@@ -7,24 +7,6 @@
 -- Nếu chưa có biến getgenv().fragmentchange từ trước, mặc định sẽ là 8000
 getgenv().fragmentchange = getgenv().fragmentchange or 8000 
 local TARGET_FRAG = getgenv().fragmentchange
-
--- ==========================================
--- [ 5. ĐỢI GAME LOAD ĐẦY ĐỦ ]
--- ==========================================
-if not game:IsLoaded() then
-    game.Loaded:Wait()
-end
-
--- Đợi LocalPlayer và các thành phần giao diện, nhân vật
-repeat task.wait() until game.Players
-repeat task.wait() until game.Players.LocalPlayer
-repeat task.wait() until game.Players.LocalPlayer:FindFirstChild("PlayerGui")
-repeat task.wait() until game.Players.LocalPlayer.Character and game.Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-task.wait(2)
-
--- ==========================================
--- [ LẤY DỮ LIỆU NGƯỜI CHƠI ]
--- ==========================================
 local Player = game.Players.LocalPlayer
 local CoreGui = game:GetService("CoreGui")
 
