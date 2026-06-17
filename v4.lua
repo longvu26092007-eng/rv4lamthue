@@ -127,36 +127,46 @@ end)
 
 function thuaaa()
     if game:GetService("Players").LocalPlayer.Team then return end
-    if getgenv().Config["Team"] == "Marines" or not getgenv().Config["Team"] then
-        game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("SetTeam", "Marines")
-    elseif getgenv().Config["Team"] == "Pirates" then
-        game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("SetTeam", "Pirates")
-    end
+    local team = getgenv().Config["Team"]
+    if team ~= "Marines" and team ~= "Pirates" then team = "Marines" end
+    pcall(function()
+        game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("SetTeam", team)
+    end)
 end
 
-thuaaa()
-
-local L_207_ = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui"):FindFirstChild("ChooseTeam", true)
-local L_208_ = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui"):FindFirstChild("UIController", true)
-if L_207_ and L_207_.Visible then
-    repeat
-        task.wait(1)
-        if L_207_ and L_207_.Visible and L_208_ then
-            for L_209_forvar0, L_210_forvar1 in pairs(getgc(true)) do
-                if type(L_210_forvar1) == "function" and getfenv(L_210_forvar1).script == L_208_ then
-                    local L_211_ = getconstants(L_210_forvar1)
-                    pcall(function()
-                        if (L_211_[1] == "Pirates" or L_211_[1] == "Marines") and #L_211_ == 1 then
-                            if L_211_[1] == getgenv().Config["Team"] then
-                                L_210_forvar1(getgenv().Config["Team"])
-                            end
+-- FIX: Join team bền — retry cả 2 cách (remote + ChooseTeam UI) tới khi có team thật.
+-- Trước đây chỉ gọi 1 lần nên "lúc được lúc không" (remote chưa sẵn / UI chưa load kịp).
+spawn(function()
+    local LP = game:GetService("Players").LocalPlayer
+    local team = getgenv().Config["Team"]
+    if team ~= "Marines" and team ~= "Pirates" then team = "Marines" end
+    local attempts = 0
+    while not LP.Team and attempts < 40 do
+        attempts = attempts + 1
+        -- Cách 1: gọi thẳng remote SetTeam
+        pcall(function()
+            game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("SetTeam", team)
+        end)
+        task.wait(0.4)
+        if LP.Team then break end
+        -- Cách 2: fallback qua ChooseTeam UI (getgc) khi remote không ăn
+        pcall(function()
+            local chooseGui = LP.PlayerGui:FindFirstChild("ChooseTeam", true)
+            local uiCtrl    = LP.PlayerGui:FindFirstChild("UIController", true)
+            if chooseGui and chooseGui.Visible and uiCtrl then
+                for _, fn in pairs(getgc(true)) do
+                    if type(fn) == "function" and getfenv(fn).script == uiCtrl then
+                        local consts = getconstants(fn)
+                        if consts and #consts == 1 and (consts[1] == "Pirates" or consts[1] == "Marines") then
+                            if consts[1] == team then pcall(fn, team) end
                         end
-                    end)
+                    end
                 end
             end
-        end
-    until game:GetService("Players").LocalPlayer.Team
-end
+        end)
+        task.wait(0.8)
+    end
+end)
 
 local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
@@ -1349,152 +1359,512 @@ spawn(function()
 end)
 
 _G[myName] = true
-getgenv().UseSeaUi = true
-local Library = loadstring(game:HttpGet("https://github.com/noguchihyuga/idk/blob/main/alchemyui.lua?raw=true"))()
-local Window = Library:Window({
-    Title = "Kaitun V4",
-    Desc = "free",
-    Icon = "rbxassetid://88776023850919",
-    Config = { Keybind = Enum.KeyCode.RightControl },
-    CloseUIButton = { Enabled = true, Text = "On/Off" },
-    Theme = "Dark"
-})
+-- ============================================================
+-- [GUI] Vu Nguyen Kaitun V4 — Premium (self-contained luxury UI)
+-- Không phụ thuộc thư viện ngoài. Theme tối + viền RGB + animation.
+-- ============================================================
+local LocalPlayer  = game:GetService("Players").LocalPlayer
+local TweenService = game:GetService("TweenService")
+local RunService   = game:GetService("RunService")
+local StarterGui   = game:GetService("StarterGui")
+local TPService    = game:GetService("TeleportService")
 
-function toggle(a, b)
-    local x, y = pcall(function() return game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json")) end)
-    if not x then
-        y = {}; if not isfolder("nawy") then makefolder("nawy") end; writefile("nawy/kaitunv4.json", "{}")
-    end
-    if y[b["Title"]] then b["Value"] = y[b["Title"]] and true or false end
-    local oldcallback = b["Callback"]
-    local callback = function(v)
-        oldcallback(v)
-        local m, n = pcall(function() return game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json")) end)
-        if not m then
-            n = {}; if not isfolder("nawy") then makefolder("nawy") end; writefile("nawy/kaitunv4.json", "{}")
+-- dọn GUI cũ nếu reload
+pcall(function()
+    local old = LocalPlayer.PlayerGui:FindFirstChild("VuNguyenKaitunV4")
+    if old then old:Destroy() end
+end)
+
+-- ---- RGB animator: viền chạy 7 màu ----
+local rgbObjects = {} -- { {obj=, offset=, s=, v=, prop=} }
+local function RegisterRGB(obj, offset, s, v, prop)
+    table.insert(rgbObjects, {
+        obj = obj, offset = offset or 0, s = s or 0.85, v = v or 1,
+        prop = prop or "Color"
+    })
+end
+spawn(function()
+    while true do
+        local t = tick()
+        for _, o in ipairs(rgbObjects) do
+            if o.obj and o.obj.Parent then
+                local hue = (t * 0.12 + o.offset) % 1
+                pcall(function() o.obj[o.prop] = Color3.fromHSV(hue, o.s, o.v) end)
+            end
         end
-        n[b["Title"]] = v
-        writefile("nawy/kaitunv4.json", game.HttpService:JSONEncode(n))
+        RunService.RenderStepped:Wait()
     end
-    b["Callback"] = callback
-    return a:Toggle(b)
+end)
+
+local Gui = Instance.new("ScreenGui")
+Gui.Name           = "VuNguyenKaitunV4"
+Gui.ResetOnSpawn   = false
+Gui.IgnoreGuiInset = false
+Gui.DisplayOrder   = 1000
+Gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+Gui.Parent         = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ---- Toggle floating button ----
+local Toggle = Instance.new("TextButton")
+Toggle.Size                   = UDim2.new(0, 54, 0, 54)
+Toggle.Position               = UDim2.new(1, -70, 0.30, 0)
+Toggle.BackgroundColor3       = Color3.fromRGB(18, 20, 28)
+Toggle.BorderSizePixel        = 0
+Toggle.Text                   = "👑"
+Toggle.TextSize               = 26
+Toggle.Font                   = Enum.Font.GothamBold
+Toggle.TextColor3             = Color3.fromRGB(255, 255, 255)
+Toggle.AutoButtonColor        = false
+Toggle.Parent                 = Gui
+Instance.new("UICorner", Toggle).CornerRadius = UDim.new(0, 14)
+local togGrad = Instance.new("UIGradient", Toggle)
+togGrad.Rotation = 90
+togGrad.Color = ColorSequence.new{
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(35, 38, 55)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(15, 17, 25)),
+}
+local togStroke = Instance.new("UIStroke", Toggle)
+togStroke.Thickness       = 2.5
+togStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+RegisterRGB(togStroke, 0)
+Toggle.MouseEnter:Connect(function()
+    TweenService:Create(Toggle, TweenInfo.new(0.2), {Size = UDim2.new(0, 60, 0, 60)}):Play()
+end)
+Toggle.MouseLeave:Connect(function()
+    TweenService:Create(Toggle, TweenInfo.new(0.2), {Size = UDim2.new(0, 54, 0, 54)}):Play()
+end)
+
+-- ---- Main panel ----
+local Panel = Instance.new("Frame")
+Panel.Size             = UDim2.new(0, 320, 0, 460)
+Panel.Position         = UDim2.new(0.5, -160, 0.5, -230)
+Panel.BackgroundColor3 = Color3.fromRGB(12, 14, 22)
+Panel.BorderSizePixel  = 0
+Panel.Active           = true
+Panel.Draggable        = true
+Panel.Visible          = true
+Panel.Parent           = Gui
+Instance.new("UICorner", Panel).CornerRadius = UDim.new(0, 16)
+local pGrad = Instance.new("UIGradient", Panel)
+pGrad.Rotation = 135
+pGrad.Color = ColorSequence.new{
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(22, 25, 38)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(14, 16, 24)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(10, 11, 18)),
+}
+local pStroke = Instance.new("UIStroke", Panel)
+pStroke.Thickness       = 2.5
+pStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+RegisterRGB(pStroke, 0)
+local shadow = Instance.new("Frame")
+shadow.Size                   = UDim2.new(1, 18, 1, 18)
+shadow.Position               = UDim2.new(0, -9, 0, -9)
+shadow.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
+shadow.BackgroundTransparency = 0.6
+shadow.BorderSizePixel        = 0
+shadow.ZIndex                 = 0
+shadow.Parent                 = Panel
+Instance.new("UICorner", shadow).CornerRadius = UDim.new(0, 22)
+
+-- ---- Header ----
+local Header = Instance.new("Frame")
+Header.Size             = UDim2.new(1, -20, 0, 52)
+Header.Position         = UDim2.new(0, 10, 0, 10)
+Header.BackgroundColor3 = Color3.fromRGB(20, 23, 35)
+Header.BorderSizePixel  = 0
+Header.Parent           = Panel
+Instance.new("UICorner", Header).CornerRadius = UDim.new(0, 10)
+local hGrad = Instance.new("UIGradient", Header)
+hGrad.Color = ColorSequence.new{
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(28, 32, 48)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(18, 20, 30)),
+}
+local Title = Instance.new("TextLabel")
+Title.Size                   = UDim2.new(1, -50, 0, 24)
+Title.Position               = UDim2.new(0, 14, 0, 6)
+Title.BackgroundTransparency = 1
+Title.Text                   = "👑 VU NGUYEN KAITUN V4"
+Title.TextColor3             = Color3.fromRGB(255, 255, 255)
+Title.TextXAlignment         = Enum.TextXAlignment.Left
+Title.Font                   = Enum.Font.GothamBold
+Title.TextSize               = 15
+Title.Parent                 = Header
+local SubTitle = Instance.new("TextLabel")
+SubTitle.Size                   = UDim2.new(1, -50, 0, 14)
+SubTitle.Position               = UDim2.new(0, 14, 0, 30)
+SubTitle.BackgroundTransparency = 1
+SubTitle.Text                   = "✦ PREMIUM"
+SubTitle.TextXAlignment         = Enum.TextXAlignment.Left
+SubTitle.Font                   = Enum.Font.GothamBold
+SubTitle.TextSize               = 11
+SubTitle.Parent                 = Header
+RegisterRGB(SubTitle, 0.1, 0.7, 1, "TextColor3")
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size             = UDim2.new(0, 30, 0, 30)
+CloseBtn.Position         = UDim2.new(1, -38, 0.5, -15)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+CloseBtn.BorderSizePixel  = 0
+CloseBtn.Text             = "✕"
+CloseBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+CloseBtn.Font             = Enum.Font.GothamBold
+CloseBtn.TextSize         = 15
+CloseBtn.AutoButtonColor  = false
+CloseBtn.Parent           = Header
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 8)
+CloseBtn.MouseButton1Click:Connect(function() Panel.Visible = false end)
+Toggle.MouseButton1Click:Connect(function() Panel.Visible = not Panel.Visible end)
+
+-- ---- Tab bar ----
+local TabBar = Instance.new("Frame")
+TabBar.Size             = UDim2.new(1, -20, 0, 34)
+TabBar.Position         = UDim2.new(0, 10, 0, 70)
+TabBar.BackgroundColor3 = Color3.fromRGB(16, 18, 28)
+TabBar.BorderSizePixel  = 0
+TabBar.Parent           = Panel
+Instance.new("UICorner", TabBar).CornerRadius = UDim.new(0, 9)
+local tabLayout = Instance.new("UIListLayout", TabBar)
+tabLayout.FillDirection       = Enum.FillDirection.Horizontal
+tabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+tabLayout.VerticalAlignment   = Enum.VerticalAlignment.Center
+tabLayout.Padding             = UDim.new(0, 4)
+local tabPad = Instance.new("UIPadding", TabBar)
+tabPad.PaddingLeft  = UDim.new(0, 4)
+tabPad.PaddingRight = UDim.new(0, 4)
+
+-- ---- Pages container ----
+local PageHolder = Instance.new("Frame")
+PageHolder.Size                  = UDim2.new(1, -20, 1, -120)
+PageHolder.Position              = UDim2.new(0, 10, 0, 112)
+PageHolder.BackgroundTransparency = 1
+PageHolder.BorderSizePixel       = 0
+PageHolder.Parent                = Panel
+
+local pages   = {}
+local tabBtns = {}
+local function selectTab(name)
+    for n, pg in pairs(pages) do pg.Visible = (n == name) end
+    for n, b in pairs(tabBtns) do
+        local on = (n == name)
+        TweenService:Create(b, TweenInfo.new(0.18), {
+            BackgroundColor3 = on and Color3.fromRGB(40, 45, 68) or Color3.fromRGB(20, 23, 35)
+        }):Play()
+        b.TextColor3 = on and Color3.fromRGB(255,255,255) or Color3.fromRGB(150,160,185)
+    end
 end
 
-function dropdown(a, b)
-    local x, y = pcall(function() return game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json")) end)
-    if not x then
-        y = {}; if not isfolder("nawy") then makefolder("nawy") end; writefile("nawy/kaitunv4.json", "{}")
-    end
-    if y[b["Title"]] then b["Value"] = y[b["Title"]] or "" end
-    local oldcallback = b["Callback"]
-    local callback = function(v)
-        oldcallback(v)
-        local m, n = pcall(function() return game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json")) end)
-        if not m then
-            n = {}; if not isfolder("nawy") then makefolder("nawy") end; writefile("nawy/kaitunv4.json", "{}")
-        end
-        n[b["Title"]] = v
-        writefile("nawy/kaitunv4.json", game.HttpService:JSONEncode(n))
-    end
-    b["Callback"] = callback
-    return a:Dropdown(b)
+local function CreatePage(name)
+    local page = Instance.new("ScrollingFrame")
+    page.Size                  = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel       = 0
+    page.ScrollBarThickness    = 4
+    page.ScrollBarImageColor3  = Color3.fromRGB(120, 160, 240)
+    page.CanvasSize            = UDim2.new(0, 0, 0, 0)
+    page.AutomaticCanvasSize   = Enum.AutomaticSize.Y
+    page.Visible               = false
+    page.Parent                = PageHolder
+    local l = Instance.new("UIListLayout", page)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.Padding   = UDim.new(0, 8)
+    local p = Instance.new("UIPadding", page)
+    p.PaddingTop = UDim.new(0, 2); p.PaddingBottom = UDim.new(0, 4)
+    p.PaddingLeft = UDim.new(0, 2); p.PaddingRight = UDim.new(0, 4)
+    pages[name] = page
+
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(0, 96, 1, -6)
+    btn.BackgroundColor3 = Color3.fromRGB(20, 23, 35)
+    btn.BorderSizePixel  = 0
+    btn.Text             = name
+    btn.Font             = Enum.Font.GothamBold
+    btn.TextSize         = 12
+    btn.TextColor3       = Color3.fromRGB(150, 160, 185)
+    btn.AutoButtonColor  = false
+    btn.Parent           = TabBar
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
+    btn.MouseButton1Click:Connect(function() selectTab(name) end)
+    tabBtns[name] = btn
+    return page
 end
 
-local main = Window:Tab({ Title = "Main", Icon = "rbxassetid://10620349455" })
-local Status = main:Label({ Title = "Status: nothing", Desc = "nothing" })
-local DropdownWithOptions = dropdown(main, {
-    Title = "Choose Gear",
-    Desc = "Main",
-    List = { "A-B-B", "A-A-B" },
-    Value = "A-B-B",
-    Multi = false,
-    Callback = function(value) getgenv().Config["Gear"] = value end
-})
-toggle(main, {
-    Title = "Reset After Trial",
-    Desc = "Allies",
-    Value = false,
-    Callback = function(value) getgenv().Config["ResetAfterTrial"] = value end
-})
-main:Textbox({
-    Title = "Input Job id",
-    Desc = "",
-    Placeholder = "jobid",
-    ClearTextOnFocus = true,
-    Callback = function(text) _G.jobidinput = text end
-})
-main:Button({
-    Title = "Join Job Id",
-    Desc = "",
-    Callback = function()
+-- ---- widget builders ----
+local function addCard(page, order, height)
+    local f = Instance.new("Frame")
+    f.LayoutOrder      = order
+    f.Size             = UDim2.new(1, 0, 0, height)
+    f.BackgroundColor3 = Color3.fromRGB(18, 20, 30)
+    f.BorderSizePixel  = 0
+    f.Parent           = page
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 10)
+    local g = Instance.new("UIGradient", f)
+    g.Rotation = 90
+    g.Color = ColorSequence.new{
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(24, 27, 41)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(14, 16, 24)),
+    }
+    return f
+end
+
+local function StatusCard(page, order)
+    local f = addCard(page, order, 72)
+    local s = Instance.new("UIStroke", f); s.Thickness = 1.8; s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    RegisterRGB(s, 0.33)
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -16, 0, 16); t.Position = UDim2.new(0, 12, 0, 8)
+    t.BackgroundTransparency = 1; t.Text = "● STATUS"
+    t.TextColor3 = Color3.fromRGB(140, 200, 255); t.TextXAlignment = Enum.TextXAlignment.Left
+    t.Font = Enum.Font.GothamBold; t.TextSize = 11; t.Parent = f
+    local v = Instance.new("TextLabel")
+    v.Size = UDim2.new(1, -20, 0, 40); v.Position = UDim2.new(0, 12, 0, 26)
+    v.BackgroundTransparency = 1; v.Text = "Đang khởi động..."
+    v.TextColor3 = Color3.fromRGB(255, 255, 255); v.TextXAlignment = Enum.TextXAlignment.Left
+    v.TextYAlignment = Enum.TextYAlignment.Top; v.Font = Enum.Font.GothamBold
+    v.TextSize = 13; v.TextWrapped = true; v.Parent = f
+    return v
+end
+
+local function LabelCard(page, order, titleText, descText)
+    local f = addCard(page, order, 50)
+    local s = Instance.new("UIStroke", f); s.Thickness = 1.2; s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    RegisterRGB(s, (order % 7) / 7)
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -16, 0, 18); t.Position = UDim2.new(0, 12, 0, 7)
+    t.BackgroundTransparency = 1; t.Text = titleText
+    t.TextColor3 = Color3.fromRGB(230, 235, 255); t.TextXAlignment = Enum.TextXAlignment.Left
+    t.Font = Enum.Font.GothamBold; t.TextSize = 13; t.Parent = f
+    local d = Instance.new("TextLabel")
+    d.Size = UDim2.new(1, -16, 0, 16); d.Position = UDim2.new(0, 12, 0, 27)
+    d.BackgroundTransparency = 1; d.Text = descText or ""
+    d.TextColor3 = Color3.fromRGB(140, 150, 175); d.TextXAlignment = Enum.TextXAlignment.Left
+    d.Font = Enum.Font.Gotham; d.TextSize = 11; d.TextTruncate = Enum.TextTruncate.AtEnd; d.Parent = f
+    return { SetTitle = function(_, x) t.Text = x end, SetDesc = function(_, x) d.Text = x end }
+end
+
+local function ButtonCard(page, order, text, callback)
+    local btn = Instance.new("TextButton")
+    btn.LayoutOrder      = order
+    btn.Size             = UDim2.new(1, 0, 0, 42)
+    btn.BackgroundColor3 = Color3.fromRGB(22, 25, 38)
+    btn.BorderSizePixel  = 0
+    btn.Text             = ""
+    btn.AutoButtonColor  = false
+    btn.Parent           = page
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 10)
+    local grad = Instance.new("UIGradient", btn); grad.Rotation = 90
+    grad.Color = ColorSequence.new{
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(38, 42, 60)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(22, 25, 38)),
+    }
+    local stroke = Instance.new("UIStroke", btn); stroke.Thickness = 1.5; stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    RegisterRGB(stroke, (order % 7) / 7)
+    local icon = Instance.new("TextLabel")
+    icon.Size = UDim2.new(0, 30, 1, 0); icon.Position = UDim2.new(0, 8, 0, 0)
+    icon.BackgroundTransparency = 1; icon.Text = "🚀"; icon.Font = Enum.Font.GothamBold
+    icon.TextSize = 16; icon.TextColor3 = Color3.fromRGB(255,255,255); icon.Parent = btn
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -50, 1, 0); lbl.Position = UDim2.new(0, 42, 0, 0)
+    lbl.BackgroundTransparency = 1; lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(245, 250, 255); lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Font = Enum.Font.GothamBold; lbl.TextSize = 13; lbl.Parent = btn
+    local arrow = Instance.new("TextLabel")
+    arrow.Size = UDim2.new(0, 24, 1, 0); arrow.Position = UDim2.new(1, -28, 0, 0)
+    arrow.BackgroundTransparency = 1; arrow.Text = "›"; arrow.TextColor3 = Color3.fromRGB(180,200,255)
+    arrow.TextTransparency = 0.5; arrow.Font = Enum.Font.GothamBold; arrow.TextSize = 22; arrow.Parent = btn
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.18), {Size = UDim2.new(1, 0, 0, 46)}):Play()
+        TweenService:Create(arrow, TweenInfo.new(0.18), {TextTransparency = 0}):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.18), {Size = UDim2.new(1, 0, 0, 42)}):Play()
+        TweenService:Create(arrow, TweenInfo.new(0.18), {TextTransparency = 0.5}):Play()
+    end)
+    btn.MouseButton1Click:Connect(function()
+        local ok, err = pcall(callback)
+        if not ok then warn("[Kaitun GUI] " .. tostring(err)) end
+    end)
+    return btn
+end
+
+local function ToggleCard(page, order, text, descText, default, callback)
+    local f = addCard(page, order, 46)
+    local s = Instance.new("UIStroke", f); s.Thickness = 1.2; s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    RegisterRGB(s, (order % 7) / 7)
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -70, 0, 18); t.Position = UDim2.new(0, 12, 0, 6)
+    t.BackgroundTransparency = 1; t.Text = text; t.TextColor3 = Color3.fromRGB(230,235,255)
+    t.TextXAlignment = Enum.TextXAlignment.Left; t.Font = Enum.Font.GothamBold; t.TextSize = 13; t.Parent = f
+    local d = Instance.new("TextLabel")
+    d.Size = UDim2.new(1, -70, 0, 14); d.Position = UDim2.new(0, 12, 0, 25)
+    d.BackgroundTransparency = 1; d.Text = descText or ""; d.TextColor3 = Color3.fromRGB(140,150,175)
+    d.TextXAlignment = Enum.TextXAlignment.Left; d.Font = Enum.Font.Gotham; d.TextSize = 10; d.Parent = f
+    local sw = Instance.new("TextButton")
+    sw.Size = UDim2.new(0, 44, 0, 22); sw.Position = UDim2.new(1, -54, 0.5, -11)
+    sw.BackgroundColor3 = default and Color3.fromRGB(60,200,110) or Color3.fromRGB(60,64,82)
+    sw.Text = ""; sw.AutoButtonColor = false; sw.Parent = f
+    Instance.new("UICorner", sw).CornerRadius = UDim.new(1, 0)
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 18, 0, 18); knob.Position = default and UDim2.new(1,-20,0.5,-9) or UDim2.new(0,2,0.5,-9)
+    knob.BackgroundColor3 = Color3.fromRGB(255,255,255); knob.BorderSizePixel = 0; knob.Parent = sw
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+    local state = default
+    sw.MouseButton1Click:Connect(function()
+        state = not state
+        TweenService:Create(sw, TweenInfo.new(0.18), {
+            BackgroundColor3 = state and Color3.fromRGB(60,200,110) or Color3.fromRGB(60,64,82)
+        }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.18), {
+            Position = state and UDim2.new(1,-20,0.5,-9) or UDim2.new(0,2,0.5,-9)
+        }):Play()
+        pcall(callback, state)
+    end)
+    return f
+end
+
+local function DropdownCard(page, order, text, options, default, callback)
+    local f = addCard(page, order, 46)
+    local s = Instance.new("UIStroke", f); s.Thickness = 1.2; s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    RegisterRGB(s, (order % 7) / 7)
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -110, 1, 0); t.Position = UDim2.new(0, 12, 0, 0)
+    t.BackgroundTransparency = 1; t.Text = text; t.TextColor3 = Color3.fromRGB(230,235,255)
+    t.TextXAlignment = Enum.TextXAlignment.Left; t.Font = Enum.Font.GothamBold; t.TextSize = 13; t.Parent = f
+    local cur = Instance.new("TextButton")
+    cur.Size = UDim2.new(0, 90, 0, 30); cur.Position = UDim2.new(1, -100, 0.5, -15)
+    cur.BackgroundColor3 = Color3.fromRGB(30,34,50); cur.Text = default
+    cur.TextColor3 = Color3.fromRGB(255,255,255); cur.Font = Enum.Font.GothamBold; cur.TextSize = 12
+    cur.AutoButtonColor = false; cur.Parent = f
+    Instance.new("UICorner", cur).CornerRadius = UDim.new(0, 7)
+    local idx = 1
+    for i, o in ipairs(options) do if o == default then idx = i end end
+    cur.MouseButton1Click:Connect(function()
+        idx = (idx % #options) + 1
+        cur.Text = options[idx]
+        pcall(callback, options[idx])
+    end)
+    return f
+end
+
+local function TextboxCard(page, order, placeholder, callback)
+    local f = addCard(page, order, 46)
+    local s = Instance.new("UIStroke", f); s.Thickness = 1.2; s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    RegisterRGB(s, (order % 7) / 7)
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, -24, 1, -14); box.Position = UDim2.new(0, 12, 0, 7)
+    box.BackgroundColor3 = Color3.fromRGB(14,16,24); box.PlaceholderText = placeholder
+    box.Text = ""; box.TextColor3 = Color3.fromRGB(255,255,255); box.PlaceholderColor3 = Color3.fromRGB(120,128,150)
+    box.Font = Enum.Font.Gotham; box.TextSize = 13; box.ClearTextOnFocus = false
+    box.TextXAlignment = Enum.TextXAlignment.Left; box.Parent = f
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 7)
+    local pad = Instance.new("UIPadding", box); pad.PaddingLeft = UDim.new(0, 8)
+    box:GetPropertyChangedSignal("Text"):Connect(function() pcall(callback, box.Text) end)
+    return box
+end
+
+-- =================== PAGE: MAIN ===================
+local mainPage = CreatePage("Main")
+local StatusValue = StatusCard(mainPage, 1)
+local Status = { -- giữ tương thích API cũ status loop
+    SetTitle = function() end,
+    SetDesc  = function(_, v) StatusValue.Text = v end,
+}
+-- Choose Gear (load value đã lưu)
+do
+    local savedGear = "A-B-B"
+    pcall(function()
+        local y = game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json"))
+        if y and y["Choose Gear"] then savedGear = y["Choose Gear"] end
+    end)
+    getgenv().Config["Gear"] = savedGear
+    DropdownCard(mainPage, 2, "Choose Gear", { "A-B-B", "A-A-B" }, savedGear, function(v)
+        getgenv().Config["Gear"] = v
         pcall(function()
-            game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, _G.jobidinput,
-                game.Players.LocalPlayer)
+            local m = {}; pcall(function() m = game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json")) end)
+            if type(m) ~= "table" then m = {} end
+            if not isfolder("nawy") then makefolder("nawy") end
+            m["Choose Gear"] = v
+            writefile("nawy/kaitunv4.json", game.HttpService:JSONEncode(m))
         end)
-    end
-})
+    end)
+end
+-- Reset After Trial
+do
+    local savedReset = false
+    pcall(function()
+        local y = game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json"))
+        if y and y["Reset After Trial"] ~= nil then savedReset = y["Reset After Trial"] and true or false end
+    end)
+    getgenv().Config["ResetAfterTrial"] = savedReset
+    ToggleCard(mainPage, 3, "Reset After Trial", "Allies", savedReset, function(v)
+        getgenv().Config["ResetAfterTrial"] = v
+        pcall(function()
+            local m = {}; pcall(function() m = game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json")) end)
+            if type(m) ~= "table" then m = {} end
+            if not isfolder("nawy") then makefolder("nawy") end
+            m["Reset After Trial"] = v
+            writefile("nawy/kaitunv4.json", game.HttpService:JSONEncode(m))
+        end)
+    end)
+end
+-- Job id input + join
+TextboxCard(mainPage, 4, "Nhập Job ID...", function(text) _G.jobidinput = text end)
+ButtonCard(mainPage, 5, "Join Job Id", function()
+    pcall(function()
+        TPService:TeleportToPlaceInstance(game.PlaceId, _G.jobidinput, LocalPlayer)
+    end)
+end)
 
-local statusTab = Window:Tab({ Title = "Main Status", Icon = "rbxassetid://10620349455" })
+-- live status loop
+spawn(function()
+    while wait() do
+        if _G.statusnow then StatusValue.Text = _G.statusnow end
+    end
+end)
+
+-- =================== PAGE: MAIN STATUS ===================
+local statusPage = CreatePage("Status")
 local mainStatusLabels = {}
 for i, name in ipairs(getgenv().Config["MainAccount"]) do
-    mainStatusLabels[name] = statusTab:Label({
-        Title = "Main " .. i .. ": " .. name,
-        Desc = "loading..."
-    })
+    mainStatusLabels[name] = LabelCard(statusPage, i, "Main " .. i .. ": " .. name, "loading...")
 end
 spawn(function()
     while wait(3) do
         for i, name in ipairs(getgenv().Config["MainAccount"]) do
             pcall(function()
                 local st = getMainStatus(name)
-                if mainStatusLabels[name] then
-                    mainStatusLabels[name]:SetDesc("Status: " .. st)
-                end
+                if mainStatusLabels[name] then mainStatusLabels[name]:SetDesc("Status: " .. st) end
             end)
         end
     end
 end)
 
-local acc = Window:Tab({ Title = "Accounts", Icon = "rbxassetid://10620349455" })
-spawn(function()
-    while wait() do
-        if _G.statusnow then
-            Status:SetTitle("Status: " .. _G.statusnow)
-            Status:SetDesc(_G.statusnow)
-        end
-    end
-end)
-
+-- =================== PAGE: ACCOUNTS ===================
+local accPage = CreatePage("Accounts")
 function get_data_safe(target_name)
     local success, response = pcall(function()
         return game:HttpGet(BASE_URL .. "/noguchi?name=" .. target_name)
     end)
     if success and response and response ~= "" then
         local data = game.HttpService:JSONDecode(response)
-        if data and data.data and data.data.jobid then
-            return data.data.jobid
-        end
+        if data and data.data and data.data.jobid then return data.data.jobid end
     end
     return "N/A"
 end
-
+local accOrder = 0
 for idx, vl in pairs(getgenv().Config["Allies"]) do
-    local label = acc:Label({ Title = "Account: " .. vl, Desc = "No Update" })
+    accOrder = accOrder + 1
+    local label = LabelCard(accPage, accOrder, "Account: " .. vl, "No Update")
     local jobidnow = "no update"
-    local button = acc:Button({
-        ["Title"] = "Join to " .. vl,
-        Desc = "",
-        ["Callback"] = function()
-            game:GetService("TeleportService"):TeleportToPlaceInstance(game.PlaceId, jobidnow, game.Players.LocalPlayer)
-        end
-    })
+    accOrder = accOrder + 1
+    ButtonCard(accPage, accOrder, "Join to " .. vl, function()
+        TPService:TeleportToPlaceInstance(game.PlaceId, jobidnow, LocalPlayer)
+    end)
     spawn(function()
         while wait(5) do
             pcall(function()
                 local dataplr = game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/noguchi?name=" .. vl))
                 local jobid, time = dataplr["data"]["jobid"], dataplr["data"]["time"]
                 local t = gettimeserver()
-                label:SetDesc(jobid .. " | " .. tostring(t - time) .. "s ago")
+                label:SetDesc(tostring(jobid):sub(1,18) .. " | " .. tostring(t - time) .. "s ago")
                 jobidnow = jobid
                 local gg = get_data_safe(vl)
                 if gg ~= "N/A" then _G.current_target_jobid = gg end
@@ -1502,3 +1872,11 @@ for idx, vl in pairs(getgenv().Config["Allies"]) do
         end
     end)
 end
+
+selectTab("Main")
+
+-- intro animation
+Panel.Size = UDim2.new(0, 0, 0, 0)
+TweenService:Create(Panel, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+    Size = UDim2.new(0, 320, 0, 460)
+}):Play()
