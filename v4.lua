@@ -729,7 +729,7 @@ spawn(function()
                             if thua and thua["success"] and thua["data"] then
                                 for _, v in pairs(thua["data"]) do
                                     local jobid = v["jobid"]
-                                    if jobid and jobid ~= game.JobId and v.player >= 8 then
+                                    if jobid and jobid ~= game.JobId and v.player <= 8 then
                                         local lastVisit = cachedJobs[jobid]
                                         if not lastVisit or (math.floor(tick()) - lastVisit) > 3600 then
                                             status("[MAIN " .. myMainIndex .. "] Hop fullmoon server")
