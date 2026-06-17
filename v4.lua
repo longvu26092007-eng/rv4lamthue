@@ -875,9 +875,10 @@ spawn(function()
                                     status("[MAIN " .. myMainIndex .. "] Ready for trialing")
                                     if myName == currentmain then
                                         if isshouldturnonability() then
-                                            -- Main bắn tín hiệu rồi bấm ngay (như bản gốc). lead nhỏ 0.6s
-                                            -- để 2 ally fast-poll (0.3s) kịp thấy tín hiệu cùng lúc.
-                                            local fire_at = serverNow() + 0.6
+                                            -- Main bắn tín hiệu với lead 1.2s để 2 ally fast-poll (0.25s)
+                                            -- chắc chắn nhận kịp, rồi CẢ main lẫn ally chờ tới đúng fire_at
+                                            -- → tất cả bấm cùng một thời điểm.
+                                            local fire_at = serverNow() + 1.2
                                             _G.allyLastFire = fire_at  -- chống fast-poll của chính main bấm trùng
                                             pcall(function()
                                                 (http_request or http and http.request or request)({
@@ -887,7 +888,8 @@ spawn(function()
                                                     ["Body"] = game.HttpService:JSONEncode({ fire_at = fire_at })
                                                 })
                                             end)
-                                            wait(0.6)
+                                            local d = fire_at - serverNow()
+                                            if d > 0 then wait(d) end
                                             game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
                                         end
                                     end
@@ -1402,31 +1404,40 @@ spawn(function()
 end)
 
 -- ===== ALLY FAST-POLL: bắt tín hiệu fire nhanh, độc lập vòng logic chậm =====
--- Poll /firesignal mỗi 0.3s. Đứng sát cửa + thấy fire_at MỚI (chưa xử lý) + còn tươi
--- → BẤM NGAY (không chờ). _G.allyLastFire chống bấm trùng. Cả 2 ally bấm trong <0.3s.
+-- Poll /firesignal mỗi 0.25s. Điều kiện vị trí NỚI RỘNG để KHÔNG con nào bị loại:
+--   gần cửa (door < 150) HOẶC đang trong khu Temple (< 3000).
+-- Khi thấy fire_at MỚI → chờ tới ĐÚNG fire_at rồi bấm (đồng bộ y hệt main).
+-- _G.allyLastFire chống bấm trùng. Cả 2 ally + main bấm cùng một thời điểm.
 spawn(function()
     while true do
         pcall(function()
-            local atDoor = false
+            -- vị trí hợp lệ: sát cửa race của mình HOẶC đang ở trong Temple of Time
+            local inPlace = false
             pcall(function()
                 local door = getdoor()
-                if door then atDoor = (getdis(door.CFrame) < 80) end
+                if door and getdis(door.CFrame) < 150 then inPlace = true end
             end)
-            if atDoor then
+            if not inPlace then
+                pcall(function()
+                    if getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) < 3000 then inPlace = true end
+                end)
+            end
+            if inPlace then
                 local sig = game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/firesignal"))
                 if sig and sig.fire_at then
                     local fire_at = tonumber(sig.fire_at) or 0
                     if fire_at > 0 and fire_at ~= _G.allyLastFire then
-                        local age = serverNow() - fire_at   -- tín hiệu cũ bao lâu rồi
-                        if age > -8 and age < 12 then        -- còn tươi (chưa quá 12s)
+                        local delta = fire_at - serverNow()   -- còn bao lâu tới giờ bấm
+                        if delta > -8 and delta < 12 then       -- tín hiệu hợp lệ (sắp tới / vừa qua)
                             _G.allyLastFire = fire_at
+                            if delta > 0 then wait(delta) end   -- chờ tới ĐÚNG fire_at → đồng bộ với main
                             game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
                         end
                     end
                 end
             end
         end)
-        wait(0.3)
+        wait(0.25)
     end
 end)
 
