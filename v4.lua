@@ -34,7 +34,7 @@ if not getgenv().Config["Gear"] or #getgenv().Config["Gear"] ~= 5 then
 end
 
 local myName = game.Players.LocalPlayer.Name
-local BASE_URL = "http://us2.bot-hosting.net:20425"
+local BASE_URL = "https://api.vunguyensoft.shop"
 
 local isallies = {}
 if getgenv().Config and getgenv().Config["Allies"] then
