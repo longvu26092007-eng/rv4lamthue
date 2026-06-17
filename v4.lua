@@ -105,6 +105,26 @@ function getMainStatus(accName)
     return "waiting"
 end
 
+-- Heartbeat: báo server account còn sống. Account không gửi gì >15s sẽ bị server tự xoá.
+function sendHeartbeat()
+    pcall(function()
+        (http_request or http and http.request or request)({
+            ["Url"] = BASE_URL .. "/heartbeat?name=" .. myName,
+            ["Method"] = "POST",
+            ["Headers"] = { ["Content-Type"] = "application/json" },
+            ["Body"] = game.HttpService:JSONEncode({ role = myRole })
+        })
+    end)
+end
+
+-- Vòng lặp nền gửi heartbeat mỗi 5s (an toàn dưới ngưỡng 15s của server)
+spawn(function()
+    while true do
+        sendHeartbeat()
+        wait(5)
+    end
+end)
+
 function thuaaa()
     if game:GetService("Players").LocalPlayer.Team then return end
     if getgenv().Config["Team"] == "Marines" or not getgenv().Config["Team"] then
