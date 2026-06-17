@@ -1,3 +1,27 @@
+-- ============================================================
+-- KaitunV4.lua  —  Auto Trial V4 (Blox Fruits) — Multi-account
+-- Bê nguyên từ kkv4.lua + fix lỗi (continue, getdis CFrame, requestEntrance Vector3, pcall)
+-- ============================================================
+
+-- ======================== [CONFIG] ========================
+getgenv().Config = {
+    ["Allies"] = {
+        "UltraReece0761",
+        "PureJackson6395",
+    },
+    ["MainAccount"] = {
+        "TotoroDark9174",
+        "SydneyBarrera02",
+    },
+    ["Method"] = "Kill Players After Trial",
+    ["ResetAfterTrial"] = true,
+    ["Team"] = "Marines",
+    ["Gear"] = "A-B-B",
+    ["VIPServer"] = false,
+    ["Kick Moon"] = false,
+    ["Hop Server FullMoon"] = true,
+}
+
 repeat
     wait(1)
 until game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
@@ -846,9 +870,10 @@ spawn(function()
                                     status("[MAIN " .. myMainIndex .. "] Ready for trialing")
                                     if myName == currentmain then
                                         if isshouldturnonability() then
-                                            -- Main bắn tín hiệu (lead 1.5s cho ally kịp nhận) + tự bấm đúng giờ.
-                                            local fire_at = serverNow() + 1.5
-                                            _G.allyLastFire = fire_at  -- main đánh dấu để watcher của chính nó không bấm trùng
+                                            -- Main bắn tín hiệu rồi bấm ngay (như bản gốc). lead nhỏ 0.6s
+                                            -- để 2 ally fast-poll (0.3s) kịp thấy tín hiệu cùng lúc.
+                                            local fire_at = serverNow() + 0.6
+                                            _G.allyLastFire = fire_at  -- chống fast-poll của chính main bấm trùng
                                             pcall(function()
                                                 (http_request or http and http.request or request)({
                                                     ["Url"] = BASE_URL .. "/firesignal",
@@ -857,8 +882,7 @@ spawn(function()
                                                     ["Body"] = game.HttpService:JSONEncode({ fire_at = fire_at })
                                                 })
                                             end)
-                                            local d = fire_at - serverNow()
-                                            if d > 0 then wait(d) end
+                                            wait(0.6)
                                             game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
                                         end
                                     end
@@ -1011,21 +1035,8 @@ spawn(function()
                                     if getdis(khang.CFrame) < 1500 then
                                         topos(khang.CFrame)
                                         status("Ready for trialing")
-                                        local ok, sig = pcall(function()
-                                            return game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/firesignal"))
-                                        end)
-                                        if ok and sig and sig.fire_at then
-                                            local fire_at = tonumber(sig.fire_at) or 0
-                                            local now = gettimeserver()
-                                            local delta = fire_at - now
-                                            -- FIX: ally tới sớm hay muộn đều bám đúng fire_at.
-                                            -- Cửa sổ rộng [-8, 8] + nhớ fire_at đã bấm để không bấm lặp.
-                                            if fire_at > 0 and fire_at ~= _G.allyLastFire and delta < 8 and delta > -8 then
-                                                _G.allyLastFire = fire_at
-                                                if delta > 0 then wait(delta) end  -- chờ tới đúng giờ rồi bấm
-                                                game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
-                                            end
-                                        end
+                                        -- Bấm ability do ALLY FAST-POLL (0.3s) lo → cả 2 ally bấm
+                                        -- gần như tức thì. Ở đây chỉ cần giữ vị trí ở cửa.
                                     else
                                         -- FIX #3: requestEntrance chỉ nhận Vector3
                                         game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", Vector3.new(28310.0234, 14895.1123, 109.456741))
@@ -1349,8 +1360,7 @@ spawn(function()
     end
 end)
 
--- FIX #5 + ĐỒNG BỘ: clock sync để có giờ server độ phân giải dưới giây (không HTTP mỗi lần gọi)
--- Dùng GLOBAL (không local) vì serverNow được gọi ở vòng logic chính nằm TRƯỚC khối này.
+-- FIX #5 + ĐỒNG BỘ: clock sync KHÔNG chặn luồng chính + luôn trả epoch server nhất quán.
 serverClockOffset = nil
 function syncClock()
     local t0 = tick()
@@ -1359,36 +1369,39 @@ function syncClock()
     end)
     local t1 = tick()
     if ok and srv then
-        local rtt = t1 - t0
-        serverClockOffset = (srv + rtt / 2) - t1  -- bù nửa round-trip
+        serverClockOffset = (srv + (t1 - t0) / 2) - t1
         return true
     end
     return false
 end
+-- serverNow LUÔN trả epoch server (nhất quán mọi account). Không bao giờ trả tick() thô
+-- (tránh lệch hàng tỷ giây làm account không bấm được).
 function serverNow()
-    if serverClockOffset == nil then
-        if not syncClock() then return math.floor(tick()) end
+    if serverClockOffset ~= nil then
+        return tick() + serverClockOffset
     end
-    return tick() + serverClockOffset
+    -- chưa sync xong → lấy thẳng từ server 1 lần (epoch đúng)
+    local ok, srv = pcall(function()
+        return tonumber(game:HttpGet(BASE_URL .. "/timeserver"))
+    end)
+    if ok and srv then return srv end
+    return os and os.time and os.time() or srv or 0
 end
--- sync ngay lúc khởi động + định kỳ mỗi 20s để chống trôi
-syncClock()
-spawn(function()
-    while true do wait(20); pcall(syncClock) end
-end)
-
--- gettimeserver dùng clock đã sync (nhanh, mượt, dưới giây) thay vì HTTP mỗi lần
 function gettimeserver()
     return serverNow()
 end
+-- sync nền, KHÔNG chặn load
+spawn(function()
+    syncClock()
+    while true do wait(20); pcall(syncClock) end
+end)
 
 -- ===== ALLY FAST-POLL: bắt tín hiệu fire nhanh, độc lập vòng logic chậm =====
--- Poll /firesignal mỗi 0.3s. Khi thấy fire_at mới + đang đứng gần cửa trial → chờ
--- đúng giờ rồi bấm. Dùng chung _G.allyLastFire với phần inline để KHÔNG bấm trùng.
+-- Poll /firesignal mỗi 0.3s. Đứng sát cửa + thấy fire_at MỚI (chưa xử lý) + còn tươi
+-- → BẤM NGAY (không chờ). _G.allyLastFire chống bấm trùng. Cả 2 ally bấm trong <0.3s.
 spawn(function()
     while true do
         pcall(function()
-            -- chỉ bấm khi đang đứng sát cửa trial (đã vào temple đúng vị trí)
             local atDoor = false
             pcall(function()
                 local door = getdoor()
@@ -1398,11 +1411,12 @@ spawn(function()
                 local sig = game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/firesignal"))
                 if sig and sig.fire_at then
                     local fire_at = tonumber(sig.fire_at) or 0
-                    local delta = fire_at - serverNow()
-                    if fire_at > 0 and fire_at ~= _G.allyLastFire and delta < 8 and delta > -8 then
-                        _G.allyLastFire = fire_at
-                        if delta > 0 then wait(delta) end
-                        game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
+                    if fire_at > 0 and fire_at ~= _G.allyLastFire then
+                        local age = serverNow() - fire_at   -- tín hiệu cũ bao lâu rồi
+                        if age > -8 and age < 12 then        -- còn tươi (chưa quá 12s)
+                            _G.allyLastFire = fire_at
+                            game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
+                        end
                     end
                 end
             end
