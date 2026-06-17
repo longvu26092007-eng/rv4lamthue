@@ -1,3 +1,27 @@
+-- ============================================================
+-- KaitunV4.lua  —  Auto Trial V4 (Blox Fruits) — Multi-account
+-- Bê nguyên từ kkv4.lua + fix lỗi (continue, getdis CFrame, requestEntrance Vector3, pcall)
+-- ============================================================
+
+-- ======================== [CONFIG] ========================
+getgenv().Config = {
+    ["Allies"] = {
+        "UltraReece0761",
+        "PureJackson6395",
+    },
+    ["MainAccount"] = {
+        "TotoroDark9174",
+        "SydneyBarrera02",
+    },
+    ["Method"] = "Kill Players After Trial",
+    ["ResetAfterTrial"] = true,
+    ["Team"] = "Marines",
+    ["Gear"] = "A-B-B",
+    ["VIPServer"] = false,
+    ["Kick Moon"] = false,
+    ["Hop Server FullMoon"] = true,
+}
+
 repeat
     wait(1)
 until game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
@@ -187,7 +211,14 @@ local topofgreattree = CFrame.new(3035.15137, 2281.15918, -7325.19189, 0.0284484
 
 function getdoor(vv)
     vv = vv or game:GetService("Players").LocalPlayer.Data.Race.Value
-    return workspace.Map["Temple of Time"]:WaitForChild(vv .. "Corridor"):WaitForChild("Door").Entrance
+    -- FIX: không dùng WaitForChild (treo vô hạn nếu corridor chưa load) → FindFirstChild an toàn
+    local temple = workspace.Map:FindFirstChild("Temple of Time")
+    if not temple then return nil end
+    local corridor = temple:FindFirstChild(vv .. "Corridor")
+    if not corridor then return nil end
+    local door = corridor:FindFirstChild("Door")
+    if not door then return nil end
+    return door:FindFirstChild("Entrance")
 end
 
 function getdis(...)
@@ -839,9 +870,9 @@ spawn(function()
                                     status("[MAIN " .. myMainIndex .. "] Ready for trialing")
                                     if myName == currentmain then
                                         if isshouldturnonability() then
-                                            -- Chỉ BẮN tín hiệu (lead 2s). Watcher tốc độ cao sẽ bật
-                                            -- ability cho TẤT CẢ account (kể cả main này) đúng tại fire_at.
-                                            local fire_at = serverNow() + FIRE_LEAD
+                                            -- Khôi phục cách gốc: main bắn tín hiệu + tự bấm ngay.
+                                            -- fire_at lead nhỏ để ally bám theo (đồng bộ qua /firesignal).
+                                            local fire_at = serverNow() + 0.5
                                             pcall(function()
                                                 (http_request or http and http.request or request)({
                                                     ["Url"] = BASE_URL .. "/firesignal",
@@ -850,6 +881,8 @@ spawn(function()
                                                     ["Body"] = game.HttpService:JSONEncode({ fire_at = fire_at })
                                                 })
                                             end)
+                                            wait(0.5)
+                                            game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
                                         end
                                     end
                                 else
@@ -1001,8 +1034,16 @@ spawn(function()
                                     if getdis(khang.CFrame) < 1500 then
                                         topos(khang.CFrame)
                                         status("Ready for trialing")
-                                        -- Việc bật ability do watcher tốc độ cao (poll 0.2s) lo,
-                                        -- bật đúng fire_at đồng bộ với main. Ở đây chỉ cần đứng vào cửa.
+                                        local ok, sig = pcall(function()
+                                            return game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/firesignal"))
+                                        end)
+                                        if ok and sig and sig.fire_at then
+                                            local now = gettimeserver()
+                                            local fire_at = tonumber(sig.fire_at) or 0
+                                            if fire_at > 0 and now >= fire_at and (now - fire_at) < 10 then
+                                                game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
+                                            end
+                                        end
                                     else
                                         -- FIX #3: requestEntrance chỉ nhận Vector3
                                         game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", Vector3.new(28310.0234, 14895.1123, 109.456741))
@@ -1327,7 +1368,7 @@ spawn(function()
 end)
 
 -- FIX #5 + ĐỒNG BỘ: clock sync để có giờ server độ phân giải dưới giây (không HTTP mỗi lần gọi)
--- Dùng GLOBAL (không local) vì serverNow/FIRE_LEAD được gọi ở vòng logic chính nằm TRƯỚC khối này.
+-- Dùng GLOBAL (không local) vì serverNow được gọi ở vòng logic chính nằm TRƯỚC khối này.
 serverClockOffset = nil
 function syncClock()
     local t0 = tick()
@@ -1358,40 +1399,6 @@ end)
 function gettimeserver()
     return serverNow()
 end
-
--- ===== ĐỒNG BỘ BẬT ABILITY =====
--- Watcher riêng tốc độ cao: tách khỏi vòng logic chậm. Mọi account (main + ally)
--- đều bật ability ở ĐÚNG fire_at → kích hoạt cùng lúc, hết cảnh ally trễ 3-4s.
-FIRE_LEAD = 2.0       -- main đặt fire_at cách hiện tại 2s để mọi ally kịp nhận
-local lastFiredAt = 0
-local function nearTrial()
-    local ok, res = pcall(function()
-        return workspace.Map:FindFirstChild("Temple of Time") ~= nil
-            and getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) < 3000
-    end)
-    return ok and res
-end
-spawn(function()
-    while true do
-        pcall(function()
-            local sig = game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/firesignal"))
-            if sig and sig.fire_at then
-                local fa = tonumber(sig.fire_at) or 0
-                if fa > 0 and fa ~= lastFiredAt then
-                    local delta = fa - serverNow()
-                    if delta > -2 and delta < 15 then     -- tín hiệu hợp lệ (sắp tới / vừa qua)
-                        lastFiredAt = fa
-                        if delta > 0 then wait(delta) end  -- chờ tới đúng fire_at
-                        if nearTrial() then
-                            game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
-                        end
-                    end
-                end
-            end
-        end)
-        wait(0.2)   -- poll nhanh, độc lập với vòng logic chính
-    end
-end)
 
 
 spawn(function()
