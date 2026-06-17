@@ -846,9 +846,9 @@ spawn(function()
                                     status("[MAIN " .. myMainIndex .. "] Ready for trialing")
                                     if myName == currentmain then
                                         if isshouldturnonability() then
-                                            -- Khôi phục cách gốc: main bắn tín hiệu + tự bấm ngay.
-                                            -- fire_at lead nhỏ để ally bám theo (đồng bộ qua /firesignal).
-                                            local fire_at = serverNow() + 0.5
+                                            -- Main bắn tín hiệu (lead 1.5s cho ally kịp nhận) + tự bấm đúng giờ.
+                                            local fire_at = serverNow() + 1.5
+                                            _G.allyLastFire = fire_at  -- main đánh dấu để watcher của chính nó không bấm trùng
                                             pcall(function()
                                                 (http_request or http and http.request or request)({
                                                     ["Url"] = BASE_URL .. "/firesignal",
@@ -857,7 +857,8 @@ spawn(function()
                                                     ["Body"] = game.HttpService:JSONEncode({ fire_at = fire_at })
                                                 })
                                             end)
-                                            wait(0.5)
+                                            local d = fire_at - serverNow()
+                                            if d > 0 then wait(d) end
                                             game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
                                         end
                                     end
@@ -1380,6 +1381,35 @@ end)
 function gettimeserver()
     return serverNow()
 end
+
+-- ===== ALLY FAST-POLL: bắt tín hiệu fire nhanh, độc lập vòng logic chậm =====
+-- Poll /firesignal mỗi 0.3s. Khi thấy fire_at mới + đang đứng gần cửa trial → chờ
+-- đúng giờ rồi bấm. Dùng chung _G.allyLastFire với phần inline để KHÔNG bấm trùng.
+spawn(function()
+    while true do
+        pcall(function()
+            -- chỉ bấm khi đang đứng sát cửa trial (đã vào temple đúng vị trí)
+            local atDoor = false
+            pcall(function()
+                local door = getdoor()
+                if door then atDoor = (getdis(door.CFrame) < 80) end
+            end)
+            if atDoor then
+                local sig = game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/firesignal"))
+                if sig and sig.fire_at then
+                    local fire_at = tonumber(sig.fire_at) or 0
+                    local delta = fire_at - serverNow()
+                    if fire_at > 0 and fire_at ~= _G.allyLastFire and delta < 8 and delta > -8 then
+                        _G.allyLastFire = fire_at
+                        if delta > 0 then wait(delta) end
+                        game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
+                    end
+                end
+            end
+        end)
+        wait(0.3)
+    end
+end)
 
 
 spawn(function()
