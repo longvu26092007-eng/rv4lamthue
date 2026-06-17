@@ -1,3 +1,27 @@
+-- ============================================================
+-- KaitunV4.lua  —  Auto Trial V4 (Blox Fruits) — Multi-account
+-- Bê nguyên từ kkv4.lua + fix lỗi (continue, getdis CFrame, requestEntrance Vector3, pcall)
+-- ============================================================
+
+-- ======================== [CONFIG] ========================
+getgenv().Config = {
+    ["Allies"] = {
+        "UltraReece0761",
+        "PureJackson6395",
+    },
+    ["MainAccount"] = {
+        "TotoroDark9174",
+        "SydneyBarrera02",
+    },
+    ["Method"] = "Kill Players After Trial",
+    ["ResetAfterTrial"] = true,
+    ["Team"] = "Marines",
+    ["Gear"] = "A-B-B",
+    ["VIPServer"] = false,
+    ["Kick Moon"] = false,
+    ["Hop Server FullMoon"] = true,
+}
+
 repeat
     wait(1)
 until game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
@@ -1014,9 +1038,14 @@ spawn(function()
                                             return game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/firesignal"))
                                         end)
                                         if ok and sig and sig.fire_at then
-                                            local now = gettimeserver()
                                             local fire_at = tonumber(sig.fire_at) or 0
-                                            if fire_at > 0 and now >= fire_at and (now - fire_at) < 10 then
+                                            local now = gettimeserver()
+                                            local delta = fire_at - now
+                                            -- FIX: ally tới sớm hay muộn đều bám đúng fire_at.
+                                            -- Cửa sổ rộng [-8, 8] + nhớ fire_at đã bấm để không bấm lặp.
+                                            if fire_at > 0 and fire_at ~= _G.allyLastFire and delta < 8 and delta > -8 then
+                                                _G.allyLastFire = fire_at
+                                                if delta > 0 then wait(delta) end  -- chờ tới đúng giờ rồi bấm
                                                 game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
                                             end
                                         end
