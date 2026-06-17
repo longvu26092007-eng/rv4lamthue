@@ -1,5 +1,5 @@
 repeat
-    wait(1)
+    task.wait(0.1)
 until game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
 
 if workspace:GetAttribute("MAP") and workspace:GetAttribute("MAP") ~= "Sea3" then
@@ -58,10 +58,11 @@ end
 getgenv().Config["Allies"] = cleanAllies
 getgenv().Config["MainAccount"] = cleanMains
 
+-- TĂNG TỐC: gộp identify + allmains vào 1 request /init (giảm 2 round-trip → 1).
 pcall(function()
     local allies_str = table.concat(cleanAllies, ",")
     local mains_str = table.concat(cleanMains, ",")
-    local url = BASE_URL .. "/identify?name=" .. myName .. "&allies=" .. allies_str .. "&mains=" .. mains_str
+    local url = BASE_URL .. "/init?name=" .. myName .. "&allies=" .. allies_str .. "&mains=" .. mains_str
     local data = game.HttpService:JSONDecode(game:HttpGet(url))
     myRole = data.role or "unknown"
     if myRole == "main" then
@@ -69,14 +70,13 @@ pcall(function()
         isaccmain[myName] = true
         mainIndexOf[myName] = myMainIndex
     end
-end)
-
-pcall(function()
-    local mainList = game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/allmains"))
-    for _, v in ipairs(mainList) do
-        if v.name and v.name ~= "" then
-            isaccmain[v.name] = true
-            mainIndexOf[v.name] = v.index
+    -- danh sách toàn bộ main (thay cho /allmains)
+    if data.mains then
+        for _, v in ipairs(data.mains) do
+            if v.name and v.name ~= "" then
+                isaccmain[v.name] = true
+                mainIndexOf[v.name] = v.index
+            end
         end
     end
 end)
@@ -170,17 +170,46 @@ end)
 
 local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
--- FIX #7: bọc pcall quanh loadstring module
+-- FIX #7 + TĂNG TỐC: cache module_bf.lua vào file local.
+-- Lần đầu tải từ GitHub rồi lưu; các lần sau đọc thẳng từ disk (gần như tức thì, không chờ mạng).
 local module
 do
-    local ok, result = pcall(function()
-        return loadstring(game:HttpGet("https://github.com/noguchihyuga/idk/blob/main/module_bf.lua?raw=true"))()
-    end)
-    if ok and result then
-        module = result
-    else
-        warn("[KaitunV4] Load module_bf.lua FAILED: " .. tostring(result))
+    local MODULE_CACHE = "kaitun_module_bf.lua"
+    local MODULE_URL = "https://github.com/noguchihyuga/idk/blob/main/module_bf.lua?raw=true"
+    local src
+    -- 1) thử đọc cache local trước
+    if isfile and isfile(MODULE_CACHE) then
+        local okR, cached = pcall(readfile, MODULE_CACHE)
+        if okR and cached and #cached > 50 then src = cached end
     end
+    -- 2) chưa có cache → tải từ GitHub + lưu lại
+    if not src then
+        local okH, fetched = pcall(function() return game:HttpGet(MODULE_URL) end)
+        if okH and fetched and #fetched > 50 then
+            src = fetched
+            pcall(function() writefile(MODULE_CACHE, fetched) end)
+        end
+    end
+    -- 3) loadstring từ source (local hoặc vừa tải)
+    if src then
+        local okL, result = pcall(function() return loadstring(src)() end)
+        if okL and result then
+            module = result
+        else
+            warn("[KaitunV4] loadstring module_bf FAILED, thử tải lại từ GitHub...")
+            -- cache hỏng → xóa, tải tươi
+            pcall(function() if delfile then delfile(MODULE_CACHE) end end)
+            local okH2, fetched2 = pcall(function() return game:HttpGet(MODULE_URL) end)
+            if okH2 and fetched2 then
+                local okL2, res2 = pcall(function() return loadstring(fetched2)() end)
+                if okL2 and res2 then
+                    module = res2
+                    pcall(function() writefile(MODULE_CACHE, fetched2) end)
+                end
+            end
+        end
+    end
+    if not module then warn("[KaitunV4] Load module_bf.lua FAILED hoàn toàn") end
 end
 local topofgreattree = CFrame.new(3035.15137, 2281.15918, -7325.19189, 0.0284484141, 2.19495124e-08, 0.999595284,
     -3.29094476e-08, 1, -2.10217994e-08, -0.999595284, -3.22980895e-08, 0.0284484141)
