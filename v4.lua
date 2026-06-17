@@ -1,27 +1,3 @@
--- ============================================================
--- KaitunV4.lua  —  Auto Trial V4 (Blox Fruits) — Multi-account
--- Bê nguyên từ kkv4.lua + fix lỗi (continue, getdis CFrame, requestEntrance Vector3, pcall)
--- ============================================================
-
--- ======================== [CONFIG] ========================
-getgenv().Config = {
-    ["Allies"] = {
-        "UltraReece0761",
-        "PureJackson6395",
-    },
-    ["MainAccount"] = {
-        "TotoroDark9174",
-        "SydneyBarrera02",
-    },
-    ["Method"] = "Kill Players After Trial",
-    ["ResetAfterTrial"] = true,
-    ["Team"] = "Marines",
-    ["Gear"] = "A-B-B",
-    ["VIPServer"] = false,
-    ["Kick Moon"] = false,
-    ["Hop Server FullMoon"] = true,
-}
-
 repeat
     wait(1)
 until game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
