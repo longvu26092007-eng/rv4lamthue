@@ -501,28 +501,36 @@ local races_trial_place = {
 }
 
 -- ============================================================
--- [TRIAL] Làm trial theo từng tộc — bản HUB chuẩn (3.txt:8020-8130 / Banana 8274-8319).
--- QUAN TRỌNG: teleport dùng module:topos THÔ (không qua wrapper topos() vốn tự kill khi
--- target >2500 & gần temple → đó là lý do Skypiea "đứng im"). Human/Ghoul kill THẲNG bằng
--- Health=0 + SimulationRadius (không dựa đánh tay → fix "không đánh boss").
+-- [TRIAL] Làm trial theo từng tộc — ƯU TIÊN kkv4 (Ceiling/Floor + loop Enemies/SeaBeasts),
+-- sửa bug đối chiếu bản decompiled 1.txt/3.txt (KHÔNG dùng Banana lỗi thời):
+--   • Skypiea: bay tới part "snowisland_Cylinder.081" (điểm HOÀN THÀNH), không phải FinishPart.
+--   • Human/Ghoul: CẦM MELEE lên → bay tới boss → đánh + kill (Health=0 + SimulationRadius).
+--   • Teleport bằng module:topos THÔ (tránh wrapper topos() tự kill khi target xa & gần temple).
 -- Dùng chung cho cả nhánh MAIN lẫn ALLY.
 function doTrialForMyRace()
     local LP = game.Players.LocalPlayer
     local myrace = LP.Data.Race.Value
-    local function tp(cf) pcall(function() module:topos(cf) end) end  -- teleport thô, không tự kill
-
-    if myrace == "Human" or myrace == "Ghoul" then
-        for _, v in pairs(workspace.Enemies:GetChildren()) do
-            local hum = v:FindFirstChild("Humanoid")
-            if hum and hum.Health > 0 and v:FindFirstChild("HumanoidRootPart") then
-                repeat wait()
-                    pcall(function() sethiddenproperty(LP, "SimulationRadius", math.huge) end)
-                    pcall(function() v.HumanoidRootPart.CanCollide = false; hum.Health = 0 end)
-                    module:eq(); module:haki()                       -- fallback nếu Health=0 chưa ăn
-                    tp(v.HumanoidRootPart.CFrame * CFrame.new(0, 30, 0))
-                until (not v.Parent) or (not v:FindFirstChild("Humanoid")) or v.Humanoid.Health <= 0
+    local race_trial_place = races_trial_place[myrace]
+    local function tp(cf) pcall(function() module:topos(cf) end) end  -- teleport thô (không tự kill)
+    local function equipMelee()  -- cầm vũ khí Melee (fallback: Sword/Blox Fruit/Gun)
+        pcall(function()
+            local char = LP.Character
+            if not (char and char:FindFirstChild("Humanoid")) then return end
+            local melee, anyw
+            for _, t in pairs(LP.Backpack:GetChildren()) do
+                if t:IsA("Tool") then
+                    local tip = t.ToolTip
+                    if tip == "Melee" then melee = t break
+                    elseif tip == "Sword" or tip == "Blox Fruit" or tip == "Gun" then anyw = anyw or t end
+                end
             end
-        end
+            local pick = melee or anyw
+            if pick then char.Humanoid:EquipTool(pick) end
+        end)
+    end
+
+    if myrace == "Mink" then
+        pcall(function() tp(workspace.Map.MinkTrial.Ceiling.CFrame * CFrame.new(0, -20, 0)) end)
     elseif myrace == "Skypiea" then
         pcall(function()
             for _, obj in pairs(workspace.Map.SkyTrial.Model:GetDescendants()) do
@@ -530,24 +538,36 @@ function doTrialForMyRace()
             end
         end)
     elseif myrace == "Cyborg" then
-        tp(CFrame.new(28654, 14898.7832, -30))
-    elseif myrace == "Mink" then
-        pcall(function()
-            for _, obj in pairs(workspace:GetDescendants()) do
-                if obj.Name == "StartPoint" then tp(obj.CFrame * CFrame.new(0, 10, 0)) break end
+        pcall(function() tp(workspace.Map.CyborgTrial.Floor.CFrame * CFrame.new(0, 500, 0)) end)
+    elseif myrace == "Human" or myrace == "Ghoul" then
+        for _, v in pairs(workspace.Enemies:GetChildren()) do
+            local hum = v:FindFirstChild("Humanoid")
+            local hrp = v:FindFirstChild("HumanoidRootPart")
+            if hum and hrp and hum.Health > 0 and (not race_trial_place or getdis(hrp.CFrame, race_trial_place.CFrame) < 1500) then
+                repeat wait()
+                    equipMelee()                                     -- FIX: cầm melee lên trước
+                    module:eq(); module:haki()
+                    tp(hrp.CFrame * CFrame.new(0, 30, 0))            -- bay tới boss
+                    pcall(function() sethiddenproperty(LP, "SimulationRadius", math.huge) end)
+                    pcall(function() hrp.CanCollide = false; hum.Health = 0 end)  -- kill chắc ăn
+                until (not v.Parent) or (not v:FindFirstChild("Humanoid")) or v.Humanoid.Health <= 0
             end
-        end)
+        end
     elseif myrace == "Fishman" then
-        local sb = workspace.SeaBeasts:FindFirstChild("SeaBeast1")
-        if sb and sb:FindFirstChild("Health") and sb.Health.Value > 0 and sb:FindFirstChild("HumanoidRootPart") then
-            repeat wait()
-                if not LP.Backpack:FindFirstChild("Sharkman Karate") then
-                    pcall(function() game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("BuySharkmanKarate") end)
+        for _, v in pairs(workspace.SeaBeasts:GetChildren()) do
+            pcall(function()
+                if v:FindFirstChild('Health') and v.Health.Value > 0 and v:FindFirstChild("HumanoidRootPart")
+                    and (not race_trial_place or getdis(v.HumanoidRootPart.CFrame, race_trial_place) < 1500) then
+                    repeat wait()
+                        if not LP.Backpack:FindFirstChild("Sharkman Karate") then
+                            game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("BuySharkmanKarate")
+                        end
+                        tp(v.HumanoidRootPart.CFrame * CFrame.new(0, 500, 0))
+                        _G.SHOULDSPAMSKILLS = true
+                    until (not v.Parent) or (not v:FindFirstChild('Health')) or v.Health.Value <= 0 or (not v:FindFirstChild("HumanoidRootPart"))
+                    _G.SHOULDSPAMSKILLS = false
                 end
-                tp(sb.HumanoidRootPart.CFrame * CFrame.new(0, 500, 0))
-                _G.SHOULDSPAMSKILLS = true
-            until (not sb.Parent) or (not sb:FindFirstChild("Health")) or sb.Health.Value <= 0 or (not sb:FindFirstChild("HumanoidRootPart"))
-            _G.SHOULDSPAMSKILLS = false
+            end)
         end
     end
 end
@@ -870,11 +890,17 @@ end
 function isSameServerAsMain(mainName)
     if not mainName then return false, nil end
     local same, job = false, nil
-    local data = Net.getJSON(BASE_URL .. "/noguchi?name=" .. mainName, 1)
-    if data and data["data"] and data["data"]["jobid"] then
-        job = data["data"]["jobid"]
-        local time_ = data["data"]["time"] or 0
-        if (gettimeserver() - time_) < 60 and job == game.JobId then same = true end
+    -- RETRY 3 lần: 1 lần đọc /noguchi lỗi/timeout sẽ làm ally KHÔNG lấy được jobid → không hop
+    -- → "lâu lâu chỉ 1 con join theo". Retry để mọi ally đều có jobid main.
+    for attempt = 1, 3 do
+        local data = Net.getJSON(BASE_URL .. "/noguchi?name=" .. mainName, 1)
+        if data and data["data"] and data["data"]["jobid"] then
+            job = data["data"]["jobid"]
+            local time_ = data["data"]["time"] or 0
+            if (gettimeserver() - time_) < 60 and job == game.JobId then same = true end
+            break
+        end
+        wait(0.3)
     end
     return same, job
 end
