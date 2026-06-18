@@ -538,10 +538,18 @@ function doTrialForMyRace()
     end
 
     if myrace == "Mink" then
-        pcall(function() tp(workspace.Map.MinkTrial.Ceiling.CFrame * CFrame.new(0, -20, 0)) end)
+        -- 1.txt/3.txt: TWEEN MƯỢT tới part "StartPoint" (+10) — đi qua quãng đường để game NHẬN.
+        -- (teleport tức thì = "vừa vào đã tới đích" → trial không nhận.)
+        local sp
+        pcall(function()
+            for _, obj in pairs(workspace:GetDescendants()) do
+                if obj.Name == "StartPoint" then sp = obj break end
+            end
+        end)
+        if sp then pcall(function() Tween2(sp.CFrame * CFrame.new(0, 10, 0)) end) end
     elseif myrace == "Skypiea" then
-        -- tìm điểm finish an toàn (FindFirstChild, fallback FinishPart) rồi BÁM tới trong vòng tight
-        -- → hết "lúc bay lúc đứng im" (do tp 1 phát/0.35s hoặc chưa tìm thấy part thì đứng yên).
+        -- 1.txt/3.txt: BKP (set CFrame thẳng) tới "snowisland_Cylinder.081" (điểm hoàn thành).
+        -- BKP dời chắc chắn (module:topos hay kẹt → "đứng yên không bay / dính im khi đi-nhảy").
         local finish
         pcall(function()
             local model = workspace.Map:FindFirstChild("SkyTrial")
@@ -553,11 +561,7 @@ function doTrialForMyRace()
                 finish = finish or model:FindFirstChild("FinishPart")
             end
         end)
-        if finish then
-            local t0 = tick()
-            repeat wait(); pcall(function() module:topos(finish.CFrame) end)
-            until getdis(finish.CFrame) < 30 or (tick() - t0) > 4
-        end
+        if finish then pcall(function() BKP(finish.CFrame) end) end
     elseif myrace == "Cyborg" then
         pcall(function() tp(workspace.Map.CyborgTrial.Floor.CFrame * CFrame.new(0, 500, 0)) end)
     elseif myrace == "Human" or myrace == "Ghoul" then
@@ -1839,33 +1843,37 @@ spawn(function()
     end
 end)
 
--- ===== LOOP ĐỌC starttime: 3s — mọi account đọc giờ chốt =====
+-- ===== LOOP ĐỌC starttime: 1s, GIỮ giá-trị-tốt — đọc lỗi (file đang ghi) KHÔNG ghi đè nil =====
 spawn(function()
     while true do
         pcall(function()
-            _G.syncStart = readStart()
+            local v = readStart()
+            if v then _G.syncStart = v end   -- chỉ cập nhật khi đọc được → không clobber bằng nil
         end)
-        wait(3)
+        wait(1)
     end
 end)
 
--- ===== LOOP BẤM: 0.25s — tới đúng starttime thì bấm ActivateAbility 1 lần =====
+-- ===== LOOP BẤM: 0.2s — ĐỌC TƯƠI mỗi nhịp (không phụ thuộc loop 1s) → không miss window =====
 spawn(function()
     while true do
         pcall(function()
-            local st = _G.syncStart   -- giây-trong-ngày (Hà Nội) của giờ chốt
+            local st = readStart() or _G.syncStart   -- ưu tiên đọc tươi, fallback giá trị cache
+            if st then _G.syncStart = st end
             if st and st ~= _G.allyLastFire then
-                if distToMyDoor() < AT_DOOR_DIST then
-                    local age = hanoiSecOfDay(serverNow()) - st
-                    if age < -43200 then age = age + 86400 end   -- wrap qua nửa đêm
-                    if age >= 0 and age < ABILITY_FIRE_WINDOW then
-                        _G.allyLastFire = st
-                        game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
-                    end
+                local age = hanoiSecOfDay(serverNow()) - st
+                if age < -43200 then age = age + 86400 end   -- wrap qua nửa đêm
+                if age >= ABILITY_FIRE_WINDOW then
+                    -- giờ chốt ĐÃ TRÔI QUA cửa sổ → BỎ QUA (không bắn trễ), đánh dấu đã xử lý
+                    _G.allyLastFire = st
+                elseif age >= 0 and distToMyDoor() < AT_DOOR_DIST then
+                    _G.allyLastFire = st
+                    game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
                 end
+                -- age < 0 → giờ chốt ở tương lai → chờ tới đúng giờ
             end
         end)
-        wait(0.25)
+        wait(0.2)
     end
 end)
 
