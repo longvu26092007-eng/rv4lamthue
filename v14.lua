@@ -36,6 +36,174 @@ end
 local myName = game.Players.LocalPlayer.Name
 local BASE_URL = "https://api.vunguyensoft.shop"
 
+-- ============================================================
+-- [NET] Lớp HTTP production — chống mất dữ liệu cho 100+ account.
+--   • Chọn hàm request mạnh nhất theo executor (syn/http_request/request/fluxus/krnl), fallback HttpGet cho GET.
+--   • POST = hàng đợi worker (bounded concurrency) + RETRY backoff + COALESCE theo key
+--     (chỉ giữ dữ liệu MỚI NHẤT mỗi loại → không tràn queue, không spam).
+--   • GET = semaphore giới hạn đồng thời + retry + CACHE TTL (cắt bão request lặp).
+--   • Log đầy đủ. KHÔNG bao giờ làm kẹt luồng game (POST async, GET có trần đồng thời).
+-- ============================================================
+local Net = {}
+do
+    local HS = game:GetService("HttpService")
+    local httprequest = (syn and syn.request)
+        or (http and http.request)
+        or http_request
+        or request
+        or (fluxus and fluxus.request)
+        or (krnl and krnl.request)
+    Net.hasReq = httprequest ~= nil
+
+    -- ---- log vòng (giữ 200 dòng gần nhất) ----
+    Net.logs = {}
+    function Net.log(level, msg)
+        local line = ("[NET][%s] %s"):format(level, tostring(msg))
+        table.insert(Net.logs, line)
+        if #Net.logs > 200 then table.remove(Net.logs, 1) end
+        if level == "ERR" or level == "WARN" then warn(line) end
+    end
+
+    -- ---- semaphore: trần số request đồng thời (tránh chạm giới hạn executor) ----
+    local MAX_CONC = 6
+    local cur = 0
+    local function acquire()
+        local guard = 0
+        while cur >= MAX_CONC do
+            task.wait(0.03)
+            guard = guard + 1
+            if guard > 400 then break end -- ~12s thì thôi chờ (đề phòng kẹt slot)
+        end
+        cur = cur + 1
+    end
+    local function release() cur = math.max(0, cur - 1) end
+
+    -- ---- request thô: trả ok(bool), status(number), body(string), err ----
+    local function rawRequest(method, url, bodyStr)
+        if httprequest then
+            local res
+            local ok, err = pcall(function()
+                res = httprequest({
+                    Url = url,
+                    Method = method,
+                    Headers = (method == "POST") and { ["Content-Type"] = "application/json" } or nil,
+                    Body = (method == "POST") and bodyStr or nil,
+                })
+            end)
+            if not ok then return false, 0, nil, tostring(err) end
+            if type(res) ~= "table" then return false, 0, nil, "no response table" end
+            local code = res.StatusCode or res.status_code or res.Status or 0
+            local body = res.Body or res.body
+            local success = res.Success
+            if success == nil then success = (code >= 200 and code < 300) end
+            if success then return true, code, body, nil end
+            return false, code, body, "http " .. tostring(code)
+        else
+            if method ~= "GET" then
+                return false, 0, nil, "executor không có hàm request cho POST"
+            end
+            local body
+            local ok, err = pcall(function() body = game:HttpGet(url) end)
+            if ok and body then return true, 200, body, nil end
+            return false, 0, nil, tostring(err)
+        end
+    end
+
+    -- ---- GET đồng bộ + retry + cache ----
+    local cache = {} -- url -> { t, decoded, raw }
+    local GET_RETRIES = 3
+    function Net.getRaw(url)
+        acquire()
+        local ok, status, body, err
+        for attempt = 1, GET_RETRIES do
+            ok, status, body, err = rawRequest("GET", url, nil)
+            if ok then break end
+            Net.log("WARN", ("GET fail %d/%d %s : %s"):format(attempt, GET_RETRIES, url, tostring(err)))
+            task.wait(0.2 * attempt)
+        end
+        release()
+        if not ok then Net.log("ERR", "GET bỏ cuộc: " .. url) end
+        return ok, body, status
+    end
+
+    function Net.getJSON(url, ttl)
+        ttl = ttl or 0
+        if ttl > 0 then
+            local c = cache[url]
+            if c and c.decoded ~= nil and (tick() - c.t) < ttl then return c.decoded end
+        end
+        local ok, body = Net.getRaw(url)
+        if not ok or not body then return nil end
+        local good, decoded = pcall(function() return HS:JSONDecode(body) end)
+        if not good then Net.log("ERR", "JSON decode fail: " .. url); return nil end
+        if ttl > 0 then cache[url] = { t = tick(), decoded = decoded } end
+        return decoded
+    end
+
+    function Net.text(url, ttl)
+        ttl = ttl or 0
+        if ttl > 0 then
+            local c = cache[url]
+            if c and c.raw ~= nil and (tick() - c.t) < ttl then return c.raw end
+        end
+        local ok, body = Net.getRaw(url)
+        if not ok then return nil end
+        if ttl > 0 then cache[url] = { t = tick(), raw = body } end
+        return body
+    end
+
+    -- ---- POST: hàng đợi + worker + retry + coalesce theo key ----
+    local postQ = {}
+    local keyed = {} -- key -> job mới nhất
+    local MAX_Q = 800
+    local POST_RETRIES = 6
+    function Net.postJSON(url, tbl, key)
+        local bodyStr
+        local ok = pcall(function() bodyStr = HS:JSONEncode(tbl or {}) end)
+        if not ok then Net.log("ERR", "JSON encode fail: " .. url); return end
+        local job = { url = url, body = bodyStr, key = key, attempts = 0 }
+        if key then
+            local old = keyed[key]
+            if old then old.replaced = true end -- bỏ job cũ cùng key (chỉ gửi dữ liệu mới nhất)
+            keyed[key] = job
+        end
+        if #postQ >= MAX_Q then
+            table.remove(postQ, 1)
+            Net.log("WARN", "postQ tràn, bỏ job cũ nhất")
+        end
+        table.insert(postQ, job)
+    end
+
+    local function worker()
+        while true do
+            local job = table.remove(postQ, 1)
+            if not job or job.replaced then
+                task.wait(0.05)
+            else
+                acquire()
+                local sok, status, _, err = rawRequest("POST", job.url, job.body)
+                release()
+                if sok then
+                    if job.key and keyed[job.key] == job then keyed[job.key] = nil end
+                else
+                    job.attempts = job.attempts + 1
+                    if (not job.replaced) and job.attempts < POST_RETRIES then
+                        Net.log("WARN", ("POST retry %d/%d %s : %s"):format(job.attempts, POST_RETRIES, job.url, tostring(err)))
+                        task.wait(0.3 * job.attempts)
+                        table.insert(postQ, job)
+                    elseif not job.replaced then
+                        Net.log("ERR", ("POST bỏ sau %d lần: %s"):format(job.attempts, job.url))
+                        if job.key and keyed[job.key] == job then keyed[job.key] = nil end
+                    end
+                end
+            end
+        end
+    end
+    for _ = 1, 4 do task.spawn(worker) end
+
+    Net.log("INFO", "Net init — hasReq=" .. tostring(Net.hasReq))
+end
+
 local isallies = {}
 if getgenv().Config and getgenv().Config["Allies"] then
     for i, v in pairs(getgenv().Config["Allies"]) do
@@ -58,66 +226,76 @@ end
 getgenv().Config["Allies"] = cleanAllies
 getgenv().Config["MainAccount"] = cleanMains
 
--- TĂNG TỐC: gộp identify + allmains vào 1 request /init (giảm 2 round-trip → 1).
-pcall(function()
+-- TĂNG TỐC: gộp identify + allmains vào 1 request /init (giảm round-trip).
+-- QUAN TRỌNG: retry tới 8 lần — nếu /init lỗi mạng thì account không có role → đứng im.
+do
     local allies_str = table.concat(cleanAllies, ",")
     local mains_str = table.concat(cleanMains, ",")
     local url = BASE_URL .. "/init?name=" .. myName .. "&allies=" .. allies_str .. "&mains=" .. mains_str
-    local data = game.HttpService:JSONDecode(game:HttpGet(url))
-    myRole = data.role or "unknown"
-    if myRole == "main" then
-        myMainIndex = data.index
-        isaccmain[myName] = true
-        mainIndexOf[myName] = myMainIndex
+    local data
+    for attempt = 1, 8 do
+        data = Net.getJSON(url, 0)
+        if data and data.role then break end
+        Net.log("WARN", "/init thử lại " .. attempt .. "/8")
+        wait(0.6 * attempt)
     end
-    -- danh sách toàn bộ main (thay cho /allmains)
-    if data.mains then
-        for _, v in ipairs(data.mains) do
-            if v.name and v.name ~= "" then
-                isaccmain[v.name] = true
-                mainIndexOf[v.name] = v.index
+    if data then
+        myRole = data.role or "unknown"
+        if myRole == "main" then
+            myMainIndex = data.index
+            isaccmain[myName] = true
+            mainIndexOf[myName] = myMainIndex
+        end
+        if data.mains then
+            for _, v in ipairs(data.mains) do
+                if v.name and v.name ~= "" then
+                    isaccmain[v.name] = true
+                    mainIndexOf[v.name] = v.index
+                end
             end
         end
+        Net.log("INFO", "/init OK role=" .. tostring(myRole) .. " index=" .. tostring(myMainIndex))
+    else
+        Net.log("ERR", "/init thất bại hoàn toàn — account sẽ retry status qua các vòng nền")
     end
-end)
+end
 
 getgenv().Config["Team"] = getgenv().Config["Team"] and (getgenv().Config["Team"] == "Marines" or getgenv().Config["Team"] == "Pirates") and getgenv().Config["Team"] or "Marines"
 
+-- POST mainstatus qua hàng đợi (retry). Cập nhật cache ngay để logic dùng giá trị mới.
 function setMyMainStatus(statusStr)
     if not myMainIndex then return end
-    pcall(function()
-        local response = (http_request or http and http.request or request)({
-            ["Url"] = BASE_URL .. "/mainstatus?name=" .. myName,
-            ["Method"] = "POST",
-            ["Headers"] = { ["Content-Type"] = "application/json" },
-            ["Body"] = game.HttpService:JSONEncode({ status = statusStr })
-        })
-    end)
+    statusCache[myName] = { t = tick(), status = statusStr }
+    Net.postJSON(BASE_URL .. "/mainstatus?name=" .. myName, { status = statusStr }, "mainstatus")
 end
 
+-- ===== STATUS CACHE: đọc read-through, TTL ngắn → cắt bão getMainStatus mỗi frame =====
+statusCache = {} -- name -> { t, status }
+local STATUS_TTL = 3
+local function fetchMainStatusLive(accName)
+    local res = Net.getJSON(BASE_URL .. "/mainstatus?name=" .. accName, 0)
+    if res and res["data"] and res["data"]["status"] then return res["data"]["status"] end
+    return nil
+end
 function getMainStatus(accName)
-    local ok, res = pcall(function()
-        return game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/mainstatus?name=" .. accName))
-    end)
-    if ok and res and res["data"] then
-        return res["data"]["status"] or "waiting"
+    local c = statusCache[accName]
+    if c and (tick() - c.t) < STATUS_TTL then return c.status end
+    local st = fetchMainStatusLive(accName)
+    if st == nil then
+        -- FIX: lỗi mạng KHÔNG trả "waiting" (gây logic nhảy lung tung) → giữ giá trị cũ.
+        if c then return c.status end
+        return "waiting"
     end
-    return "waiting"
+    statusCache[accName] = { t = tick(), status = st }
+    return st
 end
 
--- Heartbeat: báo server account còn sống. Account không gửi gì >15s sẽ bị server tự xoá.
+-- Heartbeat: báo server account còn sống (qua hàng đợi, coalesce).
 function sendHeartbeat()
-    pcall(function()
-        (http_request or http and http.request or request)({
-            ["Url"] = BASE_URL .. "/heartbeat?name=" .. myName,
-            ["Method"] = "POST",
-            ["Headers"] = { ["Content-Type"] = "application/json" },
-            ["Body"] = game.HttpService:JSONEncode({ role = myRole })
-        })
-    end)
+    Net.postJSON(BASE_URL .. "/heartbeat?name=" .. myName, { role = myRole }, "heartbeat")
 end
 
--- Vòng lặp nền gửi heartbeat mỗi 5s (an toàn dưới ngưỡng 15s của server)
+-- Vòng nền gửi heartbeat mỗi 5s (server prune ngưỡng 30s → chịu được vài lần rớt)
 spawn(function()
     while true do
         sendHeartbeat()
@@ -125,29 +303,26 @@ spawn(function()
     end
 end)
 
--- ===== ĐỒNG BỘ ABILITY (phương pháp mới): báo donedoor + abilityready lên server =====
--- Báo đã tới cửa trial. clear=true khi rời cửa.
+-- Warmer: làm nóng statusCache nền (rải đều) → getMainStatus trong vòng logic chỉ hit cache.
+spawn(function()
+    while true do
+        local mains = (getgenv().Config and getgenv().Config["MainAccount"]) or {}
+        for _, nm in ipairs(mains) do
+            local st = fetchMainStatusLive(nm)
+            if st ~= nil then statusCache[nm] = { t = tick(), status = st } end
+            wait(0.15)
+        end
+        wait(1.5)
+    end
+end)
+
+-- ===== ĐỒNG BỘ ABILITY: báo donedoor + abilityready (qua hàng đợi, coalesce, retry) =====
 function reportDoneDoor(clear)
-    pcall(function()
-        (http_request or http and http.request or request)({
-            ["Url"] = BASE_URL .. "/donedoor?name=" .. myName,
-            ["Method"] = "POST",
-            ["Headers"] = { ["Content-Type"] = "application/json" },
-            ["Body"] = game.HttpService:JSONEncode({ clear = clear and true or false })
-        })
-    end)
+    Net.postJSON(BASE_URL .. "/donedoor?name=" .. myName, { clear = clear and true or false }, "donedoor")
 end
 
--- Báo sẵn sàng bấm race ability (kèm need = số account cần đủ = #allies + 1).
 function reportAbilityReady(need, clear)
-    pcall(function()
-        (http_request or http and http.request or request)({
-            ["Url"] = BASE_URL .. "/abilityready?name=" .. myName,
-            ["Method"] = "POST",
-            ["Headers"] = { ["Content-Type"] = "application/json" },
-            ["Body"] = game.HttpService:JSONEncode({ need = need, clear = clear and true or false })
-        })
-    end)
+    Net.postJSON(BASE_URL .. "/abilityready?name=" .. myName, { need = need, clear = clear and true or false }, "abilityready")
 end
 
 function thuaaa()
@@ -542,7 +717,7 @@ function followMainAccount()
             return
         end
         local ok, dataplr = pcall(function()
-            return game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/noguchi?name=" .. targetMain))
+            return Net.getJSON(BASE_URL .. "/noguchi?name=" .. targetMain, 1)
         end)
         if ok and dataplr and dataplr["data"] and dataplr["data"]["jobid"] then
             local jobid = dataplr["data"]["jobid"]
@@ -555,7 +730,7 @@ function followMainAccount()
                     status("Follow main: " .. targetMain .. " (hop in 5s...)")
                     wait(5)
                     local ok2, dataplr2 = pcall(function()
-                        return game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/noguchi?name=" .. targetMain))
+                        return Net.getJSON(BASE_URL .. "/noguchi?name=" .. targetMain, 1)
                     end)
                     if ok2 and dataplr2 and dataplr2["data"] and dataplr2["data"]["jobid"] then
                         local jobid2 = dataplr2["data"]["jobid"]
@@ -582,7 +757,7 @@ function followPreviousMain()
     local sameServer = false
     pcall(function()
         local ok, dataplr = pcall(function()
-            return game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/noguchi?name=" .. prevMain))
+            return Net.getJSON(BASE_URL .. "/noguchi?name=" .. prevMain, 1)
         end)
         if ok and dataplr and dataplr["data"] then
             local jobid = dataplr["data"]["jobid"]
@@ -599,6 +774,20 @@ function followPreviousMain()
         end
     end)
     return sameServer
+end
+
+-- Đọc jobid của main hiện tại → trả (cùng_server?, jobid_của_main).
+-- Dùng cho nhánh ally quyết định: cùng server thì ra cửa, khác server thì hop.
+function isSameServerAsMain(mainName)
+    if not mainName then return false, nil end
+    local same, job = false, nil
+    local data = Net.getJSON(BASE_URL .. "/noguchi?name=" .. mainName, 1)
+    if data and data["data"] and data["data"]["jobid"] then
+        job = data["data"]["jobid"]
+        local time_ = data["data"]["time"] or 0
+        if (gettimeserver() - time_) < 60 and job == game.JobId then same = true end
+    end
+    return same, job
 end
 
 function checkgear()
@@ -690,7 +879,10 @@ local checktempledoor = game:GetService("ReplicatedStorage").Remotes.CommF_:Invo
 _G.ShouldSendData = false
 local issobusy = false
 spawn(function()
-    while wait() do
+    -- THROTTLE: trước đây `while wait()` ~mỗi frame → getCurrentMainBeingUpgraded gọi HTTP
+    -- nhiều lần/frame → bão request → executor rate-limit → rớt dữ liệu. Giờ chạy 0.35s/vòng,
+    -- getMainStatus đọc statusCache (warmer nền) nên gần như không còn request trong vòng này.
+    while wait(0.35) do
         if not checktempledoor then
         else
             _G.ShouldSendData = false
@@ -786,7 +978,7 @@ spawn(function()
                             local cachedJobs = {}
                             local okCache, cacheData = pcall(function() return game.HttpService:JSONDecode(readfile("cache_v4.json")) end)
                             if okCache and cacheData then cachedJobs = cacheData end
-                            local thua = game.HttpService:JSONDecode(game:HttpGet("http://fi11.bot-hosting.net:20758/api/name=fullmoon"))
+                            local thua = Net.getJSON("http://fi11.bot-hosting.net:20758/api/name=fullmoon", 5)
                             if thua and thua["success"] and thua["data"] then
                                 for _, v in pairs(thua["data"]) do
                                     local jobid = v["jobid"]
@@ -804,14 +996,7 @@ spawn(function()
                         end)
                         if hopped then
                             wait(10)
-                            pcall(function()
-                                (http_request or http and http.request or request)({
-                                    ["Url"] = BASE_URL .. "/noguchi?name=" .. myName,
-                                    ["Method"] = "POST",
-                                    ["Headers"] = { ["Content-Type"] = "application/json" },
-                                    ["Body"] = game.HttpService:JSONEncode({ jobid = game.JobId })
-                                })
-                            end)
+                            Net.postJSON(BASE_URL .. "/noguchi?name=" .. myName, { jobid = game.JobId }, "noguchi")
                             skip = true
                         end
                     end
@@ -909,11 +1094,26 @@ spawn(function()
                 end
             else
                 local roleName = isaccmain[myName] and ("[MAIN " .. myMainIndex .. " as ALLY]") or "[ALLY]"
-                if not followMainAccount() then
-                    status(roleName .. " Waiting for current main: " .. tostring(currentmain))
-                else
-                    local currentMainStatus = currentmain and getMainStatus(currentmain) or ""
-                    if getgenv().Config["VIPServer"] or (isnight() and isfullmoon()) or issobusy or currentMainStatus == "moon" or currentMainStatus == "in_trail" then
+                local currentMainStatus = currentmain and getMainStatus(currentmain) or ""
+                local mainActive = (currentMainStatus == "moon" or currentMainStatus == "in_trail")
+                -- Main phụ (main-as-ally) KHÔNG hop theo (giữ như bản gốc); chỉ ally thật mới hop.
+                local sameServer, mainJob = true, nil
+                if not isaccmain[myName] then
+                    sameServer, mainJob = isSameServerAsMain(currentmain)
+                end
+                if currentmain and mainActive and not sameServer then
+                    -- Khác server với main đang up → hop sang server của main (throttle 8s tránh spam)
+                    status(roleName .. " Hop sang server main: " .. tostring(currentmain))
+                    if mainJob and mainJob ~= "" and mainJob ~= game.JobId then
+                        if not _G.lastAllyHop or (tick() - _G.lastAllyHop) > 8 then
+                            _G.lastAllyHop = tick()
+                            pcall(function()
+                                game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", mainJob)
+                            end)
+                        end
+                    end
+                -- B: cùng server + main moon/in_trail → RA CỬA NGAY (bỏ chặn fullmoon/Timer). VIP/fullmoon/busy vẫn cho qua.
+                elseif (currentmain and mainActive and sameServer) or getgenv().Config["VIPServer"] or (isnight() and isfullmoon()) or issobusy then
                         spawn(checkgear)
                         _G.ShouldSendData = true
                         if not workspace.Map:FindFirstChild("Temple of Time") then
@@ -950,25 +1150,14 @@ spawn(function()
                                         repeat
                                             wait(1)
                                             timeout = timeout + 1
-                                            local ok, res = pcall(function()
-                                                return game.HttpService:JSONDecode(
-                                                    game:HttpGet(BASE_URL .. "/helpreset?allies=" .. allies_str)
-                                                )
-                                            end)
-                                            if ok and res and res.all_done then break end
+                                            local res = Net.getJSON(BASE_URL .. "/helpreset?allies=" .. allies_str, 0)
+                                            if res and res.all_done then break end
                                         until timeout >= 25
                                     end
                                     game.Players.LocalPlayer.Character.Humanoid.Health = 0
                                     wait(3)
                                     setMyMainStatus("training")
-                                    pcall(function()
-                                        (http_request or http and http.request or request)({
-                                            ["Url"] = BASE_URL .. "/helpreset/clear",
-                                            ["Method"] = "POST",
-                                            ["Headers"] = { ["Content-Type"] = "application/json" },
-                                            ["Body"] = "{}"
-                                        })
-                                    end)
+                                    Net.postJSON(BASE_URL .. "/helpreset/clear", {}, "helpreset_clear")
 
                                 elseif isHelpAcc or isOtherMain then
                                     spawn(function()
@@ -983,14 +1172,7 @@ spawn(function()
                                         wait(delay)
                                         game.Players.LocalPlayer.Character.Humanoid.Health = 0
                                         wait(1)
-                                        pcall(function()
-                                            (http_request or http and http.request or request)({
-                                                ["Url"] = BASE_URL .. "/helpreset",
-                                                ["Method"] = "POST",
-                                                ["Headers"] = { ["Content-Type"] = "application/json" },
-                                                ["Body"] = game.HttpService:JSONEncode({ name = myName })
-                                            })
-                                        end)
+                                        Net.postJSON(BASE_URL .. "/helpreset", { name = myName }, "helpreset")
                                     end)
                                 end
                             end
@@ -1040,11 +1222,10 @@ spawn(function()
                                     end
                                 end
                             else
-                                if game:GetService("Players").LocalPlayer.PlayerGui.Main.Timer.Visible == false then
-                                    local khang
-                                    repeat wait()
-                                        khang = getdoor()
-                                    until khang ~= nil
+                                -- B: bỏ chặn Timer.Visible → ally luôn ra cửa. Giới hạn vòng tìm cửa tránh treo.
+                                local khang, tries = nil, 0
+                                repeat wait(); khang = getdoor(); tries = tries + 1 until khang ~= nil or tries > 50
+                                if khang then
                                     if getdis(khang.CFrame) < 1500 then
                                         topos(khang.CFrame)
                                         status("Ready for trialing (đợi đồng bộ ability)")
@@ -1057,9 +1238,8 @@ spawn(function()
                                 end
                             end
                         end
-                    else
-                        status(roleName .. " Waiting for full moon / leader...")
-                    end
+                else
+                    status(roleName .. " Waiting for current main: " .. tostring(currentmain))
                 end
             end
         end
@@ -1377,11 +1557,9 @@ end)
 serverClockOffset = nil
 function syncClock()
     local t0 = tick()
-    local ok, srv = pcall(function()
-        return tonumber(game:HttpGet(BASE_URL .. "/timeserver"))
-    end)
+    local srv = tonumber(Net.text(BASE_URL .. "/timeserver", 0))
     local t1 = tick()
-    if ok and srv then
+    if srv then
         serverClockOffset = (srv + (t1 - t0) / 2) - t1
         return true
     end
@@ -1394,11 +1572,9 @@ function serverNow()
         return tick() + serverClockOffset
     end
     -- chưa sync xong → lấy thẳng từ server 1 lần (epoch đúng)
-    local ok, srv = pcall(function()
-        return tonumber(game:HttpGet(BASE_URL .. "/timeserver"))
-    end)
-    if ok and srv then return srv end
-    return os and os.time and os.time() or srv or 0
+    local srv = tonumber(Net.text(BASE_URL .. "/timeserver", 1))
+    if srv then return srv end
+    return os and os.time and os.time() or 0
 end
 function gettimeserver()
     return serverNow()
@@ -1431,8 +1607,8 @@ spawn(function()
                     reportDoneDoor(false)
                     if dist < 60 then reportAbilityReady(need) end
                 end
-                -- Poll lịch bấm do server hẹn
-                local sig = game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/firesignal"))
+                -- Poll lịch bấm do server hẹn (cache 0.2s gộp các lần đọc sát nhau)
+                local sig = Net.getJSON(BASE_URL .. "/firesignal", 0.2)
                 if sig and sig.fire_at then
                     local fire_at = tonumber(sig.fire_at) or 0
                     if fire_at > 0 and fire_at ~= _G.allyLastFire then
@@ -1450,18 +1626,10 @@ spawn(function()
 end)
 
 
+-- MỌI account (cả ally) POST jobid mỗi 1s → dashboard hiện server từng con để so cùng/khác server.
 spawn(function()
     while wait(1) do
-        if isaccmain[myName] then
-            pcall(function()
-                local response = (http_request or http and http.request or request)({
-                    ["Url"] = BASE_URL .. "/noguchi?name=" .. myName,
-                    ["Method"] = "POST",
-                    ["Headers"] = { ["Content-Type"] = "application/json" },
-                    ["Body"] = game.HttpService:JSONEncode({ ["jobid"] = game.JobId })
-                })
-            end)
-        end
+        Net.postJSON(BASE_URL .. "/noguchi?name=" .. myName, { jobid = game.JobId }, "noguchi")
     end
 end)
 
@@ -1947,13 +2115,8 @@ end)
 -- =================== PAGE: ACCOUNTS ===================
 local accPage = CreatePage("Accounts")
 function get_data_safe(target_name)
-    local success, response = pcall(function()
-        return game:HttpGet(BASE_URL .. "/noguchi?name=" .. target_name)
-    end)
-    if success and response and response ~= "" then
-        local data = game.HttpService:JSONDecode(response)
-        if data and data.data and data.data.jobid then return data.data.jobid end
-    end
+    local data = Net.getJSON(BASE_URL .. "/noguchi?name=" .. target_name, 3)
+    if data and data.data and data.data.jobid then return data.data.jobid end
     return "N/A"
 end
 local accOrder = 0
@@ -1968,13 +2131,14 @@ for idx, vl in pairs(getgenv().Config["Allies"]) do
     spawn(function()
         while wait(5) do
             pcall(function()
-                local dataplr = game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/noguchi?name=" .. vl))
-                local jobid, time = dataplr["data"]["jobid"], dataplr["data"]["time"]
-                local t = gettimeserver()
-                label:SetDesc(tostring(jobid):sub(1,18) .. " | " .. tostring(t - time) .. "s ago")
-                jobidnow = jobid
-                local gg = get_data_safe(vl)
-                if gg ~= "N/A" then _G.current_target_jobid = gg end
+                local dataplr = Net.getJSON(BASE_URL .. "/noguchi?name=" .. vl, 3)
+                if dataplr and dataplr["data"] and dataplr["data"]["jobid"] then
+                    local jobid, time = dataplr["data"]["jobid"], dataplr["data"]["time"]
+                    local t = gettimeserver()
+                    label:SetDesc(tostring(jobid):sub(1,18) .. " | " .. tostring(t - time) .. "s ago")
+                    jobidnow = jobid
+                    _G.current_target_jobid = jobid
+                end
             end)
         end
     end)
