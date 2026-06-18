@@ -551,21 +551,20 @@ function doTrialForMyRace()
         end)
         if sp then pcall(function() Tween2(sp.CFrame * CFrame.new(0, 10, 0)) end) end
     elseif myrace == "Skypiea" then
-        -- kkv4: topos tới SkyTrial.Model.FinishPart; nếu không thấy → fallback Banana "snowisland_Cylinder.081"
+        -- tới part "snowisland_Cylinder.081" (8/8 nguồn), fallback FinishPart (kkv4).
+        -- BAY TỪ TỪ bằng Tween2 (mượt, qua quãng đường) thay vì tốc biến.
         local finish
         pcall(function()
             local model = workspace.Map:FindFirstChild("SkyTrial")
             model = model and model:FindFirstChild("Model")
             if model then
-                finish = model:FindFirstChild("FinishPart")
-                if not finish then
-                    for _, obj in pairs(model:GetDescendants()) do
-                        if obj.Name == "snowisland_Cylinder.081" then finish = obj break end
-                    end
+                for _, obj in pairs(model:GetDescendants()) do
+                    if obj.Name == "snowisland_Cylinder.081" then finish = obj break end
                 end
+                finish = finish or model:FindFirstChild("FinishPart")
             end
         end)
-        if finish then pcall(function() topos(finish.CFrame) end) end
+        if finish then pcall(function() Tween2(finish.CFrame) end) end
     elseif myrace == "Cyborg" then
         pcall(function() tp(workspace.Map.CyborgTrial.Floor.CFrame * CFrame.new(0, 500, 0)) end)
     elseif myrace == "Human" or myrace == "Ghoul" then
@@ -1825,20 +1824,14 @@ spawn(function()
                 -- Chỉ MAIN đang tới turn mới chốt giờ
                 local curName = getCurrentMainBeingUpgraded()
                 if curName and myName == curName then
-                    local existing = readStart()           -- giây-trong-ngày (Hà Nội) hoặc nil
-                    local nowSec = hanoiSecOfDay(serverNow())
-                    -- "đã qua cửa sổ" → cho đặt giờ mới. Xử lý wrap qua nửa đêm.
-                    local needNew = true
-                    if existing then
-                        local age = nowSec - existing
-                        if age < -43200 then age = age + 86400 end
-                        if age <= ABILITY_FIRE_WINDOW then needNew = false end  -- còn pending/đang trong window
-                    end
-                    if needNew and allReady() then
-                        pcall(function()
-                            -- starttime = giờ thực Hà Nội hiện tại + 10s, dạng HH:MM:SS
-                            writefile(START_FILE, fmtHanoi(serverNow() + START_LEAD))
-                        end)
+                    -- Dùng EPOCH nội bộ để biết "vừa ghi gần đây" thay vì đọc lại giây-trong-ngày
+                    -- của file (file cũ/khác ngày làm needNew kẹt false → không ghi starttime nữa).
+                    -- Chốt mới khi: đã quá (lead+window) từ lần chốt trước VÀ đủ 3 con sẵn sàng.
+                    local now = serverNow()
+                    local last = _G.myStartEpoch or 0
+                    if (now - last) > (START_LEAD + ABILITY_FIRE_WINDOW) and allReady() then
+                        pcall(function() writefile(START_FILE, fmtHanoi(now + START_LEAD)) end)
+                        _G.myStartEpoch = now
                     end
                 end
             end
