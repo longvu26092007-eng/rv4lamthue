@@ -539,7 +539,10 @@ function doTrialForMyRace()
 
     if myrace == "Mink" then
         -- 1.txt/3.txt: TWEEN MƯỢT tới part "StartPoint" (+10) — đi qua quãng đường để game NHẬN.
-        -- (teleport tức thì = "vừa vào đã tới đích" → trial không nhận.)
+        -- VỪA VÀO map trial → delay 2s cho trial khởi tạo rồi mới tween (tránh "vào là tới đích, không nhận").
+        -- Debounce: gap >3s = vừa vào lại → mới delay; đang trial liên tục thì không delay lặp.
+        if tick() - (_G.minkLastTrial or 0) > 3 then wait(2) end
+        _G.minkLastTrial = tick()
         local sp
         pcall(function()
             for _, obj in pairs(workspace:GetDescendants()) do
@@ -548,20 +551,21 @@ function doTrialForMyRace()
         end)
         if sp then pcall(function() Tween2(sp.CFrame * CFrame.new(0, 10, 0)) end) end
     elseif myrace == "Skypiea" then
-        -- 1.txt/3.txt: BKP (set CFrame thẳng) tới "snowisland_Cylinder.081" (điểm hoàn thành).
-        -- BKP dời chắc chắn (module:topos hay kẹt → "đứng yên không bay / dính im khi đi-nhảy").
+        -- kkv4: topos tới SkyTrial.Model.FinishPart; nếu không thấy → fallback Banana "snowisland_Cylinder.081"
         local finish
         pcall(function()
             local model = workspace.Map:FindFirstChild("SkyTrial")
             model = model and model:FindFirstChild("Model")
             if model then
-                for _, obj in pairs(model:GetDescendants()) do
-                    if obj.Name == "snowisland_Cylinder.081" then finish = obj break end
+                finish = model:FindFirstChild("FinishPart")
+                if not finish then
+                    for _, obj in pairs(model:GetDescendants()) do
+                        if obj.Name == "snowisland_Cylinder.081" then finish = obj break end
+                    end
                 end
-                finish = finish or model:FindFirstChild("FinishPart")
             end
         end)
-        if finish then pcall(function() BKP(finish.CFrame) end) end
+        if finish then pcall(function() topos(finish.CFrame) end) end
     elseif myrace == "Cyborg" then
         pcall(function() tp(workspace.Map.CyborgTrial.Floor.CFrame * CFrame.new(0, 500, 0)) end)
     elseif myrace == "Human" or myrace == "Ghoul" then
@@ -1650,7 +1654,7 @@ end)
 -- starttime ghi "HH:MM:SS" giờ UTC+7 (Hà Nội/Bangkok); so theo giây-trong-ngày → bấm đồng bộ 1 thời điểm.
 local ABILITY_FIRE_WINDOW = 6   -- giây — chỉ bấm trong khoảng [start, start+window)
 local AT_DOOR_DIST = 150        -- coi như "đứng ở cửa" khi cách Entrance < ngần này (nới nhẹ từ 120)
-local START_LEAD   = 10         -- giây — starttime = bây giờ + 10s
+local START_LEAD   = 5          -- giây — starttime = bây giờ + 5s
 local CHECK_FILE   = "checkalready.txt"
 local START_FILE   = "starttime.txt"
 
