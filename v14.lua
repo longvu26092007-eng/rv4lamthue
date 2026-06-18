@@ -125,6 +125,31 @@ spawn(function()
     end
 end)
 
+-- ===== ĐỒNG BỘ ABILITY (phương pháp mới): báo donedoor + abilityready lên server =====
+-- Báo đã tới cửa trial. clear=true khi rời cửa.
+function reportDoneDoor(clear)
+    pcall(function()
+        (http_request or http and http.request or request)({
+            ["Url"] = BASE_URL .. "/donedoor?name=" .. myName,
+            ["Method"] = "POST",
+            ["Headers"] = { ["Content-Type"] = "application/json" },
+            ["Body"] = game.HttpService:JSONEncode({ clear = clear and true or false })
+        })
+    end)
+end
+
+-- Báo sẵn sàng bấm race ability (kèm need = số account cần đủ = #allies + 1).
+function reportAbilityReady(need, clear)
+    pcall(function()
+        (http_request or http and http.request or request)({
+            ["Url"] = BASE_URL .. "/abilityready?name=" .. myName,
+            ["Method"] = "POST",
+            ["Headers"] = { ["Content-Type"] = "application/json" },
+            ["Body"] = game.HttpService:JSONEncode({ need = need, clear = clear and true or false })
+        })
+    end)
+end
+
 function thuaaa()
     if game:GetService("Players").LocalPlayer.Team then return end
     local team = getgenv().Config["Team"]
@@ -872,37 +897,8 @@ spawn(function()
                                 local isNearTemple = getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) < 3000
                                 if isNearTemple then
                                     topos(khang.CFrame)
-                                    status("[MAIN " .. myMainIndex .. "] Ready for trialing")
-                                    if myName == currentmain then
-                                        -- Main check /donedoor: đủ người tới cửa thì phát fire_at GIỜ THẬT.
-                                        -- KHÔNG tự bấm ở đây — vòng nền bấm cho cả main lẫn ally cùng lúc.
-                                        local doneCount = 0
-                                        pcall(function()
-                                            local dd = game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/donedoor"))
-                                            if dd and dd.count then doneCount = dd.count end
-                                        end)
-                                        -- đủ điều kiện: server thấy ≥3 người ở cửa HOẶC local đếm ≥3
-                                        if doneCount >= 3 or isshouldturnonability() then
-                                            -- chỉ phát tín hiệu mới nếu chưa có fire_at còn hiệu lực
-                                            local cur = 0
-                                            pcall(function()
-                                                local s = game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/firesignal"))
-                                                if s and s.fire_at then cur = tonumber(s.fire_at) or 0 end
-                                            end)
-                                            if (realNow() - cur) > 8 then   -- fire_at cũ đã qua → phát cái mới
-                                                local fire_at = realNow() + 10   -- bấm sau 10s giờ thật
-                                                pcall(function()
-                                                    (http_request or http and http.request or request)({
-                                                        ["Url"] = BASE_URL .. "/firesignal?name=" .. myName,
-                                                        ["Method"] = "POST",
-                                                        ["Headers"] = { ["Content-Type"] = "application/json" },
-                                                        ["Body"] = game.HttpService:JSONEncode({ fire_at = fire_at })
-                                                    })
-                                                end)
-                                                status("[MAIN " .. myMainIndex .. "] Fire in 10s (" .. doneCount .. " at door)")
-                                            end
-                                        end
-                                    end
+                                    status("[MAIN " .. myMainIndex .. "] Ready for trialing (đợi đồng bộ ability)")
+                                    -- Báo donedoor+abilityready và bấm ability đúng giờ do vòng ABILITY SYNC lo.
                                 else
                                     -- FIX #3: requestEntrance chỉ nhận Vector3 (bỏ rotation data)
                                     game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", Vector3.new(28310.0234, 14895.1123, 109.456741))
@@ -1051,9 +1047,9 @@ spawn(function()
                                     until khang ~= nil
                                     if getdis(khang.CFrame) < 1500 then
                                         topos(khang.CFrame)
-                                        status("Ready for trialing")
-                                        -- Bấm ability do ALLY FAST-POLL (0.3s) lo → cả 2 ally bấm
-                                        -- gần như tức thì. Ở đây chỉ cần giữ vị trí ở cửa.
+                                        status("Ready for trialing (đợi đồng bộ ability)")
+                                        -- Đứng giữ vị trí ở cửa. Báo donedoor+abilityready và bấm
+                                        -- ability đúng giờ fire_at do vòng ABILITY SYNC lo.
                                     else
                                         -- FIX #3: requestEntrance chỉ nhận Vector3
                                         game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", Vector3.new(28310.0234, 14895.1123, 109.456741))
@@ -1413,75 +1409,43 @@ spawn(function()
     while true do wait(20); pcall(syncClock) end
 end)
 
--- ===== ĐỒNG BỘ BẤM ABILITY THEO GIỜ THẬT (os.time epoch) =====
--- Cơ chế mới:
---   1) Account nào tới cửa trial → POST /donedoor báo server (mọi role).
---   2) Main (currentmain) check /donedoor; đủ người → tính fire_at = os.time() + LEAD
---      (GIỜ THẬT epoch UTC, giống nhau mọi máy) → POST /firesignal.
---   3) Cả 3 (main + 2 ally) poll /firesignal mỗi 2s; canh tới ĐÚNG giây fire_at thì
---      busy-wait cho khít giây boundary rồi cùng bấm → cả 3 bấm cùng một giây thật.
--- realNow(): giờ thật epoch. Ưu tiên os.time() (đồng hồ máy), fallback serverNow().
-function realNow()
-    local ok, t = pcall(function() return os and os.time and os.time() end)
-    if ok and t and t > 1000000000 then return t end
-    return serverNow()
-end
-
--- vị trí hợp lệ: sát cửa race của mình HOẶC đang trong khu Temple of Time
-local function inTrialPlace()
-    local ok1, d = pcall(function()
-        local door = getdoor()
-        return door and getdis(door.CFrame) < 150
-    end)
-    if ok1 and d then return true end
-    local ok2, near = pcall(function()
-        return getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) < 3000
-    end)
-    return ok2 and near
-end
-
--- POST /donedoor (đánh dấu đã tới cửa, hoặc clear khi rời)
-local function postDoneDoor(clear)
-    pcall(function()
-        (http_request or http and http.request or request)({
-            ["Url"] = BASE_URL .. "/donedoor?name=" .. myName,
-            ["Method"] = "POST",
-            ["Headers"] = { ["Content-Type"] = "application/json" },
-            ["Body"] = game.HttpService:JSONEncode({ clear = clear and true or false })
-        })
-    end)
-end
-
--- Bấm đúng tại giây fire_at thật: chờ thô tới gần, rồi busy-wait cho khít giây boundary.
-local function fireAtRealTime(fire_at)
-    while realNow() < fire_at do
-        local left = fire_at - realNow()
-        if left > 1.5 then wait(0.5) else wait() end   -- gần tới thì vòng sát để khít giây
-    end
-    game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
-end
-
--- Vòng nền: vừa báo donedoor (khi ở cửa), vừa canh fire_at để bấm. Poll mỗi 2s.
+-- ===== ABILITY SYNC (phương pháp mới): server hẹn giờ, 3 account bấm cùng lúc =====
+-- Dùng chung cho cả MAIN đang tới turn lẫn ALLY. Khi đứng ở cửa corridor của mình:
+--   1) Báo donedoor (gần cửa <120) + abilityready (sát cửa <60) lên server (throttle ~1.2s).
+--   2) Server thấy đủ "need" account có cả 2 cờ (= #allies+1, tức đủ 6 tín hiệu)
+--      → đặt fire_at = giờ_server + 15s.
+--   3) Poll /firesignal 0.3s; tới ĐÚNG fire_at (age ∈ [0, window)) thì bấm ActivateAbility 1 lần.
+-- Khác bản cũ: bấm ĐÚNG giờ fire_at (không bấm sớm), _G.allyLastFire chống bấm trùng.
+local ABILITY_FIRE_WINDOW = 6   -- giây — chỉ bấm trong khoảng [fire_at, fire_at+window)
 spawn(function()
+    local tickn = 0
     while true do
+        tickn = tickn + 1
         pcall(function()
-            if inTrialPlace() then
-                postDoneDoor(false)   -- báo "tôi đã tới cửa"
+            local door = getdoor()
+            local dist = (door and getdis(door.CFrame)) or 1e9
+            if dist < 120 then
+                local need = #(getgenv().Config["Allies"] or {}) + 1
+                -- Báo trạng thái (throttle ~1.2s/lần để đỡ spam request)
+                if tickn % 4 == 0 then
+                    reportDoneDoor(false)
+                    if dist < 60 then reportAbilityReady(need) end
+                end
+                -- Poll lịch bấm do server hẹn
                 local sig = game.HttpService:JSONDecode(game:HttpGet(BASE_URL .. "/firesignal"))
                 if sig and sig.fire_at then
                     local fire_at = tonumber(sig.fire_at) or 0
                     if fire_at > 0 and fire_at ~= _G.allyLastFire then
-                        local delta = fire_at - realNow()
-                        if delta > -8 and delta < 30 then     -- tín hiệu hợp lệ (sắp tới / vừa qua)
+                        local age = serverNow() - fire_at
+                        if age >= 0 and age < ABILITY_FIRE_WINDOW then
                             _G.allyLastFire = fire_at
-                            if delta > 0 then fireAtRealTime(fire_at)
-                            else game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility") end
+                            game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
                         end
                     end
                 end
             end
         end)
-        wait(2)   -- poll mỗi 2s như yêu cầu
+        wait(0.3)
     end
 end)
 
