@@ -1062,8 +1062,8 @@ spawn(function()
                             elseif myrace == "Fishman" then
                                 for i, v in pairs(workspace.SeaBeasts:GetChildren()) do
                                     pcall(function()
-                                        -- FIX #2: race_trial_place.CFrame (trước truyền object)
-                                        if v:FindFirstChild('Health') and v.Health.Value > 0 and v:FindFirstChild("HumanoidRootPart") and getdis(v.HumanoidRootPart.CFrame, race_trial_place.CFrame) < 1500 then
+                                        -- Khớp kkv4: Fishman truyền race_trial_place (object), KHÔNG .CFrame
+                                        if v:FindFirstChild('Health') and v.Health.Value > 0 and v:FindFirstChild("HumanoidRootPart") and getdis(v.HumanoidRootPart.CFrame, race_trial_place) < 1500 then
                                             repeat wait()
                                                 if not game:GetService("Players").LocalPlayer.Backpack:FindFirstChild("Sharkman Karate") then
                                                     game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("BuySharkmanKarate")
@@ -1212,8 +1212,8 @@ spawn(function()
                                 elseif myrace == "Fishman" then
                                     for i, v in pairs(workspace.SeaBeasts:GetChildren()) do
                                         pcall(function()
-                                            -- FIX #2: race_trial_place.CFrame
-                                            if v:FindFirstChild('Health') and v.Health.Value > 0 and v:FindFirstChild("HumanoidRootPart") and getdis(v.HumanoidRootPart.CFrame, race_trial_place.CFrame) < 1500 then
+                                            -- Khớp kkv4: Fishman truyền race_trial_place (object), KHÔNG .CFrame
+                                            if v:FindFirstChild('Health') and v.Health.Value > 0 and v:FindFirstChild("HumanoidRootPart") and getdis(v.HumanoidRootPart.CFrame, race_trial_place) < 1500 then
                                                 repeat wait()
                                                     if not game:GetService("Players").LocalPlayer.Backpack:FindFirstChild("Sharkman Karate") then
                                                         game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("BuySharkmanKarate")
@@ -1612,6 +1612,20 @@ local function distToMyDoor()
     return (door and getdis(door.CFrame)) or 1e9
 end
 
+-- Race ability đã SẴN SÀNG dùng chưa? = đứng trước door, có thể nhấn nút (T → ActivateAbility)
+-- để VÀO TRIAL. Không phải Y biến hình, không phải awakening.
+-- Dùng trialable() (đã có sẵn): true = account đang ở trạng thái có thể vào trial ngay.
+-- CACHE TTL 2s: trialable() gọi InvokeServer (và auto-Buy gear) → không gọi mỗi 1s.
+local _abReady = { t = -1e9, v = false }
+local function abilityReady()
+    local now = tick()
+    if now - _abReady.t < 2 then return _abReady.v end
+    local ok, ready = pcall(trialable)
+    _abReady.t = now
+    _abReady.v = ok and ready == true
+    return _abReady.v
+end
+
 -- Vị trí của mình trong danh sách Allies (1-based), nil nếu không phải ally
 local function allyIndexOf(nm)
     for i, v in ipairs(getgenv().Config["Allies"] or {}) do
@@ -1711,9 +1725,10 @@ spawn(function()
         pcall(function()
             local label = myAbilityLabel()
             if label then
-                -- đủ CẢ 2 điều kiện: ở cửa + ability sẵn sàng (đứng ở cửa coi như đã làm v4 xong, sẵn sàng)
-                local atDoor = distToMyDoor() < AT_DOOR_DIST
-                writeMyCheck(label, atDoor)
+                -- chỉ true khi đủ CẢ 2: gần door VÀ race ability (V3) đã sẵn sàng bật (Y).
+                -- Thiếu 1 trong 2 → ghi false. Ghi liên tục mỗi 1s kể từ khi load script.
+                local cond = (distToMyDoor() < AT_DOOR_DIST) and abilityReady()
+                writeMyCheck(label, cond)
 
                 -- Chỉ MAIN đang tới turn mới chốt giờ
                 local curName = getCurrentMainBeingUpgraded()
