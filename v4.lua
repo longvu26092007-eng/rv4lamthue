@@ -242,7 +242,7 @@ do
         data = Net.getJSON(url, 0)
         if data and data.role then break end
         Net.log("WARN", "/init thử lại " .. attempt .. "/8")
-        wait(0.6 * attempt)
+        wait(0.3 + 0.2 * attempt)  -- backoff nhẹ hơn → load nhanh hơn khi mạng chập chờn
     end
     if data then
         myRole = data.role or "unknown"
@@ -444,6 +444,23 @@ local topos = function(v)
     return module:topos(v)
 end
 
+local TEMPLE_ENTRY = Vector3.new(28310.0234, 14895.1123, 109.456741)
+-- Lên đứng ở cửa trial NHANH (non-blocking): có cửa & đã ở temple → tween bám sát (timeout 5s);
+-- chưa có cửa/chưa tới temple → requestEntrance vào temple NGAY cho corridor load (không spin chờ).
+function goToMyDoor()
+    local door = getdoor()
+    if door and getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) < 3000 then
+        local t0 = tick()
+        repeat wait(); pcall(function() topos(door.CFrame) end)
+        until getdis(door.CFrame) < 60 or (tick() - t0) > 5
+        return true
+    end
+    pcall(function()
+        game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", TEMPLE_ENTRY)
+    end)
+    return false
+end
+
 local pos_plr_trial = {
     CFrame.new(28692.3477, 14887.5605, -53.7669983, 0.707131445, -0, -0.707082093, 0, 1, -0, 0.707082093, 0, 0.707131445),
     CFrame.new(28782.7246, 14898.9902, -59.6069946, 0.707134247, 0, 0.707079291, 0, 1, 0, -0.707079291, 0, 0.707134247),
@@ -482,6 +499,64 @@ local races_trial_place = {
     ["Cyborg"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of the Machine"),
     ["Draco"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of Flames")
 }
+
+-- ============================================================
+-- [TRIAL] Làm trial theo từng tộc — bản BANANA "xịn" (port sang style topos của KaitunV4)
+-- Nguồn: D:\Video\suộc banana\Banana.lua......txt:8274-8319 (Function/02_trial_per_race.lua)
+-- Khác bản kkv4 cũ (bị bug): toạ độ/part chuẩn hơn cho Mink/Skypiea/Cyborg, Fishman nhắm SeaBeast1,
+-- Human/Ghoul kill TOÀN BỘ Enemies (bỏ lọc khoảng cách < 1500 vốn hay loại nhầm mob trial).
+-- Dùng chung cho cả nhánh MAIN lẫn ALLY.
+function doTrialForMyRace()
+    local myrace = game.Players.LocalPlayer.Data.Race.Value
+    if myrace == "Human" or myrace == "Ghoul" then
+        -- Banana: kill toàn bộ Enemies (eq + haki + topos lên đầu mob)
+        for _, v in pairs(workspace.Enemies:GetChildren()) do
+            if v:FindFirstChild("HumanoidRootPart") and v:FindFirstChild("Humanoid") and v.Humanoid.Health > 0 then
+                repeat wait()
+                    module:eq(); module:haki()
+                    pcall(function() topos(v.HumanoidRootPart.CFrame * CFrame.new(0, 30, 0)) end)
+                until not v or not v.Parent or not v:FindFirstChild("Humanoid") or v.Humanoid.Health <= 0
+            end
+        end
+    elseif myrace == "Skypiea" then
+        -- Banana: tp tới part "snowisland_Cylinder.081" trong SkyTrial.Model
+        pcall(function()
+            local sky = workspace.Map.SkyTrial.Model
+            for _, obj in pairs(sky:GetDescendants()) do
+                if obj.Name == "snowisland_Cylinder.081" then
+                    topos(obj.CFrame)
+                    break
+                end
+            end
+        end)
+    elseif myrace == "Cyborg" then
+        -- Banana: tp toạ độ sàn cố định
+        pcall(function() topos(CFrame.new(28654, 14898.7832, -30)) end)
+    elseif myrace == "Mink" then
+        -- Banana: tp tới part "StartPoint" + offset (0,10,0)
+        pcall(function()
+            for _, obj in pairs(workspace:GetDescendants()) do
+                if obj.Name == "StartPoint" then
+                    topos(obj.CFrame * CFrame.new(0, 10, 0))
+                    break
+                end
+            end
+        end)
+    elseif myrace == "Fishman" then
+        -- Banana: nhắm riêng SeaBeast1, mua Sharkman + spam skills
+        local sb = workspace.SeaBeasts:FindFirstChild("SeaBeast1")
+        if sb and sb:FindFirstChild("Health") and sb.Health.Value > 0 and sb:FindFirstChild("HumanoidRootPart") then
+            repeat wait()
+                if not game:GetService("Players").LocalPlayer.Backpack:FindFirstChild("Sharkman Karate") then
+                    pcall(function() game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("BuySharkmanKarate") end)
+                end
+                pcall(function() topos(sb.HumanoidRootPart.CFrame * CFrame.new(0, 500, 0)) end)
+                _G.SHOULDSPAMSKILLS = true
+            until not sb or not sb:FindFirstChild("Health") or sb.Health.Value <= 0 or not sb:FindFirstChild("HumanoidRootPart")
+            _G.SHOULDSPAMSKILLS = false
+        end
+    end
+end
 
 _G.playersinserver = {}
 function updateplayers()
@@ -606,6 +681,21 @@ function countplayers()
     local c = 0
     for _ in pairs(getplayers()) do c = c + 1 end
     return c
+end
+
+-- 1 nhịp đánh player trong trial: topos quanh target. Offset random đổi mỗi 0.3s (không mỗi
+-- frame) → hết giật, bám target lâu hơn nên kill nhanh hơn. Nil-safe.
+local _atkOff, _atkT = CFrame.new(0, 3, 0), 0
+function attackTick(target)
+    if tick() - _atkT > 0.3 then
+        _atkT = tick()
+        local x, z = math.random(1, 4), math.random(1, 4)
+        if math.random(1, 2) == 1 then x = -x end
+        if math.random(1, 2) == 1 then z = -z end
+        _atkOff = CFrame.new(x, 3, z)
+    end
+    local hrp = target and target:FindFirstChild("HumanoidRootPart")
+    if hrp then pcall(function() topos(hrp.CFrame * _atkOff) end) end
 end
 function checkbackpack(v)
     return game.Players.LocalPlayer.Backpack:FindFirstChild(v) or game.Players.LocalPlayer.Character:FindFirstChild(v)
@@ -918,46 +1008,42 @@ spawn(function()
                     if AB == "raiding" then
                         local boss = workspace.Enemies:FindFirstChild("Cake Prince") or workspace.Enemies:FindFirstChild("Dough King")
                         if boss then
+                            status("[MAIN " .. myMainIndex .. "] Raiding for fragment")
                             repeat wait()
                                 pcall(function() topos(boss.HumanoidRootPart.CFrame * CFrame.new(0, 25, 0)) end)
-                                module:eq()
-                                module:haki()
-                                BringMob()
+                                module:eq(); module:haki(); BringMob()
                             until not checkmob_(boss)
                         end
-                        status("[MAIN " .. myMainIndex .. "] Raiding for fragment")
                     else
-                        pcall(function()
-                            if game.Players.LocalPlayer.Character.RaceEnergy.Value == 1 then
-                                game:GetService("VirtualInputManager"):SendKeyEvent(true, "Y", false, game)
-                                game:GetService("VirtualInputManager"):SendKeyEvent(false, "Y", false, game)
-                            end
-                        end)
+                        local LP  = game:GetService("Players").LocalPlayer
+                        local VIM = game:GetService("VirtualInputManager")
+                        local function pressV4()  -- bấm Y biến hình V4 khi RaceEnergy đầy (nil-safe)
+                            pcall(function()
+                                local c = LP.Character
+                                if c and c:FindFirstChild("RaceEnergy") and c.RaceEnergy.Value == 1 then
+                                    VIM:SendKeyEvent(true, "Y", false, game)
+                                    VIM:SendKeyEvent(false, "Y", false, game)
+                                end
+                            end)
+                        end
+                        pressV4()
                         local pos__ = CFrame.new(214.688675, 126.626984, -12600.2236, -0.180400655, -1.09679892e-08, 0.983593225, 1.94620693e-08, 1, 1.47204746e-08, -0.983593225, 2.17983427e-08, -0.180400655)
                         if getdis(pos__) < 1500 then
-                            local mobs = getmob1(pos__)
-                            for i, v in pairs(mobs) do
+                            for _, v in ipairs(getmob1(pos__)) do
+                                local lastY, lastTf = 0, nil
                                 repeat wait()
-                                    module:eq()
-                                    module:haki()
-                                    BringMob()
-                                    pcall(function()
-                                        if game.Players.LocalPlayer.Character.RaceTransformed.Value then
-                                            status("[MAIN " .. myMainIndex .. "] Training (Wait for end V4)")
-                                            topos(v.HumanoidRootPart.CFrame * CFrame.new(0, 150, 0))
-                                        else
-                                            status("[MAIN " .. myMainIndex .. "] Training (Kill Mobs)")
-                                            topos(v.HumanoidRootPart.CFrame * CFrame.new(0, 20, 0))
-                                        end
-                                    end)
-                                    spawn(function()
-                                        pcall(function()
-                                            if game.Players.LocalPlayer.Character.RaceEnergy.Value == 1 then
-                                                game:GetService("VirtualInputManager"):SendKeyEvent(true, "Y", false,game)
-                                                game:GetService("VirtualInputManager"):SendKeyEvent(false, "Y", false,game)
-                                            end
-                                        end)
-                                    end)
+                                    module:eq(); module:haki(); BringMob()
+                                    local c   = LP.Character
+                                    local hrp = v:FindFirstChild("HumanoidRootPart")
+                                    local tf  = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
+                                    -- transformed → đứng cao chờ hết V4; chưa → áp sát kill
+                                    if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, tf and 150 or 20, 0)) end) end
+                                    if tf ~= lastTf then  -- đổi status chỉ khi state đổi → hết giật chữ
+                                        status("[MAIN " .. myMainIndex .. (tf and "] Training (Wait for end V4)" or "] Training (Kill Mobs)"))
+                                        lastTf = tf
+                                    end
+                                    -- bấm Y throttle 0.4s, KHÔNG spawn mỗi frame → hết giật
+                                    if (not tf) and (tick() - lastY > 0.4) then lastY = tick(); pressV4() end
                                 until not checkmob_(v)
                             end
                         else
@@ -1015,18 +1101,9 @@ spawn(function()
                         end
                     elseif workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 0 then
                         status("[MAIN " .. myMainIndex .. "] Kill Players After Trial")
-                        for plr, i in pairs(getplayers()) do
+                        for plr in pairs(getplayers()) do
                             if plr then
-                                repeat wait()
-                                    pcall(function()
-                                        topos(plr.HumanoidRootPart.CFrame * CFrame.new((function()
-                                            local x, y, z = 0, 3, 0
-                                            x = math.random(1, 4); z = math.random(1, 4)
-                                            if math.random(1, 2) == 1 then x = x * -1 end
-                                            if math.random(1, 2) == 1 then z = z * -1 end
-                                            return x, y, z
-                                        end)()))
-                                    end)
+                                repeat wait() attackTick(plr)
                                 until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 1
                             end
                         end
@@ -1040,59 +1117,11 @@ spawn(function()
                                 setMyMainStatus("in_trail")
                             end
                             status("[MAIN " .. myMainIndex .. "] Doing trial")
-                            local myrace = game.Players.LocalPlayer.Data.Race.Value
-                            if myrace == "Mink" then
-                                pcall(function() topos(workspace.Map.MinkTrial.Ceiling.CFrame * CFrame.new(0,-20,0)) end)
-                            elseif myrace == "Skypiea" then
-                                pcall(function() topos(workspace.Map.SkyTrial.Model.FinishPart.CFrame) end)
-                            elseif myrace == "Cyborg" then
-                                pcall(function() topos(workspace.Map.CyborgTrial.Floor.CFrame * CFrame.new(0, 500, 0)) end)
-                            elseif myrace == "Human" or myrace == "Ghoul" then
-                                for i, v in pairs(game.Workspace.Enemies:GetChildren()) do
-                                    if v:FindFirstChild("HumanoidRootPart") and v:FindFirstChild("Humanoid") and v.Humanoid.Health > 0 then
-                                        if getdis(v.HumanoidRootPart.CFrame, race_trial_place.CFrame) < 1500 then
-                                            repeat wait()
-                                                module:eq()
-                                                module:haki()
-                                                pcall(function() topos(v:FindFirstChild("HumanoidRootPart").CFrame * CFrame.new(0, 30, 0)) end)
-                                            until not v or not v:FindFirstChild("HumanoidRootPart") or not v:FindFirstChild("Humanoid") or v.Humanoid.Health <= 0
-                                        end
-                                    end
-                                end
-                            elseif myrace == "Fishman" then
-                                for i, v in pairs(workspace.SeaBeasts:GetChildren()) do
-                                    pcall(function()
-                                        -- Khớp kkv4: Fishman truyền race_trial_place (object), KHÔNG .CFrame
-                                        if v:FindFirstChild('Health') and v.Health.Value > 0 and v:FindFirstChild("HumanoidRootPart") and getdis(v.HumanoidRootPart.CFrame, race_trial_place) < 1500 then
-                                            repeat wait()
-                                                if not game:GetService("Players").LocalPlayer.Backpack:FindFirstChild("Sharkman Karate") then
-                                                    game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("BuySharkmanKarate")
-                                                end
-                                                topos(v.HumanoidRootPart.CFrame * CFrame.new(0, 500, 0))
-                                                _G.SHOULDSPAMSKILLS = true
-                                            until not v or not v:FindFirstChild('Health') or v.Health.Value <= 0 or not v:FindFirstChild("HumanoidRootPart")
-                                            _G.SHOULDSPAMSKILLS = false
-                                        end
-                                    end)
-                                end
-                            end
+                            doTrialForMyRace()
                         else
                             if game:GetService("Players").LocalPlayer.PlayerGui.Main.Timer.Visible == false then
-                                local khang
-                                repeat wait()
-                                    khang = pcall(function()
-                                        return getdoor()
-                                    end) and getdoor()
-                                until khang ~= nil
-                                local isNearTemple = getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) < 3000
-                                if isNearTemple then
-                                    topos(khang.CFrame)
-                                    status("[MAIN " .. myMainIndex .. "] Ready for trialing (đợi đồng bộ ability)")
-                                    -- Đứng ở cửa. Ghi checkalready.txt=true + bấm ability đúng starttime do vòng ABILITY SYNC (file) lo.
-                                else
-                                    -- FIX #3: requestEntrance chỉ nhận Vector3 (bỏ rotation data)
-                                    game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", Vector3.new(28310.0234, 14895.1123, 109.456741))
-                                end
+                                status("[MAIN " .. myMainIndex .. "] Ready for trialing (đợi đồng bộ ability)")
+                                goToMyDoor()  -- file ABILITY SYNC lo ghi check + bấm đúng starttime
                             end
                         end
                     end
@@ -1107,10 +1136,10 @@ spawn(function()
                     sameServer, mainJob = isSameServerAsMain(currentmain)
                 end
                 if currentmain and mainActive and not sameServer then
-                    -- Khác server với main đang up → hop sang server của main (throttle 8s tránh spam)
+                    -- Khác server với main đang up → hop sang server của main (throttle 5s tránh spam)
                     status(roleName .. " Hop sang server main: " .. tostring(currentmain))
                     if mainJob and mainJob ~= "" and mainJob ~= game.JobId then
-                        if not _G.lastAllyHop or (tick() - _G.lastAllyHop) > 8 then
+                        if not _G.lastAllyHop or (tick() - _G.lastAllyHop) > 5 then
                             _G.lastAllyHop = tick()
                             pcall(function()
                                 game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", mainJob)
@@ -1148,18 +1177,9 @@ spawn(function()
                                 end
                             else
                                 status(roleName .. " Kill Players After Trial")
-                                for plr, i in pairs(getplayers()) do
+                                for plr in pairs(getplayers()) do
                                     if plr then
-                                        repeat wait()
-                                            pcall(function()
-                                                topos(plr.HumanoidRootPart.CFrame * CFrame.new((function()
-                                                    local x, y, z = 0, 3, 0
-                                                    x = math.random(1, 4); z = math.random(1, 4)
-                                                    if math.random(1, 2) == 1 then x = x * -1 end
-                                                    if math.random(1, 2) == 1 then z = z * -1 end
-                                                    return x, y, z
-                                                end)()))
-                                            end)
+                                        repeat wait() attackTick(plr)
                                         until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 1
                                     end
                                 end
@@ -1200,59 +1220,11 @@ spawn(function()
                             end
                             if race_trial_place and getdis(race_trial_place.CFrame) < 1500 then
                                 status(roleName .. " Doing trial")
-                                local myrace = game.Players.LocalPlayer.Data.Race.Value
-                                if myrace == "Mink" then
-                                    pcall(function() topos(workspace.Map.MinkTrial.Ceiling.CFrame * CFrame.new(0,-20,0)) end)
-                                elseif myrace == "Skypiea" then
-                                    pcall(function() topos(workspace.Map.SkyTrial.Model.FinishPart.CFrame) end)
-                                elseif myrace == "Cyborg" then
-                                    pcall(function() topos(workspace.Map.CyborgTrial.Floor.CFrame * CFrame.new(0, 500, 0)) end)
-                                elseif myrace == "Human" or myrace == "Ghoul" then
-                                    for i, v in pairs(game.Workspace.Enemies:GetChildren()) do
-                                        if v:FindFirstChild("HumanoidRootPart") and v:FindFirstChild("Humanoid") and v.Humanoid.Health > 0 then
-                                            if getdis(v.HumanoidRootPart.CFrame, race_trial_place.CFrame) < 1500 then
-                                                repeat wait()
-                                                    module:eq()
-                                                    module:haki()
-                                                    pcall(function()
-                                                        topos(v:FindFirstChild("HumanoidRootPart").CFrame * CFrame.new(0, 30, 0))
-                                                    end)
-                                                until not v or not v:FindFirstChild("HumanoidRootPart") or not v:FindFirstChild("Humanoid") or v.Humanoid.Health <= 0
-                                            end
-                                        end
-                                    end
-                                elseif myrace == "Fishman" then
-                                    for i, v in pairs(workspace.SeaBeasts:GetChildren()) do
-                                        pcall(function()
-                                            -- Khớp kkv4: Fishman truyền race_trial_place (object), KHÔNG .CFrame
-                                            if v:FindFirstChild('Health') and v.Health.Value > 0 and v:FindFirstChild("HumanoidRootPart") and getdis(v.HumanoidRootPart.CFrame, race_trial_place) < 1500 then
-                                                repeat wait()
-                                                    if not game:GetService("Players").LocalPlayer.Backpack:FindFirstChild("Sharkman Karate") then
-                                                        game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("BuySharkmanKarate")
-                                                    end
-                                                    topos(v.HumanoidRootPart.CFrame * CFrame.new(0, 500, 0))
-                                                    _G.SHOULDSPAMSKILLS = true
-                                                until not v or not v:FindFirstChild('Health') or v.Health.Value <= 0 or not v:FindFirstChild("HumanoidRootPart")
-                                                _G.SHOULDSPAMSKILLS = false
-                                            end
-                                        end)
-                                    end
-                                end
+                                doTrialForMyRace()
                             else
-                                -- B: bỏ chặn Timer.Visible → ally luôn ra cửa. Giới hạn vòng tìm cửa tránh treo.
-                                local khang, tries = nil, 0
-                                repeat wait(); khang = getdoor(); tries = tries + 1 until khang ~= nil or tries > 50
-                                if khang then
-                                    if getdis(khang.CFrame) < 1500 then
-                                        topos(khang.CFrame)
-                                        status("Ready for trialing (đợi đồng bộ ability)")
-                                        -- Đứng giữ vị trí ở cửa (ally đã chọn team → lên cửa làm v4 + đợi lệnh).
-                                        -- Ghi checkalready.txt=true + bấm ability đúng starttime do vòng ABILITY SYNC (file) lo.
-                                    else
-                                        -- FIX #3: requestEntrance chỉ nhận Vector3
-                                        game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", Vector3.new(28310.0234, 14895.1123, 109.456741))
-                                    end
-                                end
+                                -- ally đã chọn team → lên cửa làm v4 + đợi lệnh (file ABILITY SYNC lo)
+                                status("Ready for trialing (đợi đồng bộ ability)")
+                                goToMyDoor()
                             end
                         end
                 else
