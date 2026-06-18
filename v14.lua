@@ -501,58 +501,52 @@ local races_trial_place = {
 }
 
 -- ============================================================
--- [TRIAL] Làm trial theo từng tộc — bản BANANA "xịn" (port sang style topos của KaitunV4)
--- Nguồn: D:\Video\suộc banana\Banana.lua......txt:8274-8319 (Function/02_trial_per_race.lua)
--- Khác bản kkv4 cũ (bị bug): toạ độ/part chuẩn hơn cho Mink/Skypiea/Cyborg, Fishman nhắm SeaBeast1,
--- Human/Ghoul kill TOÀN BỘ Enemies (bỏ lọc khoảng cách < 1500 vốn hay loại nhầm mob trial).
+-- [TRIAL] Làm trial theo từng tộc — bản HUB chuẩn (3.txt:8020-8130 / Banana 8274-8319).
+-- QUAN TRỌNG: teleport dùng module:topos THÔ (không qua wrapper topos() vốn tự kill khi
+-- target >2500 & gần temple → đó là lý do Skypiea "đứng im"). Human/Ghoul kill THẲNG bằng
+-- Health=0 + SimulationRadius (không dựa đánh tay → fix "không đánh boss").
 -- Dùng chung cho cả nhánh MAIN lẫn ALLY.
 function doTrialForMyRace()
-    local myrace = game.Players.LocalPlayer.Data.Race.Value
+    local LP = game.Players.LocalPlayer
+    local myrace = LP.Data.Race.Value
+    local function tp(cf) pcall(function() module:topos(cf) end) end  -- teleport thô, không tự kill
+
     if myrace == "Human" or myrace == "Ghoul" then
-        -- Banana: kill toàn bộ Enemies (eq + haki + topos lên đầu mob)
         for _, v in pairs(workspace.Enemies:GetChildren()) do
-            if v:FindFirstChild("HumanoidRootPart") and v:FindFirstChild("Humanoid") and v.Humanoid.Health > 0 then
+            local hum = v:FindFirstChild("Humanoid")
+            if hum and hum.Health > 0 and v:FindFirstChild("HumanoidRootPart") then
                 repeat wait()
-                    module:eq(); module:haki()
-                    pcall(function() topos(v.HumanoidRootPart.CFrame * CFrame.new(0, 30, 0)) end)
-                until not v or not v.Parent or not v:FindFirstChild("Humanoid") or v.Humanoid.Health <= 0
+                    pcall(function() sethiddenproperty(LP, "SimulationRadius", math.huge) end)
+                    pcall(function() v.HumanoidRootPart.CanCollide = false; hum.Health = 0 end)
+                    module:eq(); module:haki()                       -- fallback nếu Health=0 chưa ăn
+                    tp(v.HumanoidRootPart.CFrame * CFrame.new(0, 30, 0))
+                until (not v.Parent) or (not v:FindFirstChild("Humanoid")) or v.Humanoid.Health <= 0
             end
         end
     elseif myrace == "Skypiea" then
-        -- Banana: tp tới part "snowisland_Cylinder.081" trong SkyTrial.Model
         pcall(function()
-            local sky = workspace.Map.SkyTrial.Model
-            for _, obj in pairs(sky:GetDescendants()) do
-                if obj.Name == "snowisland_Cylinder.081" then
-                    topos(obj.CFrame)
-                    break
-                end
+            for _, obj in pairs(workspace.Map.SkyTrial.Model:GetDescendants()) do
+                if obj.Name == "snowisland_Cylinder.081" then tp(obj.CFrame) break end
             end
         end)
     elseif myrace == "Cyborg" then
-        -- Banana: tp toạ độ sàn cố định
-        pcall(function() topos(CFrame.new(28654, 14898.7832, -30)) end)
+        tp(CFrame.new(28654, 14898.7832, -30))
     elseif myrace == "Mink" then
-        -- Banana: tp tới part "StartPoint" + offset (0,10,0)
         pcall(function()
             for _, obj in pairs(workspace:GetDescendants()) do
-                if obj.Name == "StartPoint" then
-                    topos(obj.CFrame * CFrame.new(0, 10, 0))
-                    break
-                end
+                if obj.Name == "StartPoint" then tp(obj.CFrame * CFrame.new(0, 10, 0)) break end
             end
         end)
     elseif myrace == "Fishman" then
-        -- Banana: nhắm riêng SeaBeast1, mua Sharkman + spam skills
         local sb = workspace.SeaBeasts:FindFirstChild("SeaBeast1")
         if sb and sb:FindFirstChild("Health") and sb.Health.Value > 0 and sb:FindFirstChild("HumanoidRootPart") then
             repeat wait()
-                if not game:GetService("Players").LocalPlayer.Backpack:FindFirstChild("Sharkman Karate") then
+                if not LP.Backpack:FindFirstChild("Sharkman Karate") then
                     pcall(function() game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("BuySharkmanKarate") end)
                 end
-                pcall(function() topos(sb.HumanoidRootPart.CFrame * CFrame.new(0, 500, 0)) end)
+                tp(sb.HumanoidRootPart.CFrame * CFrame.new(0, 500, 0))
                 _G.SHOULDSPAMSKILLS = true
-            until not sb or not sb:FindFirstChild("Health") or sb.Health.Value <= 0 or not sb:FindFirstChild("HumanoidRootPart")
+            until (not sb.Parent) or (not sb:FindFirstChild("Health")) or sb.Health.Value <= 0 or (not sb:FindFirstChild("HumanoidRootPart"))
             _G.SHOULDSPAMSKILLS = false
         end
     end
