@@ -1126,59 +1126,71 @@ spawn(function()
                                 game:GetService("ReplicatedStorage").MapStash["Temple of Time"].Parent = workspace.Map
                             end
                         elseif workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 0 then
-                            status(roleName .. " Kill Players After Trial")
-                            for plr, i in pairs(getplayers()) do
-                                if plr then
-                                    repeat wait()
-                                        pcall(function()
-                                            topos(plr.HumanoidRootPart.CFrame * CFrame.new((function()
-                                                local x, y, z = 0, 3, 0
-                                                x = math.random(1, 4); z = math.random(1, 4)
-                                                if math.random(1, 2) == 1 then x = x * -1 end
-                                                if math.random(1, 2) == 1 then z = z * -1 end
-                                                return x, y, z
-                                            end)()))
-                                        end)
-                                    until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 1
-                                end
-                            end
-                            if countplayers() <= 0 then
-                                local isCurrentMain = isaccmain[myName] and myName == currentmain
-                                local isHelpAcc = not isaccmain[myName]  -- acc help thuần
-                                local isOtherMain = isaccmain[myName] and myName ~= currentmain  -- acc main phụ
-
-                                if isCurrentMain then
-                                    local allies_str = table.concat(getgenv().Config["Allies"] or {}, ",")
-                                    if allies_str ~= "" then
-                                        status("[MAIN " .. myMainIndex .. "] Waiting for help accs to reset first...")
-                                        local timeout = 0
-                                        repeat
-                                            wait(1)
-                                            timeout = timeout + 1
-                                            local res = Net.getJSON(BASE_URL .. "/helpreset?allies=" .. allies_str, 0)
-                                            if res and res.all_done then break end
-                                        until timeout >= 25
-                                    end
-                                    game.Players.LocalPlayer.Character.Humanoid.Health = 0
-                                    wait(3)
-                                    setMyMainStatus("training")
-                                    Net.postJSON(BASE_URL .. "/helpreset/clear", {}, "helpreset_clear")
-
-                                elseif isHelpAcc or isOtherMain then
+                            if not isaccmain[myName] then
+                                -- ===== ALLY: AUTO RESET NGAY khi vào khúc kill player =====
+                                -- Ally KHÔNG cần kill hết người — reset luôn (stagger theo thứ tự ally)
+                                -- để đồng bộ + báo /helpreset cho main. _G.allyKillReset chống reset lặp.
+                                status(roleName .. " Kill-player → AUTO RESET (ally)")
+                                if not _G.allyKillReset then
+                                    _G.allyKillReset = true
                                     spawn(function()
                                         local delay = 2
-                                        if isHelpAcc then
-                                            for i, name in ipairs(getgenv().Config["Allies"] or {}) do
-                                                if name == myName then delay = i * 2 break end
-                                            end
-                                        else
-                                            delay = (#(getgenv().Config["Allies"] or {}) * 2) + 4 + math.random(0, 3)
+                                        for i, name in ipairs(getgenv().Config["Allies"] or {}) do
+                                            if name == myName then delay = i * 2 break end
                                         end
                                         wait(delay)
-                                        game.Players.LocalPlayer.Character.Humanoid.Health = 0
+                                        pcall(function() game.Players.LocalPlayer.Character.Humanoid.Health = 0 end)
                                         wait(1)
                                         Net.postJSON(BASE_URL .. "/helpreset", { name = myName }, "helpreset")
+                                        wait(5)  -- chờ respawn xong mới cho reset lại lần sau
+                                        _G.allyKillReset = false
                                     end)
+                                end
+                            else
+                                status(roleName .. " Kill Players After Trial")
+                                for plr, i in pairs(getplayers()) do
+                                    if plr then
+                                        repeat wait()
+                                            pcall(function()
+                                                topos(plr.HumanoidRootPart.CFrame * CFrame.new((function()
+                                                    local x, y, z = 0, 3, 0
+                                                    x = math.random(1, 4); z = math.random(1, 4)
+                                                    if math.random(1, 2) == 1 then x = x * -1 end
+                                                    if math.random(1, 2) == 1 then z = z * -1 end
+                                                    return x, y, z
+                                                end)()))
+                                            end)
+                                        until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 1
+                                    end
+                                end
+                                if countplayers() <= 0 then
+                                    local isCurrentMain = isaccmain[myName] and myName == currentmain
+                                    local isOtherMain = isaccmain[myName] and myName ~= currentmain  -- acc main phụ
+                                    if isCurrentMain then
+                                        local allies_str = table.concat(getgenv().Config["Allies"] or {}, ",")
+                                        if allies_str ~= "" then
+                                            status("[MAIN " .. myMainIndex .. "] Waiting for help accs to reset first...")
+                                            local timeout = 0
+                                            repeat
+                                                wait(1)
+                                                timeout = timeout + 1
+                                                local res = Net.getJSON(BASE_URL .. "/helpreset?allies=" .. allies_str, 0)
+                                                if res and res.all_done then break end
+                                            until timeout >= 25
+                                        end
+                                        game.Players.LocalPlayer.Character.Humanoid.Health = 0
+                                        wait(3)
+                                        setMyMainStatus("training")
+                                        Net.postJSON(BASE_URL .. "/helpreset/clear", {}, "helpreset_clear")
+                                    elseif isOtherMain then
+                                        spawn(function()
+                                            local delay = (#(getgenv().Config["Allies"] or {}) * 2) + 4 + math.random(0, 3)
+                                            wait(delay)
+                                            game.Players.LocalPlayer.Character.Humanoid.Health = 0
+                                            wait(1)
+                                            Net.postJSON(BASE_URL .. "/helpreset", { name = myName }, "helpreset")
+                                        end)
+                                    end
                                 end
                             end
                         else
@@ -1595,35 +1607,75 @@ end)
 -- Vẫn dùng web CHỈ để đánh số role/index (Main..idx / Ally..i) qua /init.
 -- Cơ chế:
 --   1) checkalready.txt: mỗi account ghi đúng DÒNG của mình "<Label>:doorandability=<true|false>".
---      true khi đủ CẢ 2: đứng ở cửa (<AT_DOOR_DIST) VÀ ability sẵn sàng. Thiếu 1 → ghi false.
---      Main đang-tới-turn tự tạo file nếu chưa có (bỏ qua nếu đã tồn tại).
---   2) Khi CẢ 3 dòng (Main..idx, Ally1, Ally2...) = true → main tạo starttime.txt = epoch hiện tại + 10s.
+--      true khi đủ CẢ 2: đứng ở cửa (<AT_DOOR_DIST) VÀ CÙNG jobid (cùng server) với main đang turn.
+--      Thiếu 1 → ghi false. Main đang-tới-turn tự tạo file nếu chưa có (bỏ qua nếu đã tồn tại).
+--   2) Khi CẢ 3 dòng (Main..idx, Ally1, Ally2...) = true → main tạo starttime.txt = GIỜ THỰC Hà Nội + 10s.
 --   3) Cả 3 account đọc starttime.txt mỗi 3s. Tới đúng giờ đó (age ∈ [0, window)) thì bấm ActivateAbility 1 lần.
--- starttime ghi EPOCH TUYỆT ĐỐI (serverNow) → mọi account bấm đúng 1 thời điểm dù đọc lệch nhịp.
+-- starttime ghi "HH:MM:SS" giờ UTC+7 (Hà Nội/Bangkok); so theo giây-trong-ngày → bấm đồng bộ 1 thời điểm.
 local ABILITY_FIRE_WINDOW = 6   -- giây — chỉ bấm trong khoảng [start, start+window)
-local AT_DOOR_DIST = 120        -- coi như "đứng ở cửa" khi cách Entrance < ngần này
+local AT_DOOR_DIST = 150        -- coi như "đứng ở cửa" khi cách Entrance < ngần này (nới nhẹ từ 120)
 local START_LEAD   = 10         -- giây — starttime = bây giờ + 10s
 local CHECK_FILE   = "checkalready.txt"
 local START_FILE   = "starttime.txt"
 
--- Khoảng cách tới cửa corridor của mình (LOCAL, không mạng)
+-- Toạ độ cửa trial từng tộc (tham khảo Banana "Teleport To Trial Door") — nguồn check door
+-- dự phòng khi getdoor() trả nil/sai. Lấy khoảng cách NHỎ NHẤT giữa 2 nguồn cho chuẩn.
+local BANANA_DOOR_CFRAME = {
+    Human   = CFrame.new(29221.822, 14890.975, -205.991),
+    Skypiea = CFrame.new(28960.158, 14919.624, 235.039),
+    Fishman = CFrame.new(28231.175, 14890.975, -211.641),
+    Cyborg  = CFrame.new(28502.681, 14895.975, -423.727),
+    Ghoul   = CFrame.new(28674.244, 14890.676, 445.431),
+    Mink    = CFrame.new(29012.341, 14890.975, -380.149),
+}
+
+-- Khoảng cách tới cửa corridor của mình (LOCAL, không mạng).
+-- "Thuật toán check chuẩn": thử cả getdoor() lẫn toạ độ Banana, lấy cái gần nhất.
 local function distToMyDoor()
-    local door = getdoor()
-    return (door and getdis(door.CFrame)) or 1e9
+    local best = 1e9
+    pcall(function()
+        local door = getdoor()
+        if door then best = math.min(best, getdis(door.CFrame)) end
+    end)
+    pcall(function()
+        local race = game.Players.LocalPlayer.Data.Race.Value
+        local cf = BANANA_DOOR_CFRAME[race]
+        if cf then best = math.min(best, getdis(cf)) end
+    end)
+    return best
 end
 
--- Race ability đã SẴN SÀNG dùng chưa? = đứng trước door, có thể nhấn nút (T → ActivateAbility)
--- để VÀO TRIAL. Không phải Y biến hình, không phải awakening.
--- Dùng trialable() (đã có sẵn): true = account đang ở trạng thái có thể vào trial ngay.
--- CACHE TTL 2s: trialable() gọi InvokeServer (và auto-Buy gear) → không gọi mỗi 1s.
-local _abReady = { t = -1e9, v = false }
-local function abilityReady()
+-- ===== GIỜ THỰC UTC+7 (Hà Nội / Bangkok) =====
+local TZ_OFFSET = 7 * 3600   -- UTC+7
+-- epoch (UTC) → giây-trong-ngày theo giờ Hà Nội (0..86399)
+local function hanoiSecOfDay(epoch)
+    return math.floor(epoch + TZ_OFFSET) % 86400
+end
+-- epoch → chuỗi "HH:MM:SS" giờ Hà Nội (ghi vào starttime.txt cho dễ đọc)
+local function fmtHanoi(epoch)
+    local s = hanoiSecOfDay(epoch)
+    return string.format("%02d:%02d:%02d", math.floor(s / 3600), math.floor((s % 3600) / 60), s % 60)
+end
+-- "HH:MM:SS" → giây-trong-ngày (nil nếu sai định dạng)
+local function parseHanoi(str)
+    local h, m, s = string.match(str or "", "(%d+):(%d+):(%d+)")
+    if not h then return nil end
+    return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
+end
+
+-- Cùng server (jobid) với MAIN đang tới turn? (CACHE 3s, tránh spam /noguchi mỗi giây)
+-- Bản thân main đang-turn → luôn true. Ally → so jobid qua isSameServerAsMain.
+local _ssCache = { t = -1e9, v = false }
+local function sameServerAsCurrentMain()
+    local curName = getCurrentMainBeingUpgraded()
+    if not curName then return false end
+    if myName == curName then return true end
     local now = tick()
-    if now - _abReady.t < 2 then return _abReady.v end
-    local ok, ready = pcall(trialable)
-    _abReady.t = now
-    _abReady.v = ok and ready == true
-    return _abReady.v
+    if now - _ssCache.t < 3 then return _ssCache.v end
+    local same = isSameServerAsMain(curName)
+    _ssCache.t = now
+    _ssCache.v = same and true or false
+    return _ssCache.v
 end
 
 -- Vị trí của mình trong danh sách Allies (1-based), nil nếu không phải ally
@@ -1702,12 +1754,12 @@ local function allReady()
     return true
 end
 
--- Đọc epoch trong starttime.txt
+-- Đọc starttime.txt ("HH:MM:SS" giờ Hà Nội) → giây-trong-ngày (0..86399), nil nếu sai
 local function readStart()
     if not (isfile and isfile(START_FILE)) then return nil end
     local ok, data = pcall(readfile, START_FILE)
     if not ok or not data then return nil end
-    return tonumber((string.gsub(data, "%s", "")))
+    return parseHanoi((string.gsub(data, "%s", "")))
 end
 
 -- Main đang-tới-turn tự tạo checkalready.txt nếu chưa có (bỏ qua nếu đã tồn tại)
@@ -1725,23 +1777,28 @@ spawn(function()
         pcall(function()
             local label = myAbilityLabel()
             if label then
-                -- chỉ true khi đủ CẢ 2: gần door VÀ race ability (V3) đã sẵn sàng bật (Y).
+                -- chỉ true khi đủ CẢ 2: gần door VÀ cùng jobid (cùng server) với main đang turn.
                 -- Thiếu 1 trong 2 → ghi false. Ghi liên tục mỗi 1s kể từ khi load script.
-                local cond = (distToMyDoor() < AT_DOOR_DIST) and abilityReady()
+                local cond = (distToMyDoor() < AT_DOOR_DIST) and sameServerAsCurrentMain()
                 writeMyCheck(label, cond)
 
                 -- Chỉ MAIN đang tới turn mới chốt giờ
                 local curName = getCurrentMainBeingUpgraded()
                 if curName and myName == curName then
-                    local existing = readStart()
-                    local now = serverNow()
-                    -- chưa có starttime hợp lệ (chưa đặt / đã cũ quá cửa sổ) và đủ 3 → đặt mới
-                    if (not existing) or (now - existing > ABILITY_FIRE_WINDOW) then
-                        if allReady() then
-                            pcall(function()
-                                writefile(START_FILE, tostring(math.floor(now + START_LEAD)))
-                            end)
-                        end
+                    local existing = readStart()           -- giây-trong-ngày (Hà Nội) hoặc nil
+                    local nowSec = hanoiSecOfDay(serverNow())
+                    -- "đã qua cửa sổ" → cho đặt giờ mới. Xử lý wrap qua nửa đêm.
+                    local needNew = true
+                    if existing then
+                        local age = nowSec - existing
+                        if age < -43200 then age = age + 86400 end
+                        if age <= ABILITY_FIRE_WINDOW then needNew = false end  -- còn pending/đang trong window
+                    end
+                    if needNew and allReady() then
+                        pcall(function()
+                            -- starttime = giờ thực Hà Nội hiện tại + 10s, dạng HH:MM:SS
+                            writefile(START_FILE, fmtHanoi(serverNow() + START_LEAD))
+                        end)
                     end
                 end
             end
@@ -1764,10 +1821,11 @@ end)
 spawn(function()
     while true do
         pcall(function()
-            local st = _G.syncStart
-            if st and st > 0 and st ~= _G.allyLastFire then
+            local st = _G.syncStart   -- giây-trong-ngày (Hà Nội) của giờ chốt
+            if st and st ~= _G.allyLastFire then
                 if distToMyDoor() < AT_DOOR_DIST then
-                    local age = serverNow() - st
+                    local age = hanoiSecOfDay(serverNow()) - st
+                    if age < -43200 then age = age + 86400 end   -- wrap qua nửa đêm
                     if age >= 0 and age < ABILITY_FIRE_WINDOW then
                         _G.allyLastFire = st
                         game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
