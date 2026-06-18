@@ -1088,7 +1088,7 @@ spawn(function()
                                 if isNearTemple then
                                     topos(khang.CFrame)
                                     status("[MAIN " .. myMainIndex .. "] Ready for trialing (đợi đồng bộ ability)")
-                                    -- Báo donedoor+abilityready và bấm ability đúng giờ do vòng ABILITY SYNC lo.
+                                    -- Đứng ở cửa. Ghi checkalready.txt=true + bấm ability đúng starttime do vòng ABILITY SYNC (file) lo.
                                 else
                                     -- FIX #3: requestEntrance chỉ nhận Vector3 (bỏ rotation data)
                                     game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", Vector3.new(28310.0234, 14895.1123, 109.456741))
@@ -1234,8 +1234,8 @@ spawn(function()
                                     if getdis(khang.CFrame) < 1500 then
                                         topos(khang.CFrame)
                                         status("Ready for trialing (đợi đồng bộ ability)")
-                                        -- Đứng giữ vị trí ở cửa. Báo donedoor+abilityready và bấm
-                                        -- ability đúng giờ fire_at do vòng ABILITY SYNC lo.
+                                        -- Đứng giữ vị trí ở cửa (ally đã chọn team → lên cửa làm v4 + đợi lệnh).
+                                        -- Ghi checkalready.txt=true + bấm ability đúng starttime do vòng ABILITY SYNC (file) lo.
                                     else
                                         -- FIX #3: requestEntrance chỉ nhận Vector3
                                         game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", Vector3.new(28310.0234, 14895.1123, 109.456741))
@@ -1590,15 +1590,21 @@ spawn(function()
     while true do wait(20); pcall(syncClock) end
 end)
 
--- ===== ABILITY SYNC (phương pháp mới): server hẹn giờ, 3 account bấm cùng lúc =====
--- Dùng chung cho cả MAIN đang tới turn lẫn ALLY. Khi đứng ở cửa corridor của mình:
---   1) Báo donedoor (gần cửa <120) + abilityready (sát cửa <60) lên server (throttle ~1.2s).
---   2) Server thấy đủ "need" account có cả 2 cờ (= #allies+1, tức đủ 6 tín hiệu)
---      → đặt fire_at = giờ_server + 15s.
---   3) Poll /firesignal 0.3s; tới ĐÚNG fire_at (age ∈ [0, window)) thì bấm ActivateAbility 1 lần.
--- Khác bản cũ: bấm ĐÚNG giờ fire_at (không bấm sớm), _G.allyLastFire chống bấm trùng.
-local ABILITY_FIRE_WINDOW = 6   -- giây — chỉ bấm trong khoảng [fire_at, fire_at+window)
+-- ===== ABILITY SYNC (phương pháp FILE workspace): 3 account chung 1 PC bấm cùng lúc =====
+-- KHÔNG còn dùng web để hẹn giờ bấm (đã bỏ /firesignal, /donedoor, /abilityready cho việc bấm).
+-- Vẫn dùng web CHỈ để đánh số role/index (Main..idx / Ally..i) qua /init.
+-- Cơ chế:
+--   1) checkalready.txt: mỗi account ghi đúng DÒNG của mình "<Label>:doorandability=<true|false>".
+--      true khi đủ CẢ 2: đứng ở cửa (<AT_DOOR_DIST) VÀ ability sẵn sàng. Thiếu 1 → ghi false.
+--      Main đang-tới-turn tự tạo file nếu chưa có (bỏ qua nếu đã tồn tại).
+--   2) Khi CẢ 3 dòng (Main..idx, Ally1, Ally2...) = true → main tạo starttime.txt = epoch hiện tại + 10s.
+--   3) Cả 3 account đọc starttime.txt mỗi 3s. Tới đúng giờ đó (age ∈ [0, window)) thì bấm ActivateAbility 1 lần.
+-- starttime ghi EPOCH TUYỆT ĐỐI (serverNow) → mọi account bấm đúng 1 thời điểm dù đọc lệch nhịp.
+local ABILITY_FIRE_WINDOW = 6   -- giây — chỉ bấm trong khoảng [start, start+window)
 local AT_DOOR_DIST = 120        -- coi như "đứng ở cửa" khi cách Entrance < ngần này
+local START_LEAD   = 10         -- giây — starttime = bây giờ + 10s
+local CHECK_FILE   = "checkalready.txt"
+local START_FILE   = "starttime.txt"
 
 -- Khoảng cách tới cửa corridor của mình (LOCAL, không mạng)
 local function distToMyDoor()
@@ -1606,42 +1612,155 @@ local function distToMyDoor()
     return (door and getdis(door.CFrame)) or 1e9
 end
 
--- ===== LOOP BÁO: cadence ỔN ĐỊNH 1s, chỉ check LOCAL + POST async =====
--- TÁCH khỏi loop GET firesignal: trước đây gộp chung nên GET chậm/retry làm nhịp báo
--- vọt 8–12s → chạm TTL 12s server → cờ chập chờn ("báo 1 lần rồi rất lâu mới báo").
--- Giờ báo luôn đều 1s bất kể mạng (POST qua hàng đợi, không block).
+-- Vị trí của mình trong danh sách Allies (1-based), nil nếu không phải ally
+local function allyIndexOf(nm)
+    for i, v in ipairs(getgenv().Config["Allies"] or {}) do
+        if v == nm then return i end
+    end
+    return nil
+end
+
+-- Nhãn (label) của CHÍNH account này trong checkalready.txt:
+--   - Main đang tới turn  → "Main"..idx_web_của_main_đó
+--   - Ally                → "Ally"..vị_trí_trong_Allies
+--   - Main KHÔNG tới turn  → nil (không tham gia round này)
+local function myAbilityLabel()
+    local curName, curIdx = getCurrentMainBeingUpgraded()
+    if curName and myName == curName then
+        return "Main" .. tostring(curIdx)
+    end
+    local ai = allyIndexOf(myName)
+    if ai then return "Ally" .. ai end
+    return nil
+end
+
+-- Tập nhãn BẮT BUỘC phải true để chốt giờ: main đang-turn + toàn bộ ally
+local function requiredLabels()
+    local curName, curIdx = getCurrentMainBeingUpgraded()
+    local labels = {}
+    if curIdx then table.insert(labels, "Main" .. tostring(curIdx)) end
+    for i, _ in ipairs(getgenv().Config["Allies"] or {}) do
+        table.insert(labels, "Ally" .. i)
+    end
+    return labels
+end
+
+-- Đọc & phân tích checkalready.txt → bảng { Label = true/false }
+local function parseCheck()
+    local t = {}
+    if not (isfile and isfile(CHECK_FILE)) then return t end
+    local ok, data = pcall(readfile, CHECK_FILE)
+    if not ok or not data then return t end
+    for label, val in string.gmatch(data, "(%w+):doorandability=(%w+)") do
+        t[label] = (val == "true")
+    end
+    return t
+end
+
+-- Ghi lại toàn bộ bảng ra file (mỗi dòng 1 nhãn, sort cho ổn định)
+local function serializeCheck(t)
+    local keys = {}
+    for k, _ in pairs(t) do table.insert(keys, k) end
+    table.sort(keys)
+    local lines = {}
+    for _, k in ipairs(keys) do
+        table.insert(lines, k .. ":doorandability=" .. (t[k] and "true" or "false"))
+    end
+    return table.concat(lines, "\n")
+end
+
+-- Read-modify-write: chỉ đụng DÒNG của chính mình, giữ nguyên dòng account khác
+local function writeMyCheck(label, cond)
+    if not label then return end
+    local t = parseCheck()
+    t[label] = cond and true or false
+    pcall(function() writefile(CHECK_FILE, serializeCheck(t)) end)
+end
+
+-- Đủ tất cả nhãn bắt buộc = true?
+local function allReady()
+    local t = parseCheck()
+    local req = requiredLabels()
+    if #req == 0 then return false end
+    for _, lb in ipairs(req) do
+        if t[lb] ~= true then return false end
+    end
+    return true
+end
+
+-- Đọc epoch trong starttime.txt
+local function readStart()
+    if not (isfile and isfile(START_FILE)) then return nil end
+    local ok, data = pcall(readfile, START_FILE)
+    if not ok or not data then return nil end
+    return tonumber((string.gsub(data, "%s", "")))
+end
+
+-- Main đang-tới-turn tự tạo checkalready.txt nếu chưa có (bỏ qua nếu đã tồn tại)
+if isaccmain[myName] then
+    spawn(function()
+        if not (isfile and isfile(CHECK_FILE)) then
+            pcall(function() writefile(CHECK_FILE, "") end)
+        end
+    end)
+end
+
+-- ===== LOOP GHI: cadence 1s — ghi dòng của mình + (main) chốt starttime khi đủ 3 =====
 spawn(function()
     while true do
         pcall(function()
-            if distToMyDoor() < AT_DOOR_DIST then
-                local need = #(getgenv().Config["Allies"] or {}) + 1
-                reportDoneDoor(false)
-                reportAbilityReady(need)
+            local label = myAbilityLabel()
+            if label then
+                -- đủ CẢ 2 điều kiện: ở cửa + ability sẵn sàng (đứng ở cửa coi như đã làm v4 xong, sẵn sàng)
+                local atDoor = distToMyDoor() < AT_DOOR_DIST
+                writeMyCheck(label, atDoor)
+
+                -- Chỉ MAIN đang tới turn mới chốt giờ
+                local curName = getCurrentMainBeingUpgraded()
+                if curName and myName == curName then
+                    local existing = readStart()
+                    local now = serverNow()
+                    -- chưa có starttime hợp lệ (chưa đặt / đã cũ quá cửa sổ) và đủ 3 → đặt mới
+                    if (not existing) or (now - existing > ABILITY_FIRE_WINDOW) then
+                        if allReady() then
+                            pcall(function()
+                                writefile(START_FILE, tostring(math.floor(now + START_LEAD)))
+                            end)
+                        end
+                    end
+                end
             end
         end)
         wait(1)
     end
 end)
 
--- ===== LOOP POLL: 0.3s, GET firesignal (cache), bấm ĐÚNG fire_at =====
+-- ===== LOOP ĐỌC starttime: 3s — mọi account đọc giờ chốt =====
 spawn(function()
     while true do
         pcall(function()
-            if distToMyDoor() < AT_DOOR_DIST then
-                local sig = Net.getJSON(BASE_URL .. "/firesignal", 0.2)
-                if sig and sig.fire_at then
-                    local fire_at = tonumber(sig.fire_at) or 0
-                    if fire_at > 0 and fire_at ~= _G.allyLastFire then
-                        local age = serverNow() - fire_at
-                        if age >= 0 and age < ABILITY_FIRE_WINDOW then
-                            _G.allyLastFire = fire_at
-                            game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
-                        end
+            _G.syncStart = readStart()
+        end)
+        wait(3)
+    end
+end)
+
+-- ===== LOOP BẤM: 0.25s — tới đúng starttime thì bấm ActivateAbility 1 lần =====
+spawn(function()
+    while true do
+        pcall(function()
+            local st = _G.syncStart
+            if st and st > 0 and st ~= _G.allyLastFire then
+                if distToMyDoor() < AT_DOOR_DIST then
+                    local age = serverNow() - st
+                    if age >= 0 and age < ABILITY_FIRE_WINDOW then
+                        _G.allyLastFire = st
+                        game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
                     end
                 end
             end
         end)
-        wait(0.3)
+        wait(0.25)
     end
 end)
 
