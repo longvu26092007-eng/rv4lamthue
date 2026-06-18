@@ -445,20 +445,28 @@ local topos = function(v)
 end
 
 local TEMPLE_ENTRY = Vector3.new(28310.0234, 14895.1123, 109.456741)
--- Lên đứng ở cửa trial NHANH (non-blocking): có cửa & đã ở temple → tween bám sát (timeout 5s);
--- chưa có cửa/chưa tới temple → requestEntrance vào temple NGAY cho corridor load (không spin chờ).
+-- Lên đứng ở cửa trial. Tách 2 trường hợp cho hết "đứng im / detect door lỗi":
+--   • CHƯA ở temple → requestEntrance NHƯNG throttle 5s (gọi mỗi frame sẽ restart teleport
+--     liên tục → đứng im rất lâu mới vào được).
+--   • ĐÃ ở temple mà getdoor() chớp nil → CHỜ cửa load (retry 3s), KHÔNG re-teleport
+--     (re-teleport khi cửa chưa load chính là "lỗi detect door"), rồi bám sát cửa.
 function goToMyDoor()
-    local door = getdoor()
-    if door and getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) < 3000 then
-        local t0 = tick()
-        repeat wait(); pcall(function() topos(door.CFrame) end)
-        until getdis(door.CFrame) < 60 or (tick() - t0) > 5
-        return true
+    if getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) >= 3000 then
+        if not _G.lastReqEntrance or (tick() - _G.lastReqEntrance) > 5 then
+            _G.lastReqEntrance = tick()
+            pcall(function()
+                game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", TEMPLE_ENTRY)
+            end)
+        end
+        return false
     end
-    pcall(function()
-        game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", TEMPLE_ENTRY)
-    end)
-    return false
+    local door, t0 = nil, tick()
+    repeat wait(); door = getdoor() until door ~= nil or (tick() - t0) > 3  -- chờ corridor load
+    if not door then return false end                                       -- chưa kịp → vòng sau thử lại
+    t0 = tick()
+    repeat wait(); pcall(function() topos(door.CFrame) end)
+    until getdis(door.CFrame) < 60 or (tick() - t0) > 5
+    return true
 end
 
 local pos_plr_trial = {
@@ -532,11 +540,24 @@ function doTrialForMyRace()
     if myrace == "Mink" then
         pcall(function() tp(workspace.Map.MinkTrial.Ceiling.CFrame * CFrame.new(0, -20, 0)) end)
     elseif myrace == "Skypiea" then
+        -- tìm điểm finish an toàn (FindFirstChild, fallback FinishPart) rồi BÁM tới trong vòng tight
+        -- → hết "lúc bay lúc đứng im" (do tp 1 phát/0.35s hoặc chưa tìm thấy part thì đứng yên).
+        local finish
         pcall(function()
-            for _, obj in pairs(workspace.Map.SkyTrial.Model:GetDescendants()) do
-                if obj.Name == "snowisland_Cylinder.081" then tp(obj.CFrame) break end
+            local model = workspace.Map:FindFirstChild("SkyTrial")
+            model = model and model:FindFirstChild("Model")
+            if model then
+                for _, obj in pairs(model:GetDescendants()) do
+                    if obj.Name == "snowisland_Cylinder.081" then finish = obj break end
+                end
+                finish = finish or model:FindFirstChild("FinishPart")
             end
         end)
+        if finish then
+            local t0 = tick()
+            repeat wait(); pcall(function() module:topos(finish.CFrame) end)
+            until getdis(finish.CFrame) < 30 or (tick() - t0) > 4
+        end
     elseif myrace == "Cyborg" then
         pcall(function() tp(workspace.Map.CyborgTrial.Floor.CFrame * CFrame.new(0, 500, 0)) end)
     elseif myrace == "Human" or myrace == "Ghoul" then
@@ -1139,17 +1160,32 @@ spawn(function()
                             status("[MAIN " .. myMainIndex .. "] Doing trial")
                             doTrialForMyRace()
                         else
-                            if game:GetService("Players").LocalPlayer.PlayerGui.Main.Timer.Visible == false then
-                                status("[MAIN " .. myMainIndex .. "] Ready for trialing (đợi đồng bộ ability)")
-                                goToMyDoor()  -- file ABILITY SYNC lo ghi check + bấm đúng starttime
-                            end
+                            -- BỎ chặn Timer.Visible: chết/failed trial mà Timer còn hiện → trước đây
+                            -- main đứng im không lên door. Giờ LUÔN lên cửa (giống nhánh ally).
+                            status("[MAIN " .. myMainIndex .. "] Ready for trialing (đợi đồng bộ ability)")
+                            goToMyDoor()  -- file ABILITY SYNC lo ghi check + bấm đúng starttime
                         end
                     end
                 end
             else
                 local roleName = isaccmain[myName] and ("[MAIN " .. myMainIndex .. " as ALLY]") or "[ALLY]"
-                local currentMainStatus = currentmain and getMainStatus(currentmain) or ""
-                local mainActive = (currentMainStatus == "moon" or currentMainStatus == "in_trail")
+                -- "Nhận lệnh lên trial door" = phát hiện main đang up (moon/in_trail). Làm như join
+                -- jobid: nếu cache miss/chưa active thì FETCH TƯƠI retry 2 lần → đỡ trễ/đứng chờ oan.
+                local mainActive = false
+                if currentmain then
+                    local st = getMainStatus(currentmain)
+                    mainActive = (st == "moon" or st == "in_trail")
+                    if not mainActive and not isaccmain[myName] then
+                        for _ = 1, 2 do
+                            wait(0.2)
+                            local live = fetchMainStatusLive(currentmain)
+                            if live == "moon" or live == "in_trail" then
+                                statusCache[currentmain] = { t = tick(), status = live }
+                                mainActive = true; break
+                            end
+                        end
+                    end
+                end
                 -- Main phụ (main-as-ally) KHÔNG hop theo (giữ như bản gốc); chỉ ally thật mới hop.
                 local sameServer, mainJob = true, nil
                 if not isaccmain[myName] then
@@ -1157,6 +1193,7 @@ spawn(function()
                 end
                 if currentmain and mainActive and not sameServer then
                     -- Khác server với main đang up → hop sang server của main (throttle 5s tránh spam)
+                    _G.allyKillReset = false  -- rời khúc kill-player → cho reset lại ở trial sau
                     status(roleName .. " Hop sang server main: " .. tostring(currentmain))
                     if mainJob and mainJob ~= "" and mainJob ~= game.JobId then
                         if not _G.lastAllyHop or (tick() - _G.lastAllyHop) > 5 then
@@ -1180,6 +1217,9 @@ spawn(function()
                                 -- Ally KHÔNG cần kill hết người — reset luôn (stagger theo thứ tự ally)
                                 -- để đồng bộ + báo /helpreset cho main. _G.allyKillReset chống reset lặp.
                                 status(roleName .. " Kill-player → AUTO RESET (ally)")
+                                -- reset 1 LẦN cho mỗi khúc kill-player. KHÔNG tự clear theo timer
+                                -- (trước đây clear sau 5s → chết lặp = "đứng khá lâu" + chặn hop sang
+                                -- server main mới). Flag chỉ clear khi đã rời khúc này (hop/trial/waiting).
                                 if not _G.allyKillReset then
                                     _G.allyKillReset = true
                                     spawn(function()
@@ -1191,8 +1231,6 @@ spawn(function()
                                         pcall(function() game.Players.LocalPlayer.Character.Humanoid.Health = 0 end)
                                         wait(1)
                                         Net.postJSON(BASE_URL .. "/helpreset", { name = myName }, "helpreset")
-                                        wait(5)  -- chờ respawn xong mới cho reset lại lần sau
-                                        _G.allyKillReset = false
                                     end)
                                 end
                             else
@@ -1234,6 +1272,7 @@ spawn(function()
                                 end
                             end
                         else
+                            _G.allyKillReset = false  -- Forcefield đã đóng (qua trial mới) → reset lại được
                             local race_trial_place
                             if races_trial_place[game:GetService("Players").LocalPlayer.Data.Race.Value] then
                                 race_trial_place = races_trial_place[game:GetService("Players").LocalPlayer.Data.Race.Value]
@@ -1248,6 +1287,7 @@ spawn(function()
                             end
                         end
                 else
+                    _G.allyKillReset = false  -- chờ main → cho reset lại ở trial sau
                     status(roleName .. " Waiting for current main: " .. tostring(currentmain))
                 end
             end
