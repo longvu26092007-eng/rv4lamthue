@@ -64,19 +64,24 @@ do
         if level == "ERR" or level == "WARN" then warn(line) end
     end
 
-    -- ---- semaphore: trần số request đồng thời (tránh chạm giới hạn executor) ----
-    local MAX_CONC = 6
-    local cur = 0
-    local function acquire()
-        local guard = 0
-        while cur >= MAX_CONC do
-            task.wait(0.03)
-            guard = guard + 1
-            if guard > 400 then break end -- ~12s thì thôi chờ (đề phòng kẹt slot)
+    -- ---- 2 semaphore RIÊNG cho GET và POST ----
+    -- GET đông (firesignal/status...) KHÔNG được làm nghẽn POST (heartbeat/donedoor/abilityready).
+    local function makeSem(max)
+        local cur = 0
+        local function acquire()
+            local guard = 0
+            while cur >= max do
+                task.wait(0.03)
+                guard = guard + 1
+                if guard > 400 then break end -- ~12s thì thôi chờ (đề phòng kẹt slot)
+            end
+            cur = cur + 1
         end
-        cur = cur + 1
+        local function release() cur = math.max(0, cur - 1) end
+        return acquire, release
     end
-    local function release() cur = math.max(0, cur - 1) end
+    local acquireGet, releaseGet = makeSem(4)
+    local acquirePost, releasePost = makeSem(4)
 
     -- ---- request thô: trả ok(bool), status(number), body(string), err ----
     local function rawRequest(method, url, bodyStr)
@@ -113,7 +118,7 @@ do
     local cache = {} -- url -> { t, decoded, raw }
     local GET_RETRIES = 3
     function Net.getRaw(url)
-        acquire()
+        acquireGet()
         local ok, status, body, err
         for attempt = 1, GET_RETRIES do
             ok, status, body, err = rawRequest("GET", url, nil)
@@ -121,7 +126,7 @@ do
             Net.log("WARN", ("GET fail %d/%d %s : %s"):format(attempt, GET_RETRIES, url, tostring(err)))
             task.wait(0.2 * attempt)
         end
-        release()
+        releaseGet()
         if not ok then Net.log("ERR", "GET bỏ cuộc: " .. url) end
         return ok, body, status
     end
@@ -180,9 +185,9 @@ do
             if not job or job.replaced then
                 task.wait(0.05)
             else
-                acquire()
+                acquirePost()
                 local sok, status, _, err = rawRequest("POST", job.url, job.body)
-                release()
+                releasePost()
                 if sok then
                     if job.key and keyed[job.key] == job then keyed[job.key] = nil end
                 else
@@ -1593,21 +1598,36 @@ end)
 --   3) Poll /firesignal 0.3s; tới ĐÚNG fire_at (age ∈ [0, window)) thì bấm ActivateAbility 1 lần.
 -- Khác bản cũ: bấm ĐÚNG giờ fire_at (không bấm sớm), _G.allyLastFire chống bấm trùng.
 local ABILITY_FIRE_WINDOW = 6   -- giây — chỉ bấm trong khoảng [fire_at, fire_at+window)
+local AT_DOOR_DIST = 120        -- coi như "đứng ở cửa" khi cách Entrance < ngần này
+
+-- Khoảng cách tới cửa corridor của mình (LOCAL, không mạng)
+local function distToMyDoor()
+    local door = getdoor()
+    return (door and getdis(door.CFrame)) or 1e9
+end
+
+-- ===== LOOP BÁO: cadence ỔN ĐỊNH 1s, chỉ check LOCAL + POST async =====
+-- TÁCH khỏi loop GET firesignal: trước đây gộp chung nên GET chậm/retry làm nhịp báo
+-- vọt 8–12s → chạm TTL 12s server → cờ chập chờn ("báo 1 lần rồi rất lâu mới báo").
+-- Giờ báo luôn đều 1s bất kể mạng (POST qua hàng đợi, không block).
 spawn(function()
-    local tickn = 0
     while true do
-        tickn = tickn + 1
         pcall(function()
-            local door = getdoor()
-            local dist = (door and getdis(door.CFrame)) or 1e9
-            if dist < 120 then
+            if distToMyDoor() < AT_DOOR_DIST then
                 local need = #(getgenv().Config["Allies"] or {}) + 1
-                -- Báo trạng thái (throttle ~1.2s/lần để đỡ spam request)
-                if tickn % 4 == 0 then
-                    reportDoneDoor(false)
-                    if dist < 60 then reportAbilityReady(need) end
-                end
-                -- Poll lịch bấm do server hẹn (cache 0.2s gộp các lần đọc sát nhau)
+                reportDoneDoor(false)
+                reportAbilityReady(need)
+            end
+        end)
+        wait(1)
+    end
+end)
+
+-- ===== LOOP POLL: 0.3s, GET firesignal (cache), bấm ĐÚNG fire_at =====
+spawn(function()
+    while true do
+        pcall(function()
+            if distToMyDoor() < AT_DOOR_DIST then
                 local sig = Net.getJSON(BASE_URL .. "/firesignal", 0.2)
                 if sig and sig.fire_at then
                     local fire_at = tonumber(sig.fire_at) or 0
