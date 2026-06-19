@@ -1,3 +1,7 @@
+-- Module giờ NHÚNG THẲNG trong script (không tải GitHub nữa) → xoá cache cũ để chắc chắn không
+-- dính bản module_bf.lua lỗi (tween leak / noclip loadstring mỗi frame).
+pcall(function() if isfile and isfile("kaitun_module_bf.lua") and delfile then delfile("kaitun_module_bf.lua") end end)
+
 repeat
     task.wait(0.1)
 until game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
@@ -358,52 +362,135 @@ end)
 
 local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
--- FIX #7 + TĂNG TỐC: cache module_bf.lua vào file local.
--- Lần đầu tải từ GitHub rồi lưu; các lần sau đọc thẳng từ disk (gần như tức thì, không chờ mạng).
+-- ============================================================
+-- [MODULE] Bản module_bf NHÚNG THẲNG (không tải GitHub) — đã FIX:
+--   • topos: HỦY tween cũ trước khi tạo mới (hết chồng tween + memory leak + giật),
+--     clamp duration 0.05–4s (không bao giờ tween 300s = kẹt), nil-safe (không WaitForChild vô hạn).
+--   • noclip: compile loadstring 1 LẦN (không mỗi frame = hết tốn CPU), single-instance,
+--     nil-safe lúc respawn, chỉ set CanCollide part còn true.
+--   • eq/haki/getdis: nil-guard Character/Backpack/HRP.
+-- ============================================================
 local module
 do
-    local MODULE_CACHE = "kaitun_module_bf.lua"
-    local MODULE_URL = "https://github.com/noguchihyuga/idk/blob/main/module_bf.lua?raw=true"
-    local src
-    -- 1) thử đọc cache local trước
-    if isfile and isfile(MODULE_CACHE) then
-        local okR, cached = pcall(readfile, MODULE_CACHE)
-        if okR and cached and #cached > 50 then src = cached end
+    local Players = game:GetService("Players")
+    local LP = Players.LocalPlayer
+    local TweenS = game:GetService("TweenService")
+    module = {}
+
+    local function getHRP()
+        local c = LP.Character
+        return c and c:FindFirstChild("HumanoidRootPart")
     end
-    -- 2) chưa có cache → tải từ GitHub + lưu lại
-    if not src then
-        local okH, fetched = pcall(function() return game:HttpGet(MODULE_URL) end)
-        if okH and fetched and #fetched > 50 then
-            src = fetched
-            pcall(function() writefile(MODULE_CACHE, fetched) end)
-        end
-    end
-    -- 3) loadstring từ source (local hoặc vừa tải)
-    if src then
-        local okL, result = pcall(function() return loadstring(src)() end)
-        if okL and result then
-            module = result
-        else
-            warn("[KaitunV4] loadstring module_bf FAILED, thử tải lại từ GitHub...")
-            -- cache hỏng → xóa, tải tươi
-            pcall(function() if delfile then delfile(MODULE_CACHE) end end)
-            local okH2, fetched2 = pcall(function() return game:HttpGet(MODULE_URL) end)
-            if okH2 and fetched2 then
-                local okL2, res2 = pcall(function() return loadstring(fetched2)() end)
-                if okL2 and res2 then
-                    module = res2
-                    pcall(function() writefile(MODULE_CACHE, fetched2) end)
+
+    function module:eq()
+        local char = LP.Character
+        local bp = LP:FindFirstChild("Backpack")
+        if not (char and bp) then return end
+        for _, L in pairs(bp:GetChildren()) do
+            if L:IsA("Tool") then
+                local tip = L.ToolTip
+                if (tip == "Melee" and not _G.USESWORD) or (tip == "Sword" and _G.USESWORD) then
+                    if pcall(function() char.Humanoid:EquipTool(L) end) then break end
                 end
             end
         end
     end
-    if not module then warn("[KaitunV4] Load module_bf.lua FAILED hoàn toàn") end
-end
--- module là bắt buộc (getdis/topos/eq/haki/noclip đều dùng). Thiếu nó mọi vòng lặp sẽ lỗi liên
--- tục → dừng sạch + báo rõ thay vì để spam error.
-if not module then
-    _G.statusnow = "[KaitunV4] LỖI: không load được module_bf.lua — dừng script."
-    error("[KaitunV4] module_bf.lua load FAILED — không thể chạy", 0)
+
+    function module:haki()
+        local char = LP.Character
+        if char and not char:FindFirstChild("HasBuso") then
+            pcall(function()
+                game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("Buso")
+            end)
+        end
+    end
+
+    -- topos: hủy tween cũ + clamp + nil-safe
+    local _activeTween
+    function module:topos(targetCFrame, v36)
+        if typeof(targetCFrame) ~= "CFrame" then return end
+        local hrp = getHRP()
+        if not hrp then return end                                  -- respawn → bỏ qua, KHÔNG hang
+        if not v36 then pcall(function() LP.Character.Humanoid.Sit = false end) end
+        if _activeTween then pcall(function() _activeTween:Cancel(); _activeTween:Destroy() end); _activeTween = nil end
+        local dist = (hrp.Position - targetCFrame.Position).Magnitude
+        local dur = math.clamp(dist / 300, 0.05, 4)                 -- clamp chống tween vô tận
+        local tw = TweenS:Create(hrp,
+            TweenInfo.new(dur, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+            { CFrame = targetCFrame })
+        _activeTween = tw
+        tw.Completed:Once(function() if _activeTween == tw then _activeTween = nil end; pcall(function() tw:Destroy() end) end)
+        tw:Play()
+        return tw
+    end
+
+    function module:join(v2)
+        v2 = (v2 == "Marines" or v2 == "Pirates") and v2 or "Marines"
+        for _, v in pairs(LP.PlayerGui:GetChildren()) do
+            if v:FindFirstChild("ChooseTeam") then
+                local b = v.ChooseTeam.Container:FindFirstChild(v2)
+                b = b and b:FindFirstChild("Frame"); b = b and b:FindFirstChild("TextButton")
+                if b then pcall(function() firesignal(b.Activated) end) end
+            end
+        end
+    end
+
+    function module:tele(v)
+        pcall(function()
+            game:GetService("ReplicatedStorage").__ServerBrowser:InvokeServer("teleport", v or game.JobId)
+        end)
+    end
+
+    -- noclip: compile 1 lần + single-instance + nil-safe
+    local _noclipOn = false
+    function module:noclip(v)
+        if _noclipOn then return end
+        _noclipOn = true
+        local okC, fn = pcall(loadstring, v)
+        local cond = (okC and type(fn) == "function") and fn or function() return true end
+        task.spawn(function()
+            while true do
+                task.wait()
+                local char = LP.Character
+                local hum = char and char:FindFirstChild("Humanoid")
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                local okR, want = pcall(cond)
+                if okR and want and hum and hrp and not hum.Sit then
+                    if not hrp:FindFirstChild("BodyClip") then
+                        local bv = Instance.new("BodyVelocity")
+                        bv.Name = "BodyClip"; bv.MaxForce = Vector3.new(1e5, 1e5, 1e5); bv.Velocity = Vector3.zero
+                        bv.Parent = hrp
+                    end
+                    for _, p in pairs(char:GetDescendants()) do
+                        if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+                    end
+                elseif hrp then
+                    local bc = hrp:FindFirstChild("BodyClip")
+                    if bc then bc:Destroy() end
+                end
+            end
+        end)
+    end
+
+    function module:getdis(x, y)
+        if typeof(x) ~= "CFrame" then return math.huge end
+        if not y then
+            local hrp = getHRP()
+            if not hrp then return math.huge end
+            y = hrp.CFrame
+        end
+        return (x.Position - y.Position).Magnitude
+    end
+
+    -- anti-AFK
+    pcall(function()
+        LP.Idled:Connect(function()
+            local vu = game:GetService("VirtualUser")
+            vu:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+            task.wait(1)
+            vu:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+        end)
+    end)
 end
 local topofgreattree = CFrame.new(3035.15137, 2281.15918, -7325.19189, 0.0284484141, 2.19495124e-08, 0.999595284,
     -3.29094476e-08, 1, -2.10217994e-08, -0.999595284, -3.22980895e-08, 0.0284484141)
@@ -834,11 +921,13 @@ end
 
 TweenObject = function(Object, Pos, Speed)
     if Speed == nil then Speed = 350 end
+    if not (Object and Object.Parent) then return end                 -- nil-guard mob đã despawn
     local Distance = (Pos.Position - Object.Position).Magnitude
-    local tweenService = game:GetService("TweenService")
-    local info = TweenInfo.new(Distance / Speed, Enum.EasingStyle.Linear)
-    tween1 = tweenService:Create(Object, info, { CFrame = Pos })
-    tween1:Play()
+    local dur = math.clamp(Distance / Speed, 0.03, 3)                 -- clamp: không tween quá dài
+    local tw = game:GetService("TweenService"):Create(
+        Object, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = Pos })
+    tw.Completed:Once(function() pcall(function() tw:Destroy() end) end) -- destroy → hết leak
+    tw:Play()
 end
 GetMobPosition = function(EnemiesName)
     local pos = Vector3.new(0, 0, 0)
