@@ -896,33 +896,47 @@ function status(v)
     _G.statusnow = tostring(v) .. ((_G.lastRaceI ~= nil) and ("  [i=" .. tostring(_G.lastRaceI) .. "]") or "")
 end
 
-function getCurrentMainBeingUpgraded()
-    local mains = getgenv().Config["MainAccount"]
-    if not mains or #mains == 0 then
-        return nil, nil
-    end
-    for i, name in ipairs(mains) do
+-- ============================================================
+-- HÀNG ĐỢI ĐỘNG theo "stt":
+--   1) main đang trial (moon/in_trail) → đầu hàng
+--   2) main đang chờ (waiting/"")       → theo thứ tự config
+--   3) main đã xong (done/training)     → đẩy XUỐNG CUỐI
+-- order[1] = main đang ở "stt1" (tới lượt trial). Khi main stt1 chuyển done/training
+-- nó tự xuống cuối → main kế lên stt1; main sau lại tụt 1 bậc (Main3 → Main2...).
+-- ============================================================
+function getMainOrder()
+    local mains = getgenv().Config["MainAccount"] or {}
+    local active, waiting, finished = {}, {}, {}
+    for _, name in ipairs(mains) do
         local st = getMainStatus(name)
         if st == "moon" or st == "in_trail" then
-            return name, i
+            active[#active + 1] = name
+        elseif st == "done" or st == "training" then
+            finished[#finished + 1] = name
+        else -- "waiting" / ""
+            waiting[#waiting + 1] = name
         end
     end
-    for i, name in ipairs(mains) do
-        local st = getMainStatus(name)
-        if st == "waiting" or st == "" then
-            if i == 1 then
-                return name, i
-            else
-                local prevSt = getMainStatus(mains[i - 1])
-                -- FIX deadlock: thêm "done". Main trước đã XONG (full gear) thì main sau PHẢI
-                -- được lên lượt; trước đây thiếu "done" → main sau chờ main "done" mãi, game đứng.
-                if prevSt == "training" or prevSt == "waiting" or prevSt == "" or prevSt == "done" then
-                    return name, i
-                end
-            end
-        end
+    local order = {}
+    for _, n in ipairs(active) do order[#order + 1] = n end
+    for _, n in ipairs(waiting) do order[#order + 1] = n end
+    for _, n in ipairs(finished) do order[#order + 1] = n end
+    return order
+end
+
+-- stt ĐỘNG (1-based) của 1 main trong hàng đợi; nil nếu không phải main.
+function mainSttOf(name)
+    for i, v in ipairs(getMainOrder()) do
+        if v == name then return i end
     end
-    return mains[1], 1
+    return nil
+end
+
+-- Main đang ở "stt1" (tới lượt được trial). Trả (name, 1).
+function getCurrentMainBeingUpgraded()
+    local order = getMainOrder()
+    if #order == 0 then return nil, nil end
+    return order[1], 1
 end
 
 -- Đọc jobid của main hiện tại → trả (cùng_server?, jobid_của_main).
@@ -1057,6 +1071,7 @@ spawn(function()
             _G.ShouldSendData = false
             local ab, AB = cachedTrialable()
             local currentmain, currentidx = getCurrentMainBeingUpgraded()
+            local myStt = mainSttOf(myName) or myMainIndex   -- stt ĐỘNG để hiển thị
             local myStatus = ""
             if isaccmain[myName] then
                 myStatus = getMainStatus(myName)
@@ -1069,7 +1084,7 @@ spawn(function()
                     -- Không còn done (đổi tộc/V3/đang tiến hành) → bỏ status done về waiting để chạy lại
                     if myStatus == "done" then setMyMainStatus("waiting"); myStatus = "waiting" end
                     if (myStatus == "in_trail" or myStatus == "moon") and not ab then
-                        status("[MAIN " .. myMainIndex .. "] Trial completed, switching to training!")
+                        status("[MAIN " .. myStt .. "] Trial completed, switching to training!")
                         setMyMainStatus("training")
                         myStatus = "training"
                     end
@@ -1077,21 +1092,21 @@ spawn(function()
                 if myStatus == "in_trail" and ab then
                     local in_temple = getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) < 3000
                     if not in_temple then
-                        status("[MAIN " .. myMainIndex .. "] Died in trial, retrying...")
+                        status("[MAIN " .. myStt .. "] Died in trial, retrying...")
                         setMyMainStatus("waiting")
                         myStatus = "waiting"
                     end
                 end
             end
             if isaccmain[myName] and myStatus == "done" then
-                status("[MAIN " .. myMainIndex .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
+                status("[MAIN " .. myStt .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
             elseif isaccmain[myName] and myStatus == "training" then
-                status("[MAIN " .. myMainIndex .. "] Training (parallel)")
+                status("[MAIN " .. myStt .. "] Training (parallel)")
                 if not ab then
                     if AB == "raiding" then
                         local boss = workspace.Enemies:FindFirstChild("Cake Prince") or workspace.Enemies:FindFirstChild("Dough King")
                         if boss then
-                            status("[MAIN " .. myMainIndex .. "] Raiding for fragment")
+                            status("[MAIN " .. myStt .. "] Raiding for fragment")
                             repeat wait()
                                 pcall(function() topos(boss.HumanoidRootPart.CFrame * CFrame.new(0, 25, 0)) end)
                                 module:eq(); module:haki(); BringMob()
@@ -1122,7 +1137,7 @@ spawn(function()
                                     -- transformed → đứng cao chờ hết V4; chưa → áp sát kill
                                     if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, tf and 150 or 20, 0)) end) end
                                     if tf ~= lastTf then  -- đổi status chỉ khi state đổi → hết giật chữ
-                                        status("[MAIN " .. myMainIndex .. (tf and "] Training (Wait for end V4)" or "] Training (Kill Mobs)"))
+                                        status("[MAIN " .. myStt .. (tf and "] Training (Wait for end V4)" or "] Training (Kill Mobs)"))
                                         lastTf = tf
                                     end
                                     -- bấm Y throttle 0.4s, KHÔNG spawn mỗi frame → hết giật
@@ -1134,11 +1149,11 @@ spawn(function()
                         end
                     end
                 else
-                    status("[MAIN " .. myMainIndex .. "] Training done, back to waiting")
+                    status("[MAIN " .. myStt .. "] Training done, back to waiting")
                     setMyMainStatus("waiting")
                 end
             elseif isaccmain[myName] and currentmain == myName then
-                status("[MAIN " .. myMainIndex .. "] My turn to upgrade gear!")
+                status("[MAIN " .. myStt .. "] My turn to upgrade gear!")
                 if myStatus == "waiting" or myStatus == "" then
                     setMyMainStatus("moon")
                 end
@@ -1159,7 +1174,7 @@ spawn(function()
                                     if jobid and jobid ~= game.JobId and v.player <= 8 then
                                         local lastVisit = cachedJobs[jobid]
                                         if not lastVisit or (math.floor(tick()) - lastVisit) > 3600 then
-                                            status("[MAIN " .. myMainIndex .. "] Hop fullmoon server")
+                                            status("[MAIN " .. myStt .. "] Hop fullmoon server")
                                             game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", jobid)
                                             hopped = true
                                             break
@@ -1183,7 +1198,7 @@ spawn(function()
                             game:GetService("ReplicatedStorage").MapStash["Temple of Time"].Parent = workspace.Map
                         end
                     elseif workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 0 then
-                        status("[MAIN " .. myMainIndex .. "] Kill Players After Trial")
+                        status("[MAIN " .. myStt .. "] Kill Players After Trial")
                         for plr in pairs(getplayers()) do
                             if plr then
                                 repeat wait() attackTick(plr)
@@ -1191,11 +1206,18 @@ spawn(function()
                             end
                         end
                     else
-                        runTrialPhase("[MAIN " .. myMainIndex .. "]", true)
+                        runTrialPhase("[MAIN " .. myStt .. "]", true)
                     end
                 end
+            elseif isaccmain[myName] then
+                -- MAIN CHƯA TỚI LƯỢT → ĐỨNG IM chờ lên stt1, KHÔNG đi help main khác.
+                -- Liên tục re-check mỗi vòng: khi main stt1 chuyển done/training thì hàng đợi
+                -- xoay, mình lên stt1 → vòng sau rơi vào nhánh "My turn" ở trên.
+                _G.allyKillReset = false
+                status("[MAIN " .. myStt .. "] Waiting for current main: " .. tostring(currentmain))
             else
-                local roleName = isaccmain[myName] and ("[MAIN " .. myMainIndex .. " as ALLY]") or "[ALLY]"
+                -- CHỈ ALLY THẬT vào đây: liên tục detect jobid của main stt1 → join + help.
+                local roleName = "[ALLY]"
                 -- "Nhận lệnh lên trial door" = phát hiện main đang up (moon/in_trail). Làm như join
                 -- jobid: nếu cache miss/chưa active thì FETCH TƯƠI retry 2 lần → đỡ trễ/đứng chờ oan.
                 local mainActive = false
@@ -1274,7 +1296,7 @@ spawn(function()
                                     if isCurrentMain then
                                         local allies_str = table.concat(getgenv().Config["Allies"] or {}, ",")
                                         if allies_str ~= "" then
-                                            status("[MAIN " .. myMainIndex .. "] Waiting for help accs to reset first...")
+                                            status("[MAIN " .. myStt .. "] Waiting for help accs to reset first...")
                                             local timeout = 0
                                             repeat
                                                 wait(1)
