@@ -2,6 +2,9 @@
 -- dính bản module_bf.lua lỗi (tween leak / noclip loadstring mỗi frame).
 pcall(function() if isfile and isfile("kaitun_module_bf.lua") and delfile then delfile("kaitun_module_bf.lua") end end)
 
+-- ĐỢI CLIENT LOAD XONG HẲN trước khi làm gì (quan trọng SAU KHI HOP SERVER: instance mới
+-- phải load đủ mới chọn team + chạy script; nếu không sẽ "chọn được team mà script không chạy").
+if not game:IsLoaded() then game.Loaded:Wait() end
 repeat
     task.wait(0.1)
 until game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
@@ -1051,6 +1054,32 @@ local function readTempleDoor()
     if ok then return res end
     return nil
 end
+-- ============================================================
+-- GATE SẴN SÀNG: chờ TEAM + NHÂN VẬT + DATA load xong rồi mới chạy logic chính.
+-- Cần sau khi HOP SERVER: nếu chạy logic khi nhân vật/Data chưa load → lỗi / "không chạy".
+-- Heartbeat + choose-team + /init ở TRÊN đã chạy rồi nên account KHÔNG bị rớt khi chờ.
+-- Có timeout 45s (best-effort) để không treo vĩnh viễn; vòng lặp chính đã bọc pcall nên an toàn.
+-- ============================================================
+do
+    local LP = game:GetService("Players").LocalPlayer
+    local t0 = tick()
+    repeat
+        task.wait(0.2)
+        local c = LP.Character
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        local ready = LP.Team
+            and c and c:FindFirstChild("HumanoidRootPart")
+            and hum and hum.Health > 0
+            and LP:FindFirstChild("Data") and LP.Data:FindFirstChild("Race")
+        if ready then break end
+    until (tick() - t0) > 45
+    Net.log("INFO", ("Game ready gate: team=%s char=%s data=%s elapsed=%.1fs"):format(
+        tostring(LP.Team ~= nil),
+        tostring(LP.Character ~= nil),
+        tostring(LP:FindFirstChild("Data") ~= nil),
+        tick() - t0))
+end
+
 local checktempledoor = readTempleDoor()
 _G.ShouldSendData = false
 local issobusy = false
