@@ -908,7 +908,9 @@ function getCurrentMainBeingUpgraded()
                 return name, i
             else
                 local prevSt = getMainStatus(mains[i - 1])
-                if prevSt == "training" or prevSt == "waiting" or prevSt == "" then
+                -- FIX deadlock: thêm "done". Main trước đã XONG (full gear) thì main sau PHẢI
+                -- được lên lượt; trước đây thiếu "done" → main sau chờ main "done" mãi, game đứng.
+                if prevSt == "training" or prevSt == "waiting" or prevSt == "" or prevSt == "done" then
                     return name, i
                 end
             end
