@@ -2280,31 +2280,13 @@ ButtonCard(mainPage, 5, "Join Job Id", function()
     end)
 end)
 
--- Auto Choose Gear — bật/tắt. On: tự CHỌN gear (TempleClock SpendPoint theo Config A-B-B/A-A-B)
--- LIÊN TỤC, gồm cả mức config cuối sau Gear4 (lvl 5). Không phải "buy".
-do
-    local savedACG = false
+-- Change Race (đổi tộc 2500 Fragments) — bản Banana: BlackbeardReward "Reroll" 1+2
+ButtonCard(mainPage, 6, "Change Race (2500F)", function()
     pcall(function()
-        local y = game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json"))
-        if y and y["Auto Choose Gear"] ~= nil then savedACG = y["Auto Choose Gear"] and true or false end
+        local R = game:GetService("ReplicatedStorage").Remotes.CommF_
+        R:InvokeServer("BlackbeardReward", "Reroll", "1")
+        R:InvokeServer("BlackbeardReward", "Reroll", "2")
     end)
-    _G.AutoChooseGear = savedACG
-    ToggleCard(mainPage, 6, "Auto Choose Gear", "Tự chọn gear theo Config (gồm mức cuối)", savedACG, function(v)
-        _G.AutoChooseGear = v
-        pcall(function()
-            local m = {}; pcall(function() m = game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json")) end)
-            if type(m) ~= "table" then m = {} end
-            if not isfolder("nawy") then makefolder("nawy") end
-            m["Auto Choose Gear"] = v
-            writefile("nawy/kaitunv4.json", game.HttpService:JSONEncode(m))
-        end)
-    end)
-end
--- Vòng nền Auto Choose Gear: gọi checkgear() (SpendPoint chọn Alpha/Omega/config), throttle 0.3s
-spawn(function()
-    while wait(0.3) do
-        if _G.AutoChooseGear then pcall(function() checkgear() end) end
-    end
 end)
 
 -- live status loop
