@@ -451,8 +451,10 @@ local TEMPLE_ENTRY = Vector3.new(28310.0234, 14895.1123, 109.456741)
 --   • ĐÃ ở temple mà getdoor() chớp nil → CHỜ cửa load (retry 3s), KHÔNG re-teleport
 --     (re-teleport khi cửa chưa load chính là "lỗi detect door"), rồi bám sát cửa.
 function goToMyDoor()
+    -- XA temple (vd vừa chết/reset, respawn ở spawn) → requestEntrance lên Temple of Time NHƯ LÚC
+    -- MỚI VÀO GAME. KHÔNG topos bay từ xa (giật giật + lỗi nil lúc char đang respawn). Throttle 4s.
     if getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) >= 3000 then
-        if not _G.lastReqEntrance or (tick() - _G.lastReqEntrance) > 5 then
+        if not _G.lastReqEntrance or (tick() - _G.lastReqEntrance) > 4 then
             _G.lastReqEntrance = tick()
             pcall(function()
                 game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("requestEntrance", TEMPLE_ENTRY)
@@ -460,13 +462,15 @@ function goToMyDoor()
         end
         return false
     end
-    local door, t0 = nil, tick()
-    repeat wait(); door = getdoor() until door ~= nil or (tick() - t0) > 3  -- chờ corridor load
-    if not door then return false end                                       -- chưa kịp → vòng sau thử lại
-    t0 = tick()
-    repeat wait(); pcall(function() topos(door.CFrame) end)
-    until getdis(door.CFrame) < 60 or (tick() - t0) > 5
-    return true
+    -- ĐÃ ở temple: topos tới cửa MỖI tick (noclip BẬT → đứng yên sẽ rơi xuyên sàn; topos lại mỗi
+    -- ~0.35s giữ char trong tầm AT_DOOR_DIST, không rơi xa). KHÔNG hard-set liên tục để không cản
+    -- teleport khi ActivateAbility mở trial. Nil-safe (đang respawn → bỏ qua).
+    local door = getdoor()
+    if not door then return false end
+    local char = game.Players.LocalPlayer.Character
+    if not (char and char:FindFirstChild("HumanoidRootPart")) then return false end
+    pcall(function() topos(door.CFrame) end)
+    return getdis(door.CFrame) <= 150
 end
 
 local pos_plr_trial = {
@@ -803,7 +807,7 @@ function trialable()
     end
     local i, d, f = game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("UpgradeRace", "Check")
     if i == 5 then
-        return false
+        return false, "done"   -- DONE YOUR RACE = full gear (nâng xong Gear2/3/4)
     else
         if i == 6 then
             return false, d - 2
@@ -1085,7 +1089,10 @@ spawn(function()
                 myStatus = getMainStatus(myName)
             end
             if isaccmain[myName] then
-                if (myStatus == "in_trail" or myStatus == "moon") and not ab then
+                if AB == "done" then
+                    -- ✅ XONG TỘC (full gear) → set status "done" để không tới lượt/không train nữa
+                    if myStatus ~= "done" then setMyMainStatus("done"); myStatus = "done" end
+                elseif (myStatus == "in_trail" or myStatus == "moon") and not ab then
                     status("[MAIN " .. myMainIndex .. "] Trial completed, switching to training!")
                     setMyMainStatus("training")
                     myStatus = "training"
@@ -1099,7 +1106,9 @@ spawn(function()
                     end
                 end
             end
-            if isaccmain[myName] and myStatus == "training" then
+            if isaccmain[myName] and myStatus == "done" then
+                status("[MAIN " .. myMainIndex .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
+            elseif isaccmain[myName] and myStatus == "training" then
                 status("[MAIN " .. myMainIndex .. "] Training (parallel)")
                 if not ab then
                     if AB == "raiding" then
