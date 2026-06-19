@@ -332,25 +332,31 @@ spawn(function()
     end
 end)
 
--- Phát hiện account RỜI GAME / bị đá / teleport → báo offline tức thì, dừng heartbeat.
+-- Phát hiện account RỜI GAME THẬT → báo offline. QUAN TRỌNG: ĐỔI SERVER (hop fullmoon/
+-- teleport) KHÔNG tính offline — báo offline lúc hop sẽ xoá account khỏi stt1 làm LỆCH đồng bộ.
+-- Hop chỉ teleport rồi join lại, heartbeat tiếp tục ở server mới (<30s); rớt thật thì prune lo.
+local teleporting = false
 do
     local Players = game:GetService("Players")
     local LP = Players.LocalPlayer
-    -- chính mình rời server
-    Players.PlayerRemoving:Connect(function(plr)
-        if plr == LP then sendOffline() end
-    end)
-    -- executor/Roblox đóng instance (đóng tab, kill) → chạy trước khi tắt hẳn
-    pcall(function() game:BindToClose(function() sendOffline() end) end)
-    -- teleport sang server khác cũng coi như rời (instance hiện tại chết)
+    -- đánh dấu đang teleport (hop server) → chặn offline trong lúc này
     pcall(function()
         LP.OnTeleport:Connect(function(state)
-            -- Started(1)/Failed(3) đều nghĩa là instance này sắp/đang bị huỷ
-            if state == Enum.TeleportState.Started or state == Enum.TeleportState.Failed then
-                sendOffline()
+            if state == Enum.TeleportState.Started or state == Enum.TeleportState.InProgress then
+                teleporting = true
+            elseif state == Enum.TeleportState.Failed or state == Enum.TeleportState.Cancelled then
+                teleporting = false   -- hop hỏng → cho phép offline nếu sau đó rời thật
             end
         end)
     end)
+    -- chính mình rời server (quit thật) — BỎ QUA nếu đang teleport (hop)
+    Players.PlayerRemoving:Connect(function(plr)
+        if plr == LP and not teleporting then sendOffline() end
+    end)
+    -- đóng instance (đóng tab/kill) — cũng bỏ qua nếu đang teleport
+    pcall(function() game:BindToClose(function()
+        if not teleporting then sendOffline() end
+    end) end)
 end
 
 -- Warmer: làm nóng statusCache nền (rải đều) → getMainStatus trong vòng logic chỉ hit cache.
