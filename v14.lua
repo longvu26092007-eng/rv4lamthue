@@ -803,36 +803,35 @@ function trialable()
         local okI, i5 = pcall(function()
             return (game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("UpgradeRace", "Check"))
         end)
-        if okI and i5 == 5 then return false, "done" end
+        _G.lastRaceI = okI and i5 or "?"   -- debug: hiện i hiện tại
+        if okI and (i5 == 5 or i5 == 8) then return false, "done" end   -- 5/8 = FULL GEAR
         local abcxyz = checkbackpack(race_abilities[game:GetService("Players").LocalPlayer.Data.Race.Value])
         if abcxyz then return true end
         return false
     end
     local i, d, f = game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("UpgradeRace", "Check")
-    if i == 5 then
-        return false, "done"   -- DONE YOUR RACE = full gear (nâng xong Gear2/3/4)
-    else
-        if i == 6 then
-            return false, d - 2
-        elseif i == 1 or i == 3 then
-            return false
-        elseif i == 2 or i == 4 or i == 7 then
-            if f then
-                local totalfragments = tonumber(f)
-                if game:GetService("Players").LocalPlayer.Data.Fragments.Value >= totalfragments then
-                    game:GetService("ReplicatedStorage")["Remotes"]["CommF_"]:InvokeServer("UpgradeRace", "Buy")
-                else
-                    return false, "raiding"
-                end
+    _G.lastRaceI = i   -- debug: hiện i hiện tại
+    -- FULL GEAR = i==5 (Full Update) HOẶC i==8 (full gear + còn training sessions) → DONE.
+    if i == 5 or i == 8 then
+        return false, "done"
+    elseif i == 6 then
+        return false, d - 2
+    elseif i == 1 or i == 3 then
+        return false
+    elseif i == 2 or i == 4 or i == 7 then
+        if f then
+            local totalfragments = tonumber(f)
+            if game:GetService("Players").LocalPlayer.Data.Fragments.Value >= totalfragments then
+                game:GetService("ReplicatedStorage")["Remotes"]["CommF_"]:InvokeServer("UpgradeRace", "Buy")
+            else
+                return false, "raiding"
             end
-            return false, f
-        elseif i == 0 then
-            return true, d
-        elseif i ~= 8 then
-            return false
-        else
-            return true, 10 - d
         end
+        return false, f
+    elseif i == 0 then
+        return true, d   -- Ready For Trial
+    else
+        return false
     end
 end
 
@@ -847,7 +846,8 @@ function cachedTrialable()
 end
 
 function status(v)
-    _G.statusnow = v
+    -- DEBUG: luôn kèm [i=X] (giá trị UpgradeRace Check mới nhất) để xem trạng thái race thực tế
+    _G.statusnow = tostring(v) .. ((_G.lastRaceI ~= nil) and ("  [i=" .. tostring(_G.lastRaceI) .. "]") or "")
 end
 
 function getCurrentMainBeingUpgraded()
@@ -2278,6 +2278,33 @@ ButtonCard(mainPage, 5, "Join Job Id", function()
     pcall(function()
         TPService:TeleportToPlaceInstance(game.PlaceId, _G.jobidinput, LocalPlayer)
     end)
+end)
+
+-- Auto Choose Gear — bật/tắt. On: tự CHỌN gear (TempleClock SpendPoint theo Config A-B-B/A-A-B)
+-- LIÊN TỤC, gồm cả mức config cuối sau Gear4 (lvl 5). Không phải "buy".
+do
+    local savedACG = false
+    pcall(function()
+        local y = game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json"))
+        if y and y["Auto Choose Gear"] ~= nil then savedACG = y["Auto Choose Gear"] and true or false end
+    end)
+    _G.AutoChooseGear = savedACG
+    ToggleCard(mainPage, 6, "Auto Choose Gear", "Tự chọn gear theo Config (gồm mức cuối)", savedACG, function(v)
+        _G.AutoChooseGear = v
+        pcall(function()
+            local m = {}; pcall(function() m = game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json")) end)
+            if type(m) ~= "table" then m = {} end
+            if not isfolder("nawy") then makefolder("nawy") end
+            m["Auto Choose Gear"] = v
+            writefile("nawy/kaitunv4.json", game.HttpService:JSONEncode(m))
+        end)
+    end)
+end
+-- Vòng nền Auto Choose Gear: gọi checkgear() (SpendPoint chọn Alpha/Omega/config), throttle 0.3s
+spawn(function()
+    while wait(0.3) do
+        if _G.AutoChooseGear then pcall(function() checkgear() end) end
+    end
 end)
 
 -- live status loop
