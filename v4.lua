@@ -520,6 +520,19 @@ function doTrialForMyRace()
     local myrace = LP.Data.Race.Value
     local race_trial_place = races_trial_place[myrace]
     local function tp(cf) pcall(function() module:topos(cf) end) end  -- teleport thô (không tự kill)
+    -- BAY TỪ TỪ tới cf (tween mượt). KaitunV4 KHÔNG có Tween2/BKP → tự dựng bằng TweenService.
+    -- module:noclip(return true) đã bật sẵn nên xuyên vật cản khi bay.
+    local function flyTo(cf)
+        pcall(function()
+            local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+            local dist = (cf.Position - hrp.Position).Magnitude
+            local dur = math.clamp(dist / 325, 0.05, 4)   -- 325 studs/s, cap 4s tránh kẹt
+            local tw = game:GetService("TweenService"):Create(
+                hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = cf })
+            tw:Play(); wait(dur)
+        end)
+    end
     local function equipMelee()  -- cầm vũ khí Melee (fallback: Sword/Blox Fruit/Gun)
         pcall(function()
             local char = LP.Character
@@ -538,9 +551,9 @@ function doTrialForMyRace()
     end
 
     if myrace == "Mink" then
-        -- 1.txt/3.txt: TWEEN MƯỢT tới part "StartPoint" (+10) — đi qua quãng đường để game NHẬN.
-        -- VỪA VÀO map trial → delay 2s cho trial khởi tạo rồi mới tween (tránh "vào là tới đích, không nhận").
-        -- Debounce: gap >3s = vừa vào lại → mới delay; đang trial liên tục thì không delay lặp.
+        -- Rabbit: TELE NGAY tới part "StartPoint" (+10), NHƯNG phải ở trong room trial 1 lúc đã
+        -- (delay 2s sau khi vừa vào) → game kịp khởi tạo, tránh "vừa vào tele là không nhận".
+        -- Debounce: gap >3s = vừa vào lại → delay 2s; đang trial liên tục thì khỏi delay lặp.
         if tick() - (_G.minkLastTrial or 0) > 3 then wait(2) end
         _G.minkLastTrial = tick()
         local sp
@@ -549,10 +562,10 @@ function doTrialForMyRace()
                 if obj.Name == "StartPoint" then sp = obj break end
             end
         end)
-        if sp then pcall(function() Tween2(sp.CFrame * CFrame.new(0, 10, 0)) end) end
+        if sp then pcall(function() tp(sp.CFrame * CFrame.new(0, 10, 0)) end) end  -- tốc biến
     elseif myrace == "Skypiea" then
         -- tới part "snowisland_Cylinder.081" (8/8 nguồn), fallback FinishPart (kkv4).
-        -- BAY TỪ TỪ bằng Tween2 (mượt, qua quãng đường) thay vì tốc biến.
+        -- BAY TỪ TỪ bằng flyTo (tween mượt) thay vì tốc biến.
         local finish
         pcall(function()
             local model = workspace.Map:FindFirstChild("SkyTrial")
@@ -564,7 +577,7 @@ function doTrialForMyRace()
                 finish = finish or model:FindFirstChild("FinishPart")
             end
         end)
-        if finish then pcall(function() Tween2(finish.CFrame) end) end
+        if finish then flyTo(finish.CFrame) end
     elseif myrace == "Cyborg" then
         pcall(function() tp(workspace.Map.CyborgTrial.Floor.CFrame * CFrame.new(0, 500, 0)) end)
     elseif myrace == "Human" or myrace == "Ghoul" then
