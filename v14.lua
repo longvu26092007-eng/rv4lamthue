@@ -556,15 +556,20 @@ function doTrialForMyRace()
         -- khỏi điểm → trial KHÔNG hoàn thành).
         if tick() - (_G.minkLastTrial or 0) > 3 then wait(2) end
         _G.minkLastTrial = tick()
-        local sp
-        pcall(function()
-            for _, obj in pairs(workspace:GetDescendants()) do
-                if obj.Name == "StartPoint" then sp = obj break end
-            end
-        end)
+        local sp = _G.minkStartPoint
+        if not (sp and sp.Parent) then   -- cache: chỉ quét workspace khi chưa có/đã mất part
+            sp = nil
+            pcall(function()
+                for _, obj in pairs(workspace:GetDescendants()) do
+                    if obj.Name == "StartPoint" then sp = obj break end
+                end
+            end)
+            _G.minkStartPoint = sp
+        end
         if sp then
+            -- ĐỨNG NGAY TRÊN điểm (bỏ offset +10 vì trước đó lơ lửng cao quá → không nhận).
             local t0 = tick()
-            repeat wait(); pcall(function() module:topos(sp.CFrame * CFrame.new(0, 10, 0)) end)
+            repeat wait(); pcall(function() module:topos(sp.CFrame * CFrame.new(0, 2, 0)) end)
             until (tick() - t0) > 4
         end
     elseif myrace == "Skypiea" then
@@ -583,14 +588,20 @@ function doTrialForMyRace()
             end
         end)
         if not finish then
-            pcall(function()
-                for _, obj in pairs(workspace:GetDescendants()) do
-                    if obj.Name == "snowisland_Cylinder.081" then finish = obj break end
-                end
-            end)
+            local c = _G.skyFinish   -- cache: tránh quét toàn workspace mỗi tick
+            if c and c.Parent then finish = c
+            else
+                pcall(function()
+                    for _, obj in pairs(workspace:GetDescendants()) do
+                        if obj.Name == "snowisland_Cylinder.081" then finish = obj break end
+                    end
+                end)
+                _G.skyFinish = finish
+            end
         end
         if finish then flyTo(finish.CFrame)
-        elseif model then pcall(function() flyTo(model:GetPivot()) end) end
+        elseif model then pcall(function() flyTo(model:GetPivot()) end)
+        elseif race_trial_place then flyTo(race_trial_place.CFrame) end  -- chưa load → bay vào khu trial cho stream part
     elseif myrace == "Cyborg" then
         pcall(function() tp(workspace.Map.CyborgTrial.Floor.CFrame * CFrame.new(0, 500, 0)) end)
     elseif myrace == "Human" or myrace == "Ghoul" then
@@ -598,13 +609,14 @@ function doTrialForMyRace()
             local hum = v:FindFirstChild("Humanoid")
             local hrp = v:FindFirstChild("HumanoidRootPart")
             if hum and hrp and hum.Health > 0 and (not race_trial_place or getdis(hrp.CFrame, race_trial_place.CFrame) < 1500) then
+                local t0 = tick()
                 repeat wait()
                     equipMelee()                                     -- FIX: cầm melee lên trước
                     module:eq(); module:haki()
                     tp(hrp.CFrame * CFrame.new(0, 30, 0))            -- bay tới boss
                     pcall(function() sethiddenproperty(LP, "SimulationRadius", math.huge) end)
                     pcall(function() hrp.CanCollide = false; hum.Health = 0 end)  -- kill chắc ăn
-                until (not v.Parent) or (not v:FindFirstChild("Humanoid")) or v.Humanoid.Health <= 0
+                until (not v.Parent) or (not v:FindFirstChild("Humanoid")) or v.Humanoid.Health <= 0 or (tick() - t0) > 20  -- timeout chống đứng im
             end
         end
     elseif myrace == "Fishman" then
@@ -612,13 +624,14 @@ function doTrialForMyRace()
             pcall(function()
                 if v:FindFirstChild('Health') and v.Health.Value > 0 and v:FindFirstChild("HumanoidRootPart")
                     and (not race_trial_place or getdis(v.HumanoidRootPart.CFrame, race_trial_place) < 1500) then
+                    local t0 = tick()
                     repeat wait()
                         if not LP.Backpack:FindFirstChild("Sharkman Karate") then
                             game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("BuySharkmanKarate")
                         end
                         tp(v.HumanoidRootPart.CFrame * CFrame.new(0, 500, 0))
                         _G.SHOULDSPAMSKILLS = true
-                    until (not v.Parent) or (not v:FindFirstChild('Health')) or v.Health.Value <= 0 or (not v:FindFirstChild("HumanoidRootPart"))
+                    until (not v.Parent) or (not v:FindFirstChild('Health')) or v.Health.Value <= 0 or (not v:FindFirstChild("HumanoidRootPart")) or (tick() - t0) > 25  -- timeout
                     _G.SHOULDSPAMSKILLS = false
                 end
             end)
@@ -814,6 +827,16 @@ function trialable()
             return true, 10 - d
         end
     end
+end
+
+-- Cache trialable() — bản gốc gọi UpgradeRace Check (+ có thể Buy) qua InvokeServer 3 lần/giây.
+-- TTL 1.5s: vẫn đủ nhạy cho chuyển trạng thái, giảm mạnh round-trip server (×100 account).
+local _trCache = { t = -1e9, ab = nil, AB = nil }
+function cachedTrialable()
+    if (tick() - _trCache.t) < 1.5 then return _trCache.ab, _trCache.AB end
+    local ab, AB = trialable()
+    _trCache.t, _trCache.ab, _trCache.AB = tick(), ab, AB
+    return ab, AB
 end
 
 local Gears = { "Alpha", "Omega" }
@@ -1055,7 +1078,7 @@ spawn(function()
         if not checktempledoor then
         else
             _G.ShouldSendData = false
-            local ab, AB = trialable()
+            local ab, AB = cachedTrialable()
             local currentmain, currentidx = getCurrentMainBeingUpgraded()
             local myStatus = ""
             if isaccmain[myName] then
