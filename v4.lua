@@ -551,9 +551,9 @@ function doTrialForMyRace()
     end
 
     if myrace == "Mink" then
-        -- Rabbit: TELE NGAY tới part "StartPoint" (+10), NHƯNG phải ở trong room trial 1 lúc đã
-        -- (delay 2s sau khi vừa vào) → game kịp khởi tạo, tránh "vừa vào tele là không nhận".
-        -- Debounce: gap >3s = vừa vào lại → delay 2s; đang trial liên tục thì khỏi delay lặp.
+        -- Rabbit: tele tới "StartPoint" (+10). Delay 2s sau khi vừa vào (game kịp khởi tạo),
+        -- rồi GIỮ ở StartPoint LIÊN TỤC ~4s (mọi nguồn tween mỗi frame; tp 1 phát/0.35s sẽ trôi
+        -- khỏi điểm → trial KHÔNG hoàn thành).
         if tick() - (_G.minkLastTrial or 0) > 3 then wait(2) end
         _G.minkLastTrial = tick()
         local sp
@@ -562,13 +562,18 @@ function doTrialForMyRace()
                 if obj.Name == "StartPoint" then sp = obj break end
             end
         end)
-        if sp then pcall(function() tp(sp.CFrame * CFrame.new(0, 10, 0)) end) end  -- tốc biến
+        if sp then
+            local t0 = tick()
+            repeat wait(); pcall(function() module:topos(sp.CFrame * CFrame.new(0, 10, 0)) end)
+            until (tick() - t0) > 4
+        end
     elseif myrace == "Skypiea" then
         -- tới part "snowisland_Cylinder.081" (8/8 nguồn), fallback FinishPart (kkv4).
-        -- BAY TỪ TỪ bằng flyTo (tween mượt) thay vì tốc biến.
-        local finish
+        -- Đứng im 10-15s ở trên trời = path workspace.Map.SkyTrial chưa đúng dù part đã load.
+        -- → tìm theo path trước (nhanh), KHÔNG thấy thì tìm RỘNG toàn workspace để bắt part ngay.
+        local finish, model
         pcall(function()
-            local model = workspace.Map:FindFirstChild("SkyTrial")
+            model = workspace.Map:FindFirstChild("SkyTrial")
             model = model and model:FindFirstChild("Model")
             if model then
                 for _, obj in pairs(model:GetDescendants()) do
@@ -577,7 +582,15 @@ function doTrialForMyRace()
                 finish = finish or model:FindFirstChild("FinishPart")
             end
         end)
-        if finish then flyTo(finish.CFrame) end
+        if not finish then
+            pcall(function()
+                for _, obj in pairs(workspace:GetDescendants()) do
+                    if obj.Name == "snowisland_Cylinder.081" then finish = obj break end
+                end
+            end)
+        end
+        if finish then flyTo(finish.CFrame)
+        elseif model then pcall(function() flyTo(model:GetPivot()) end) end
     elseif myrace == "Cyborg" then
         pcall(function() tp(workspace.Map.CyborgTrial.Floor.CFrame * CFrame.new(0, 500, 0)) end)
     elseif myrace == "Human" or myrace == "Ghoul" then
