@@ -21,9 +21,9 @@ getgenv().Settings = getgenv().Settings or {
 }
 
 getgenv().HOP_CONFIG = getgenv().HOP_CONFIG or {
-    MaxPlayers    = 9,     -- chỉ hop vào server < N người (nil = bỏ qua)
+    MaxPlayers    = 7,     -- chỉ hop vào server < N người (nil = bỏ qua)
     ForcedRegion  = nil,   -- "US" / "EU" / "AP" (nil = bỏ qua)
-    HopCooldown   = 8,     -- giây tối thiểu giữa 2 lần hop (chống spam teleport)
+    HopCooldown   = 3,     -- giây tối thiểu giữa 2 lần hop (chống spam teleport)
     CacheDuration = 60,    -- giây cache danh sách server
     MaxPages      = 100,   -- số trang tối đa khi lấy danh sách server
     Verbose       = false, -- true = in log hop chi tiết
