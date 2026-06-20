@@ -46,7 +46,9 @@ if not getgenv().Config["Gear"] or #getgenv().Config["Gear"] ~= 5 then
 end
 
 local myName = game.Players.LocalPlayer.Name
-local BASE_URL = "https://api.vunguyensoft.shop"
+-- Mặc định SERVER LOCAL (chạy node index.js ngay trên máy này) → độ trễ ~1ms, hết lag.
+-- Muốn dùng remote/LAN thì set ở executor TRƯỚC khi load: getgenv().API_URL = "http://<ip>:20425"
+local BASE_URL = getgenv().API_URL or "http://127.0.0.1:20425"
 
 -- ============================================================
 -- [NET] Lớp HTTP production — chống mất dữ liệu cho 100+ account.
@@ -292,7 +294,25 @@ function setMyMainStatus(statusStr)
     Net.postJSON(BASE_URL .. "/mainstatus?name=" .. myName, { status = statusStr }, "mainstatus")
 end
 
+-- Báo status lên server cho BẤT KỲ account nào (kể cả ALLY — không cần myMainIndex) → dashboard/đồng bộ
+-- detect được "đang làm trial". Dùng cho IN-TRIAL latch của ally.
+function reportStatus(statusStr)
+    statusCache[myName] = { t = tick(), status = statusStr }
+    Net.postJSON(BASE_URL .. "/mainstatus?name=" .. myName, { status = statusStr }, "mainstatus")
+end
+
 local function fetchMainStatusLive(accName)
+    -- 1-SHOT qua Net.raw → KHÔNG qua semaphore GET (max 4) và KHÔNG retry-storm của getJSON.
+    -- (Trước đây getJSON 3-retry + semaphore → hot-path block làm CẠN slot → warmer bị đói →
+    --  statusCache cũ → nhận diện SAI main #1. Đây là gốc của "ally thấy Clifford=waiting".)
+    if Net.raw then
+        local ok, _, body = Net.raw("GET", BASE_URL .. "/mainstatus?name=" .. accName, nil)
+        if ok and body then
+            local good, res = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
+            if good and res and res["data"] and res["data"]["status"] then return res["data"]["status"] end
+        end
+        return nil
+    end
     local res = Net.getJSON(BASE_URL .. "/mainstatus?name=" .. accName, 0)
     if res and res["data"] and res["data"]["status"] then return res["data"]["status"] end
     return nil
@@ -399,20 +419,65 @@ do
     end) end)
 end
 
--- Warmer: làm nóng statusCache nền (rải đều) → getMainStatus trong vòng logic chỉ hit cache.
+-- mainJobCache: name -> { jobid, time, t } — jobid của main do warmer đọc nền → isSameServerAsMain
+-- đọc CACHE (không gọi mạng, không block vòng chính).
+mainJobCache = mainJobCache or {}
+local function fetchJobLive(accName)
+    if Net.raw then
+        local ok, _, body = Net.raw("GET", BASE_URL .. "/noguchi?name=" .. accName, nil)
+        if ok and body then
+            local good, res = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
+            if good and res and res["data"] and res["data"]["jobid"] then
+                return res["data"]["jobid"], res["data"]["time"] or 0
+            end
+        end
+    end
+    return nil
+end
+
+-- ===== NGUỒN CHỐT THỨ TỰ MAIN do SERVER trả (web là trọng tài) =====
+-- Trả: order (mảng tên main đã xếp), current (tên main stt1). MỌI account đọc cái này → đồng nhất,
+-- hết cảnh mỗi con tự tính getMainOrder cục bộ ra stt1 khác nhau ("detect main linh tinh").
+local function fetchCurMainLive()
+    if Net.raw then
+        local ok, _, body = Net.raw("GET", BASE_URL .. "/curmain", nil)
+        if ok and body then
+            local good, res = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
+            if good and res and type(res.order) == "table" then
+                return res   -- nguyên bảng: order, current, current_jobid, current_time, mains[]
+            end
+        end
+    end
+    return nil
+end
+
+-- Warmer: CHỈ 1 request /curmain mỗi ~0.7s → lấy order (web chốt) + status MỌI main + jobid main stt1.
+-- KHÔNG còn fetch status từng main (trước đây N main = N request/con/vòng → 100 main = bùng request).
+-- Giờ tải PHẲNG: 1 request/con/vòng bất kể 2 hay 100 main. getMainStatus/isSameServerAsMain đọc cache.
 spawn(function()
     while true do
-        -- BỌC PCALL: 1 lần fetch lỗi KHÔNG được giết warmer (warmer chết = statusCache đứng
-        -- yên = getMainStatus trả giá trị cũ vĩnh viễn). Lỗi nuốt → vòng sau tự thử lại.
         pcall(function()
-            local mains = (getgenv().Config and getgenv().Config["MainAccount"]) or {}
-            for _, nm in ipairs(mains) do
-                local st = fetchMainStatusLive(nm)
-                if st ~= nil then statusCache[nm] = { t = tick(), status = st } end
-                wait(0.15)
+            local data = fetchCurMainLive()
+            if data and type(data.order) == "table" then
+                _G.srvMainOrder = data.order
+                _G.srvCurMain = data.current
+                -- nóng statusCache cho TẤT CẢ main từ 1 response (TRỪ chính mình — self do
+                -- setMyMainStatus quản lý cục bộ, không để server cũ ghi đè gây nhấp nháy rotation).
+                if type(data.mains) == "table" then
+                    for _, m in ipairs(data.mains) do
+                        if m.name and m.name ~= myName then
+                            statusCache[m.name] = { t = tick(), status = m.status or "waiting" }
+                        end
+                    end
+                end
+                -- jobid main stt1 (ally cần để biết hop đi đâu) — đã kèm trong /curmain, khỏi gọi riêng
+                local curr = data.current
+                if curr and curr ~= myName and data.current_jobid and data.current_jobid ~= "" then
+                    mainJobCache[curr] = { jobid = data.current_jobid, time = data.current_time or 0, t = tick() }
+                end
             end
         end)
-        wait(1.5)
+        wait(0.7)
     end
 end)
 
@@ -534,7 +599,7 @@ do
         if not v36 then pcall(function() LP.Character.Humanoid.Sit = false end) end
         if _activeTween then pcall(function() _activeTween:Cancel(); _activeTween:Destroy() end); _activeTween = nil end
         local dist = (hrp.Position - targetCFrame.Position).Magnitude
-        local dur = math.clamp(dist / 300, 0.05, 4)                 -- clamp chống tween vô tận
+        local dur = math.clamp(dist / 200, 0.05, 600)               -- 200 studs/s LUÔN cố định (cap 600s, gần như KHÔNG BAO GIỜ chạm) → không tăng tốc/giật ngược dù xa bao nhiêu
         local tw = TweenS:Create(hrp,
             TweenInfo.new(dur, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
             { CFrame = targetCFrame })
@@ -764,7 +829,7 @@ function doTrialForMyRace()
             local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
             if not hrp then return end
             local dist = (cf.Position - hrp.Position).Magnitude
-            local dur = math.clamp(dist / 325, 0.05, 4)   -- 325 studs/s, cap 4s tránh kẹt
+            local dur = math.clamp(dist / 200, 0.05, 600)  -- 200 studs/s LUÔN cố định (cap 600s) → không tăng tốc/giật ngược dù xa bao nhiêu
             local tw = game:GetService("TweenService"):Create(
                 hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = cf })
             tw:Play(); wait(dur); pcall(function() tw:Destroy() end)  -- destroy → hết leak
@@ -1060,11 +1125,18 @@ end
 -- nó tự xuống cuối → main kế lên stt1; main sau lại tụt 1 bậc (Main3 → Main2...).
 -- ============================================================
 function getMainOrder()
+    -- ƯU TIÊN order do SERVER chốt (đồng nhất MỌI account → hết "detect main linh tinh").
+    -- Chưa lấy được (mới load, warmer chưa chạy) → tính cục bộ TẠM cho khỏi nil.
+    if _G.srvMainOrder and #_G.srvMainOrder > 0 then return _G.srvMainOrder end
     local mains = getgenv().Config["MainAccount"] or {}
     local active, waiting, finished = {}, {}, {}
     for _, name in ipairs(mains) do
         local st = getMainStatus(name)
-        if st == "moon" or st == "in_trail" then
+        if st == "offline" then
+            -- main KHÔNG online (server trả "offline") → BỎ QUA, không tính vào hàng đợi.
+            -- = "bỏ dữ liệu con main vừa xong": con đã xong/rời sẽ KHÔNG còn bị thấy "waiting" = #1
+            --   chặn rotation → Main kế tự lên #1.
+        elseif st == "moon" or st == "in_trail" then
             active[#active + 1] = name
         elseif st == "done" or st == "training" then
             finished[#finished + 1] = name
@@ -1089,6 +1161,8 @@ end
 
 -- Main đang ở "stt1" (tới lượt được trial). Trả (name, 1).
 function getCurrentMainBeingUpgraded()
+    -- main stt1 do SERVER chốt; chưa có → suy từ getMainOrder (đã ưu tiên server bên trong)
+    if _G.srvCurMain then return _G.srvCurMain, 1 end
     local order = getMainOrder()
     if #order == 0 then return nil, nil end
     return order[1], 1
@@ -1098,20 +1172,13 @@ end
 -- Dùng cho nhánh ally quyết định: cùng server thì ra cửa, khác server thì hop.
 function isSameServerAsMain(mainName)
     if not mainName then return false, nil end
-    local same, job = false, nil
-    -- RETRY 3 lần: 1 lần đọc /noguchi lỗi/timeout sẽ làm ally KHÔNG lấy được jobid → không hop
-    -- → "lâu lâu chỉ 1 con join theo". Retry để mọi ally đều có jobid main.
-    for attempt = 1, 3 do
-        local data = Net.getJSON(BASE_URL .. "/noguchi?name=" .. mainName, 1)
-        if data and data["data"] and data["data"]["jobid"] then
-            job = data["data"]["jobid"]
-            local time_ = data["data"]["time"] or 0
-            if (gettimeserver() - time_) < 60 and job == game.JobId then same = true end
-            break
-        end
-        wait(0.3)
-    end
-    return same, job
+    -- CACHE-ONLY: đọc mainJobCache (warmer nền cập nhật mỗi ~0.7s). KHÔNG gọi mạng → KHÔNG block
+    -- vòng chính (trước đây 3×retry + getJSON-retry = block tới ~vài giây → STALL + không hop).
+    local c = mainJobCache and mainJobCache[mainName]
+    if not c or not c.jobid then return false, nil end
+    local fresh = (gettimeserver() - (c.time or 0)) < 60
+    local same = fresh and (c.jobid == game.JobId)
+    return same, c.jobid
 end
 
 function checkgear()
@@ -1225,7 +1292,10 @@ end
 -- Heartbeat + choose-team + /init ở TRÊN đã chạy rồi nên account KHÔNG bị rớt khi chờ.
 -- Có timeout 45s (best-effort) để không treo vĩnh viễn; vòng lặp chính đã bọc pcall nên an toàn.
 -- ============================================================
-do
+-- CHẠY NỀN (task.spawn) → KHÔNG block luồng chính tới đoạn TẠO UI. Trước đây GATE block tới 45s
+-- (nhất là khi team/char/data load chậm hoặc backend chậm) làm "UI mãi mới lên". Vòng lặp chính đã
+-- nil-guard + pcall nên chạy sớm vài nhịp lúc char/data chưa load cũng AN TOÀN (chỉ phí vài tick).
+task.spawn(function()
     local LP = game:GetService("Players").LocalPlayer
     local t0 = tick()
     repeat
@@ -1238,12 +1308,13 @@ do
             and LP:FindFirstChild("Data") and LP.Data:FindFirstChild("Race")
         if ready then break end
     until (tick() - t0) > 45
+    _G.gameReady = true
     Net.log("INFO", ("Game ready gate: team=%s char=%s data=%s elapsed=%.1fs"):format(
         tostring(LP.Team ~= nil),
         tostring(LP.Character ~= nil),
         tostring(LP:FindFirstChild("Data") ~= nil),
         tick() - t0))
-end
+end)
 
 local checktempledoor = readTempleDoor()
 _G.ShouldSendData = false
@@ -1298,11 +1369,38 @@ spawn(function()
                     end
                 end
             end
+
+            -- ===== IN-TRIAL LATCH =====
+            -- Đã VÀO khu trial (ability sync đẩy vào) + bản thân CÒN cần trial (ab) → CHỐT in_trial:
+            -- DỪNG mọi điều phối (hop / chờ main / kill-player), CHỈ làm trial. Áp cho CẢ Main lẫn Ally.
+            -- → Khi main đổi trạng thái giữa chừng, ally/main KHÔNG rớt về "Waiting" → 3 con cùng làm
+            --   trial tới khi xong, KHÔNG đứng im. Tự nhả khi trial xong (ab=false) hoặc rời khu trial.
+            local _tplace = getRaceTrialPlace(game.Players.LocalPlayer.Data.Race.Value)
+            -- CHỈ latch khi cửa trial ĐANG MỞ (ffdown/loading). Vào khúc KILL-PLAYER (ffup) thì NHẢ latch
+            -- → ally thoát ra để TỰ RESET. Trước đây ab còn true + đứng gần trial → latch giữ mãi "doing
+            -- trial" suốt ffup, KHÔNG bao giờ tới nhánh auto-reset (đếm 3 phút không reset là do đây).
+            local _inTrialNow = (_tplace and ab and getdis(_tplace.CFrame) < 1500 and templeState() ~= "ffup") and true or false
+            if _inTrialNow then
+                if isaccmain[myName] then
+                    if myStatus ~= "in_trail" then setMyMainStatus("in_trail"); myStatus = "in_trail" end
+                elseif not _G.inTrial then
+                    reportStatus("in_trail")          -- ally: báo 1 lần lúc vừa bước vào trial
+                end
+                _G.inTrial = true
+                status((isaccmain[myName] and ("[MAIN " .. tostring(myStt) .. "]") or "[ALLY]") .. " 🔥 IN-TRIAL → đang làm trial")
+                doTrialForMyRace()
+                return
+            else
+                if _G.inTrial and not isaccmain[myName] then reportStatus("ally") end  -- vừa RỜI trial → trả status ally
+                _G.inTrial = false
+            end
+
             if isaccmain[myName] and myStatus == "done" then
                 status("[MAIN " .. myStt .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
             elseif isaccmain[myName] and myStatus == "training" then
                 status("[MAIN " .. myStt .. "] Training (parallel)")
                 if not ab then
+                    setMyMainStatus("training")   -- CHỐT chắc status training (chống dashboard dính moon/in_trail cũ)
                     if AB == "raiding" then
                         local boss = workspace.Enemies:FindFirstChild("Cake Prince") or workspace.Enemies:FindFirstChild("Dough King")
                         if boss then
@@ -1328,20 +1426,34 @@ spawn(function()
                         local pos__ = CFrame.new(214.688675, 126.626984, -12600.2236, -0.180400655, -1.09679892e-08, 0.983593225, 1.94620693e-08, 1, 1.47204746e-08, -0.983593225, 2.17983427e-08, -0.180400655)
                         if getdis(pos__) < 1500 then
                             for _, v in ipairs(getmob1(pos__)) do
-                                local lastY, lastTf = 0, nil
-                                repeat wait()
-                                    module:eq(); module:haki(); BringMob()
-                                    local c   = LP.Character
-                                    local hrp = v:FindFirstChild("HumanoidRootPart")
-                                    local tf  = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
-                                    -- transformed → đứng cao chờ hết V4; chưa → áp sát kill
-                                    if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, tf and 150 or 20, 0)) end) end
-                                    if tf ~= lastTf then  -- đổi status chỉ khi state đổi → hết giật chữ
-                                        status("[MAIN " .. myStt .. (tf and "] Training (Wait for end V4)" or "] Training (Kill Mobs)"))
-                                        lastTf = tf
+                                local lastY, lastTf, lastTrainPost = 0, nil, 0
+                                repeat
+                                    local c  = LP.Character
+                                    local tf = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
+                                    if tf then
+                                        -- ===== ĐANG V4 → CHỈ CHỜ HẾT V4: NGẮT vòng nặng cho đỡ hao tài nguyên =====
+                                        -- KHÔNG eq/haki/BringMob/topos mỗi frame; đứng cao 1 lần rồi nghỉ dài.
+                                        if lastTf ~= true then
+                                            local hrp = v:FindFirstChild("HumanoidRootPart")
+                                            if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 150, 0)) end) end
+                                            status("[MAIN " .. myStt .. "] Training (Wait for end V4)")
+                                            lastTf = true
+                                        end
+                                        -- re-assert "training" mỗi 4s → dashboard LUÔN là training (không dính moon)
+                                        if (tick() - lastTrainPost) > 4 then setMyMainStatus("training"); lastTrainPost = tick() end
+                                        wait(0.5)   -- nghỉ dài: chỉ chờ V4 hết, không làm gì nặng
+                                    else
+                                        -- ===== CHƯA V4 → áp sát + kill nạp energy =====
+                                        module:eq(); module:haki(); BringMob()
+                                        local hrp = v:FindFirstChild("HumanoidRootPart")
+                                        if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 20, 0)) end) end
+                                        if lastTf ~= false then
+                                            status("[MAIN " .. myStt .. "] Training (Kill Mobs)")
+                                            lastTf = false
+                                        end
+                                        if (tick() - lastY > 0.4) then lastY = tick(); pressV4() end
+                                        wait()
                                     end
-                                    -- bấm Y throttle 0.4s, KHÔNG spawn mỗi frame → hết giật
-                                    if (not tf) and (tick() - lastY > 0.4) then lastY = tick(); pressV4() end
                                 until not checkmob_(v)
                             end
                         else
@@ -1349,8 +1461,16 @@ spawn(function()
                         end
                     end
                 else
-                    status("[MAIN " .. myStt .. "] Training done, back to waiting")
-                    setMyMainStatus("waiting")
+                    -- TRAINING XONG: CHỈ giành lượt (về waiting → lên #1) khi MÌNH ĐÃ Ở #1 hàng đợi
+                    -- (không còn main 'waiting'/'active' chen trước) → KHÔNG cắt hàng của Main kế.
+                    -- Khi TẤT CẢ main đang training: con ở #1 (config đầu) flip waiting → lên Main1;
+                    -- các con khác GIỮ training chờ tới lượt.
+                    if currentmain == myName then
+                        status("[MAIN " .. myStt .. "] Training done → tới lượt, về waiting để lên #1")
+                        setMyMainStatus("waiting")
+                    else
+                        status("[MAIN " .. myStt .. "] Training done — chờ tới lượt (sau " .. tostring(currentmain) .. ")")
+                    end
                 end
             elseif isaccmain[myName] and currentmain == myName then
                 status("[MAIN " .. myStt .. "] My turn to upgrade gear!")
@@ -1422,32 +1542,17 @@ spawn(function()
                 status(roleName .. " Đang dò main đang tới lượt…")
                 -- "Nhận lệnh lên trial door" = phát hiện main đang up (moon/in_trail). Làm như join
                 -- jobid: nếu cache miss/chưa active thì FETCH TƯƠI retry 2 lần → đỡ trễ/đứng chờ oan.
+                -- TẤT CẢ đọc CACHE (warmer nền giữ tươi ~0.7s) → KHÔNG gọi mạng, KHÔNG block, hết STALL.
                 local mainActive = false
                 if currentmain then
-                    local cst = statusCache[currentmain]
-                    -- BƯỚC (1): đọc status main từ CACHE (nhanh). Hiện luôn giá trị cache để soi.
-                    status(roleName .. " (1) main " .. tostring(currentmain) .. " st=" .. tostring(cst and cst.status or "nil"))
-                    local st = getMainStatus(currentmain)
+                    local st = getMainStatus(currentmain)                  -- cache-only
                     mainActive = (st == "moon" or st == "in_trail")
-                    if not mainActive and not isaccmain[myName] then
-                        for _ = 1, 2 do
-                            -- BƯỚC (2): fetch LIVE /mainstatus. KẸT Ở ĐÂY = GET /mainstatus chậm/timeout.
-                            status(roleName .. " (2) fetch LIVE status main…")
-                            wait(0.2)
-                            local live = fetchMainStatusLive(currentmain)
-                            if live == "moon" or live == "in_trail" then
-                                statusCache[currentmain] = { t = tick(), status = live }
-                                mainActive = true; break
-                            end
-                        end
-                    end
+                    status(roleName .. " main " .. tostring(currentmain) .. " = " .. tostring(st))
                 end
                 -- Main phụ (main-as-ally) KHÔNG hop theo (giữ như bản gốc); chỉ ally thật mới hop.
                 local sameServer, mainJob = true, nil
                 if not isaccmain[myName] then
-                    -- BƯỚC (3): đọc jobid main qua /noguchi. KẸT Ở ĐÂY = GET /noguchi chậm/timeout (3 lần retry).
-                    status(roleName .. " (3) đọc jobid main (same-server?)…")
-                    sameServer, mainJob = isSameServerAsMain(currentmain)
+                    sameServer, mainJob = isSameServerAsMain(currentmain)   -- cache-only (mainJobCache)
                 end
                 if currentmain and mainActive and not sameServer then
                     -- Khác server với main đang up → hop sang server của main (throttle 5s tránh spam)
@@ -1889,17 +1994,34 @@ end)
 -- KHÔNG còn dùng web để hẹn giờ bấm (đã bỏ /firesignal, /donedoor, /abilityready cho việc bấm).
 -- Vẫn dùng web CHỈ để đánh số role/index (Main..idx / Ally..i) qua /init.
 -- Cơ chế:
---   1) checkalready.txt: mỗi account ghi đúng DÒNG của mình "<Label>:doorandability=<true|false>".
+--   1) Mỗi account ghi FILE RIÊNG trong folder racev4_vunguyen/: checkalready_<label thường>
+--      nội dung "<Label>:doorandability=<true|false>" (vd checkalready_main1 → "Main1:doorandability=true").
 --      true khi đủ CẢ 2: đứng ở cửa (<AT_DOOR_DIST) VÀ CÙNG jobid (cùng server) với main đang turn.
---      Thiếu 1 → ghi false. Main đang-tới-turn tự tạo file nếu chưa có (bỏ qua nếu đã tồn tại).
---   2) Khi CẢ 3 dòng (Main..idx, Ally1, Ally2...) = true → main tạo starttime.txt = GIỜ THỰC Hà Nội + 10s.
---   3) Cả 3 account đọc starttime.txt mỗi 3s. Tới đúng giờ đó (age ∈ [0, window)) thì bấm ActivateAbility 1 lần.
+--      Mỗi con CHỈ đụng file của mình → HẾT tranh ghi (lost-update) như khi xài chung 1 checkalready.txt.
+--   2) Khi CẢ 3 file (Main1 + Ally1 + Ally2...) = true → main ghi starttime.txt = GIỜ THỰC Hà Nội + LEAD.
+--   3) Cả 3 account đọc starttime mỗi giây. Tới đúng giờ đó (age ∈ [0, window)) thì bấm ActivateAbility 1 lần.
 -- starttime ghi "HH:MM:SS" giờ UTC+7 (Hà Nội/Bangkok); so theo giây-trong-ngày → bấm đồng bộ 1 thời điểm.
 local ABILITY_FIRE_WINDOW = 6   -- giây — chỉ bấm trong khoảng [start, start+window)
 local AT_DOOR_DIST = 150        -- coi như "đứng ở cửa" khi cách Entrance < ngần này (nới nhẹ từ 120)
 local START_LEAD   = 5          -- giây — starttime = bây giờ + 5s
-local CHECK_FILE   = "checkalready.txt"
-local START_FILE   = "starttime.txt"
+-- ===== FILE SYNC theo ROLE (folder riêng, MỖI ACC 1 FILE → hết tranh ghi) =====
+local SYNC_DIR     = "racev4_vunguyen"
+local START_FILE   = SYNC_DIR .. "/starttime.txt"
+local function ensureSyncDir()
+    if isfolder and not isfolder(SYNC_DIR) then pcall(function() makefolder(SYNC_DIR) end) end
+end
+ensureSyncDir()
+-- Dọn file cũ ở thư mục gốc (bản trước dùng chung checkalready.txt / starttime.txt) → tránh đọc nhầm.
+pcall(function()
+    if isfile and delfile then
+        if isfile("checkalready.txt") then delfile("checkalready.txt") end
+        if isfile("starttime.txt") then delfile("starttime.txt") end
+    end
+end)
+-- "Main1" → racev4_vunguyen/checkalready_main1 ; "Ally2" → racev4_vunguyen/checkalready_ally2
+local function checkFileForLabel(label)
+    return SYNC_DIR .. "/checkalready_" .. string.lower(label)
+end
 
 -- Toạ độ cửa trial từng tộc (tham khảo Banana "Teleport To Trial Door") — nguồn check door
 -- dự phòng khi getdoor() trả nil/sai. Lấy khoảng cách NHỎ NHẤT giữa 2 nguồn cho chuẩn.
@@ -2003,45 +2125,31 @@ local function requiredLabels()
     return labels
 end
 
--- Đọc & phân tích checkalready.txt → bảng { Label = true/false }
-local function parseCheck()
-    local t = {}
-    if not (isfile and isfile(CHECK_FILE)) then return t end
-    local ok, data = pcall(readfile, CHECK_FILE)
-    if not ok or not data then return t end
-    for label, val in string.gmatch(data, "(%w+):doorandability=(%w+)") do
-        t[label] = (val == "true")
-    end
-    return t
+-- Đọc trạng thái ready của 1 label từ FILE RIÊNG của nó → bool.
+-- File hỏng / đang ghi dở / chưa có → false (an toàn: coi như CHƯA sẵn sàng).
+local function readLabelReady(label)
+    local fp = checkFileForLabel(label)
+    if not (isfile and isfile(fp)) then return false end
+    local ok, data = pcall(readfile, fp)
+    if not ok or not data then return false end
+    return string.match(data, ":doorandability=(%w+)") == "true"
 end
 
--- Ghi lại toàn bộ bảng ra file (mỗi dòng 1 nhãn, sort cho ổn định)
-local function serializeCheck(t)
-    local keys = {}
-    for k, _ in pairs(t) do table.insert(keys, k) end
-    table.sort(keys)
-    local lines = {}
-    for _, k in ipairs(keys) do
-        table.insert(lines, k .. ":doorandability=" .. (t[k] and "true" or "false"))
-    end
-    return table.concat(lines, "\n")
-end
-
--- Read-modify-write: chỉ đụng DÒNG của chính mình, giữ nguyên dòng account khác
+-- Ghi FILE RIÊNG của chính mình (KHÔNG đụng file account khác → hết tranh ghi).
 local function writeMyCheck(label, cond)
     if not label then return end
-    local t = parseCheck()
-    t[label] = cond and true or false
-    pcall(function() writefile(CHECK_FILE, serializeCheck(t)) end)
+    ensureSyncDir()
+    pcall(function()
+        writefile(checkFileForLabel(label), label .. ":doorandability=" .. (cond and "true" or "false"))
+    end)
 end
 
--- Đủ tất cả nhãn bắt buộc = true?
+-- Đủ tất cả nhãn bắt buộc = true? (đọc từng FILE RIÊNG của main-turn + các ally)
 local function allReady()
-    local t = parseCheck()
     local req = requiredLabels()
     if #req == 0 then return false end
     for _, lb in ipairs(req) do
-        if t[lb] ~= true then return false end
+        if not readLabelReady(lb) then return false end
     end
     return true
 end
@@ -2054,19 +2162,14 @@ local function readStart()
     return parseHanoi((string.gsub(data, "%s", "")))
 end
 
--- Main đang-tới-turn tự tạo checkalready.txt nếu chưa có (bỏ qua nếu đã tồn tại)
-if isaccmain[myName] then
-    spawn(function()
-        if not (isfile and isfile(CHECK_FILE)) then
-            pcall(function() writefile(CHECK_FILE, "") end)
-        end
-    end)
-end
+-- (Bỏ) Không cần main tạo file chung nữa — mỗi account ghi FILE RIÊNG qua writeMyCheck;
+-- folder racev4_vunguyen đã được ensureSyncDir() tạo sẵn ở trên.
 
 -- ===== LOOP GHI: cadence 1s — ghi dòng của mình + (main) chốt starttime khi đủ 3 =====
 spawn(function()
     while true do
         pcall(function()
+            _G.myDoorReady = false   -- mặc định CHƯA sẵn sàng (chưa ở cửa / chưa cùng server)
             local label = myAbilityLabel()
             if label then
                 -- chỉ true khi đủ CẢ 2: gần door VÀ cùng jobid (cùng server) với main đang turn.
@@ -2076,6 +2179,7 @@ spawn(function()
                 _G.lastDoorDist = dd        -- debug: soi detect cửa trên panel
                 _G.lastSameSrv = ss
                 local cond = (dd < AT_DOOR_DIST) and ss
+                _G.myDoorReady = cond and true or false   -- = checkalready của mình → cổng cho loop bấm
                 writeMyCheck(label, cond)
 
                 -- Chỉ MAIN đang tới turn mới chốt giờ
@@ -2087,6 +2191,7 @@ spawn(function()
                     local now = serverNow()
                     local last = _G.myStartEpoch or 0
                     if (now - last) > (START_LEAD + ABILITY_FIRE_WINDOW) and allReady() then
+                        ensureSyncDir()
                         pcall(function() writefile(START_FILE, fmtHanoi(now + START_LEAD)) end)
                         _G.myStartEpoch = now
                     end
@@ -2108,26 +2213,32 @@ spawn(function()
     end
 end)
 
--- ===== LOOP BẤM: 0.2s — ĐỌC TƯƠI mỗi nhịp (không phụ thuộc loop 1s) → không miss window =====
+-- ===== LOOP BẤM: CHỈ check starttime liên tục KHI Ở CỬA + checkalready(_G.myDoorReady)=true.
+-- Ở cửa + sẵn sàng → TĂNG CƯỜNG poll 0.1s (không miss window). Chưa ở cửa/chưa sẵn sàng → 0.5s tiết kiệm,
+-- KHÔNG đọc/bấm starttime (tránh bấm bậy khi chưa tới cửa). =====
 spawn(function()
     while true do
-        pcall(function()
-            local st = readStart() or _G.syncStart   -- ưu tiên đọc tươi, fallback giá trị cache
-            if st then _G.syncStart = st end
-            if st and st ~= _G.allyLastFire then
-                local age = hanoiSecOfDay(serverNow()) - st
-                if age < -43200 then age = age + 86400 end   -- wrap qua nửa đêm
-                if age >= ABILITY_FIRE_WINDOW then
-                    -- giờ chốt ĐÃ TRÔI QUA cửa sổ → BỎ QUA (không bắn trễ), đánh dấu đã xử lý
-                    _G.allyLastFire = st
-                elseif age >= 0 and distToMyDoor() < AT_DOOR_DIST then
-                    _G.allyLastFire = st
-                    game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
+        if _G.myDoorReady == true then
+            pcall(function()
+                local st = readStart() or _G.syncStart   -- ưu tiên đọc tươi, fallback giá trị cache
+                if st then _G.syncStart = st end
+                if st and st ~= _G.allyLastFire then
+                    local age = hanoiSecOfDay(serverNow()) - st
+                    if age < -43200 then age = age + 86400 end   -- wrap qua nửa đêm
+                    if age >= ABILITY_FIRE_WINDOW then
+                        -- giờ chốt ĐÃ TRÔI QUA cửa sổ → BỎ QUA (không bắn trễ), đánh dấu đã xử lý
+                        _G.allyLastFire = st
+                    elseif age >= 0 and distToMyDoor() < AT_DOOR_DIST then
+                        _G.allyLastFire = st
+                        game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
+                    end
+                    -- age < 0 → giờ chốt ở tương lai → chờ tới đúng giờ
                 end
-                -- age < 0 → giờ chốt ở tương lai → chờ tới đúng giờ
-            end
-        end)
-        wait(0.2)
+            end)
+            wait(0.1)   -- TĂNG CƯỜNG: ở cửa + ready → poll nhanh
+        else
+            wait(0.5)   -- chưa ở cửa / chưa ready → nghỉ, không check starttime
+        end
     end
 end)
 
