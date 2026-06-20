@@ -284,9 +284,6 @@ getgenv().Config["Team"] = getgenv().Config["Team"] and (getgenv().Config["Team"
 -- ===== STATUS CACHE: đọc read-through, TTL ngắn → cắt bão getMainStatus mỗi frame =====
 statusCache = {} -- name -> { t, status }  (khai báo TRƯỚC setMyMainStatus tránh phụ thuộc thứ tự)
 local STATUS_TTL = 3
--- Cache main KHÁC quá cũ (warmer không refresh nổi = mất mạng) → coi như "offline", BỎ khỏi hàng đợi
--- thay vì bám status cũ (vd "moon" cũ làm ally bám main đã xong). Riêng CHÍNH MÌNH luôn tin cache (local).
-local STATUS_STALE = 15
 
 -- POST mainstatus qua hàng đợi (retry). Cập nhật cache ngay để logic dùng giá trị mới.
 function setMyMainStatus(statusStr)
@@ -323,12 +320,11 @@ end
 -- TRƯỚC cả status() đầu tiên → panel đứng mãi ở "Đang khởi động...". Giờ chỉ đọc statusCache
 -- (đã được warmer nền + setMyMainStatus cập nhật liên tục). Cache rỗng → "waiting".
 function getMainStatus(accName)
+    -- Trả status từ cache (warmer nền cập nhật ~0.7s). KHÔNG tự suy "offline" theo tuổi cache:
+    -- dưới tải 4 instance/1 máy warmer có thể trễ → suy offline làm "current main = nil" → ally đứng
+    -- "Waiting for nil". Main ĐÃ RỜI đã được SERVER trả "offline" (warmer cache lại) nên vẫn bị bỏ đúng.
     local c = statusCache[accName]
-    if c then
-        -- main KHÁC mà cache quá cũ (mất mạng, warmer không refresh) → "offline" để bỏ khỏi hàng đợi
-        if accName ~= myName and (tick() - (c.t or 0)) > STATUS_STALE then return "offline" end
-        return c.status
-    end
+    if c then return c.status end
     return "waiting"
 end
 
