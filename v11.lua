@@ -2,6 +2,9 @@
 -- dính bản module_bf.lua lỗi (tween leak / noclip loadstring mỗi frame).
 pcall(function() if isfile and isfile("kaitun_module_bf.lua") and delfile then delfile("kaitun_module_bf.lua") end end)
 
+-- ĐỢI CLIENT LOAD XONG HẲN trước khi làm gì (quan trọng SAU KHI HOP SERVER: instance mới
+-- phải load đủ mới chọn team + chạy script; nếu không sẽ "chọn được team mà script không chạy").
+if not game:IsLoaded() then game.Loaded:Wait() end
 repeat
     task.wait(0.1)
 until game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
@@ -332,25 +335,31 @@ spawn(function()
     end
 end)
 
--- Phát hiện account RỜI GAME / bị đá / teleport → báo offline tức thì, dừng heartbeat.
+-- Phát hiện account RỜI GAME THẬT → báo offline. QUAN TRỌNG: ĐỔI SERVER (hop fullmoon/
+-- teleport) KHÔNG tính offline — báo offline lúc hop sẽ xoá account khỏi stt1 làm LỆCH đồng bộ.
+-- Hop chỉ teleport rồi join lại, heartbeat tiếp tục ở server mới (<30s); rớt thật thì prune lo.
+local teleporting = false
 do
     local Players = game:GetService("Players")
     local LP = Players.LocalPlayer
-    -- chính mình rời server
-    Players.PlayerRemoving:Connect(function(plr)
-        if plr == LP then sendOffline() end
-    end)
-    -- executor/Roblox đóng instance (đóng tab, kill) → chạy trước khi tắt hẳn
-    pcall(function() game:BindToClose(function() sendOffline() end) end)
-    -- teleport sang server khác cũng coi như rời (instance hiện tại chết)
+    -- đánh dấu đang teleport (hop server) → chặn offline trong lúc này
     pcall(function()
         LP.OnTeleport:Connect(function(state)
-            -- Started(1)/Failed(3) đều nghĩa là instance này sắp/đang bị huỷ
-            if state == Enum.TeleportState.Started or state == Enum.TeleportState.Failed then
-                sendOffline()
+            if state == Enum.TeleportState.Started or state == Enum.TeleportState.InProgress then
+                teleporting = true
+            elseif state == Enum.TeleportState.Failed or state == Enum.TeleportState.Cancelled then
+                teleporting = false   -- hop hỏng → cho phép offline nếu sau đó rời thật
             end
         end)
     end)
+    -- chính mình rời server (quit thật) — BỎ QUA nếu đang teleport (hop)
+    Players.PlayerRemoving:Connect(function(plr)
+        if plr == LP and not teleporting then sendOffline() end
+    end)
+    -- đóng instance (đóng tab/kill) — cũng bỏ qua nếu đang teleport
+    pcall(function() game:BindToClose(function()
+        if not teleporting then sendOffline() end
+    end) end)
 end
 
 -- Warmer: làm nóng statusCache nền (rải đều) → getMainStatus trong vòng logic chỉ hit cache.
@@ -477,7 +486,7 @@ do
 
     function module:tele(v)
         pcall(function()
-            game:GetService("ReplicatedStorage").__ServerBrowser:InvokeServer("teleport", v or game.JobId)
+            game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", v or game.JobId)
         end)
     end
 
@@ -587,6 +596,37 @@ function goToMyDoor()
     if not (char and char:FindFirstChild("HumanoidRootPart")) then return false end
     pcall(function() topos(door.CFrame) end)
     return getdis(door.CFrame) <= 150
+end
+
+-- ============================================================
+-- TEMPLE OF TIME — AN TOÀN, CHỐNG ĐƠ/CRASH.
+-- Trước đây: reparent CẢ MODEL "Temple of Time" từ MapStash vào Map MỖI 0.35s + đọc thô
+-- workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency. Reparent model lớn
+-- client-side lặp liên tục = ĐƠ/CRASH (nặng hơn khi nhiều account 1 máy); đọc thô = ném lỗi
+-- nếu game đổi cấu trúc. Sửa: THROTTLE reparent 5s + pcall, đọc forcefield bằng FindFirstChild.
+-- Trả: "loading" (chưa vào Map) | "ffup" (forcefield đóng → khúc kill-player) | "ffdown" (mở → vào trial).
+-- ============================================================
+function templeState()
+    local temple = workspace.Map:FindFirstChild("Temple of Time")
+    if not temple then
+        if not _G.lastTempleReparent or (tick() - _G.lastTempleReparent) > 5 then
+            _G.lastTempleReparent = tick()
+            pcall(function()
+                local stash = game:GetService("ReplicatedStorage"):FindFirstChild("MapStash")
+                local m = stash and stash:FindFirstChild("Temple of Time")
+                if m then m.Parent = workspace.Map end
+            end)
+        end
+        return "loading"
+    end
+    local ff
+    pcall(function()
+        local border = temple:FindFirstChild("FFABorder")
+        local field = border and border:FindFirstChild("Forcefield")
+        if field then ff = field.Transparency end
+    end)
+    if ff == 0 then return "ffup" end
+    return "ffdown"
 end
 
 local pos_plr_trial = {
@@ -890,31 +930,47 @@ function status(v)
     _G.statusnow = tostring(v) .. ((_G.lastRaceI ~= nil) and ("  [i=" .. tostring(_G.lastRaceI) .. "]") or "")
 end
 
-function getCurrentMainBeingUpgraded()
-    local mains = getgenv().Config["MainAccount"]
-    if not mains or #mains == 0 then
-        return nil, nil
-    end
-    for i, name in ipairs(mains) do
+-- ============================================================
+-- HÀNG ĐỢI ĐỘNG theo "stt":
+--   1) main đang trial (moon/in_trail) → đầu hàng
+--   2) main đang chờ (waiting/"")       → theo thứ tự config
+--   3) main đã xong (done/training)     → đẩy XUỐNG CUỐI
+-- order[1] = main đang ở "stt1" (tới lượt trial). Khi main stt1 chuyển done/training
+-- nó tự xuống cuối → main kế lên stt1; main sau lại tụt 1 bậc (Main3 → Main2...).
+-- ============================================================
+function getMainOrder()
+    local mains = getgenv().Config["MainAccount"] or {}
+    local active, waiting, finished = {}, {}, {}
+    for _, name in ipairs(mains) do
         local st = getMainStatus(name)
         if st == "moon" or st == "in_trail" then
-            return name, i
+            active[#active + 1] = name
+        elseif st == "done" or st == "training" then
+            finished[#finished + 1] = name
+        else -- "waiting" / ""
+            waiting[#waiting + 1] = name
         end
     end
-    for i, name in ipairs(mains) do
-        local st = getMainStatus(name)
-        if st == "waiting" or st == "" then
-            if i == 1 then
-                return name, i
-            else
-                local prevSt = getMainStatus(mains[i - 1])
-                if prevSt == "training" or prevSt == "waiting" or prevSt == "" then
-                    return name, i
-                end
-            end
-        end
+    local order = {}
+    for _, n in ipairs(active) do order[#order + 1] = n end
+    for _, n in ipairs(waiting) do order[#order + 1] = n end
+    for _, n in ipairs(finished) do order[#order + 1] = n end
+    return order
+end
+
+-- stt ĐỘNG (1-based) của 1 main trong hàng đợi; nil nếu không phải main.
+function mainSttOf(name)
+    for i, v in ipairs(getMainOrder()) do
+        if v == name then return i end
     end
-    return mains[1], 1
+    return nil
+end
+
+-- Main đang ở "stt1" (tới lượt được trial). Trả (name, 1).
+function getCurrentMainBeingUpgraded()
+    local order = getMainOrder()
+    if #order == 0 then return nil, nil end
+    return order[1], 1
 end
 
 -- Đọc jobid của main hiện tại → trả (cùng_server?, jobid_của_main).
@@ -1021,7 +1077,41 @@ BringMob = function()
     end
 end
 
-local checktempledoor = game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("CheckTempleDoor")
+-- đọc cổng "đã mở cửa đền" — bọc pcall để remote lỗi KHÔNG ném ra ngoài (treo load).
+local function readTempleDoor()
+    local ok, res = pcall(function()
+        return game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("CheckTempleDoor")
+    end)
+    if ok then return res end
+    return nil
+end
+-- ============================================================
+-- GATE SẴN SÀNG: chờ TEAM + NHÂN VẬT + DATA load xong rồi mới chạy logic chính.
+-- Cần sau khi HOP SERVER: nếu chạy logic khi nhân vật/Data chưa load → lỗi / "không chạy".
+-- Heartbeat + choose-team + /init ở TRÊN đã chạy rồi nên account KHÔNG bị rớt khi chờ.
+-- Có timeout 45s (best-effort) để không treo vĩnh viễn; vòng lặp chính đã bọc pcall nên an toàn.
+-- ============================================================
+do
+    local LP = game:GetService("Players").LocalPlayer
+    local t0 = tick()
+    repeat
+        task.wait(0.2)
+        local c = LP.Character
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        local ready = LP.Team
+            and c and c:FindFirstChild("HumanoidRootPart")
+            and hum and hum.Health > 0
+            and LP:FindFirstChild("Data") and LP.Data:FindFirstChild("Race")
+        if ready then break end
+    until (tick() - t0) > 45
+    Net.log("INFO", ("Game ready gate: team=%s char=%s data=%s elapsed=%.1fs"):format(
+        tostring(LP.Team ~= nil),
+        tostring(LP.Character ~= nil),
+        tostring(LP:FindFirstChild("Data") ~= nil),
+        tick() - t0))
+end
+
+local checktempledoor = readTempleDoor()
 _G.ShouldSendData = false
 local issobusy = false
 spawn(function()
@@ -1029,11 +1119,19 @@ spawn(function()
     -- nhiều lần/frame → bão request → executor rate-limit → rớt dữ liệu. Giờ chạy 0.35s/vòng,
     -- getMainStatus đọc statusCache (warmer nền) nên gần như không còn request trong vòng này.
     while wait(0.35) do
-        if not checktempledoor then
-        else
+        -- gate có thể trả nil lúc load (remote chưa sẵn) → thử đọc lại tới khi có giá trị
+        if checktempledoor == nil then checktempledoor = readTempleDoor() end
+        -- BỌC PCALL: 1 dòng lỗi (vd trialable/InvokeServer khi game update remote) sẽ KHÔNG
+        -- giết coroutine nữa → không còn kẹt im "Đang khởi động"; lỗi hiện thẳng ra status.
+        local _okLoop, _errLoop = pcall(function()
+            if not checktempledoor then
+                status("Chờ mở cửa đền (CheckTempleDoor=" .. tostring(checktempledoor) .. ")")
+                return
+            end
             _G.ShouldSendData = false
             local ab, AB = cachedTrialable()
             local currentmain, currentidx = getCurrentMainBeingUpgraded()
+            local myStt = mainSttOf(myName) or myMainIndex   -- stt ĐỘNG để hiển thị
             local myStatus = ""
             if isaccmain[myName] then
                 myStatus = getMainStatus(myName)
@@ -1046,7 +1144,7 @@ spawn(function()
                     -- Không còn done (đổi tộc/V3/đang tiến hành) → bỏ status done về waiting để chạy lại
                     if myStatus == "done" then setMyMainStatus("waiting"); myStatus = "waiting" end
                     if (myStatus == "in_trail" or myStatus == "moon") and not ab then
-                        status("[MAIN " .. myMainIndex .. "] Trial completed, switching to training!")
+                        status("[MAIN " .. myStt .. "] Trial completed, switching to training!")
                         setMyMainStatus("training")
                         myStatus = "training"
                     end
@@ -1054,21 +1152,21 @@ spawn(function()
                 if myStatus == "in_trail" and ab then
                     local in_temple = getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) < 3000
                     if not in_temple then
-                        status("[MAIN " .. myMainIndex .. "] Died in trial, retrying...")
+                        status("[MAIN " .. myStt .. "] Died in trial, retrying...")
                         setMyMainStatus("waiting")
                         myStatus = "waiting"
                     end
                 end
             end
             if isaccmain[myName] and myStatus == "done" then
-                status("[MAIN " .. myMainIndex .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
+                status("[MAIN " .. myStt .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
             elseif isaccmain[myName] and myStatus == "training" then
-                status("[MAIN " .. myMainIndex .. "] Training (parallel)")
+                status("[MAIN " .. myStt .. "] Training (parallel)")
                 if not ab then
                     if AB == "raiding" then
                         local boss = workspace.Enemies:FindFirstChild("Cake Prince") or workspace.Enemies:FindFirstChild("Dough King")
                         if boss then
-                            status("[MAIN " .. myMainIndex .. "] Raiding for fragment")
+                            status("[MAIN " .. myStt .. "] Raiding for fragment")
                             repeat wait()
                                 pcall(function() topos(boss.HumanoidRootPart.CFrame * CFrame.new(0, 25, 0)) end)
                                 module:eq(); module:haki(); BringMob()
@@ -1099,7 +1197,7 @@ spawn(function()
                                     -- transformed → đứng cao chờ hết V4; chưa → áp sát kill
                                     if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, tf and 150 or 20, 0)) end) end
                                     if tf ~= lastTf then  -- đổi status chỉ khi state đổi → hết giật chữ
-                                        status("[MAIN " .. myMainIndex .. (tf and "] Training (Wait for end V4)" or "] Training (Kill Mobs)"))
+                                        status("[MAIN " .. myStt .. (tf and "] Training (Wait for end V4)" or "] Training (Kill Mobs)"))
                                         lastTf = tf
                                     end
                                     -- bấm Y throttle 0.4s, KHÔNG spawn mỗi frame → hết giật
@@ -1111,11 +1209,11 @@ spawn(function()
                         end
                     end
                 else
-                    status("[MAIN " .. myMainIndex .. "] Training done, back to waiting")
+                    status("[MAIN " .. myStt .. "] Training done, back to waiting")
                     setMyMainStatus("waiting")
                 end
             elseif isaccmain[myName] and currentmain == myName then
-                status("[MAIN " .. myMainIndex .. "] My turn to upgrade gear!")
+                status("[MAIN " .. myStt .. "] My turn to upgrade gear!")
                 if myStatus == "waiting" or myStatus == "" then
                     setMyMainStatus("moon")
                 end
@@ -1136,7 +1234,7 @@ spawn(function()
                                     if jobid and jobid ~= game.JobId and v.player <= 8 then
                                         local lastVisit = cachedJobs[jobid]
                                         if not lastVisit or (math.floor(tick()) - lastVisit) > 3600 then
-                                            status("[MAIN " .. myMainIndex .. "] Hop fullmoon server")
+                                            status("[MAIN " .. myStt .. "] Hop fullmoon server")
                                             game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", jobid)
                                             hopped = true
                                             break
@@ -1155,24 +1253,30 @@ spawn(function()
                 if not skip then
                     spawn(checkgear)
                     _G.ShouldSendData = true
-                    if not workspace.Map:FindFirstChild("Temple of Time") then
-                        if game:GetService("ReplicatedStorage").MapStash:FindFirstChild("Temple of Time") then
-                            game:GetService("ReplicatedStorage").MapStash["Temple of Time"].Parent = workspace.Map
-                        end
-                    elseif workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 0 then
-                        status("[MAIN " .. myMainIndex .. "] Kill Players After Trial")
+                    local ts = templeState()
+                    if ts == "loading" then
+                        status("[MAIN " .. myStt .. "] Đang vào Temple of Time...")
+                    elseif ts == "ffup" then
+                        status("[MAIN " .. myStt .. "] Kill Players After Trial")
                         for plr in pairs(getplayers()) do
                             if plr then
                                 repeat wait() attackTick(plr)
-                                until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 1
+                                until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or templeState() ~= "ffup"
                             end
                         end
                     else
-                        runTrialPhase("[MAIN " .. myMainIndex .. "]", true)
+                        runTrialPhase("[MAIN " .. myStt .. "]", true)
                     end
                 end
+            elseif isaccmain[myName] then
+                -- MAIN CHƯA TỚI LƯỢT → ĐỨNG IM chờ lên stt1, KHÔNG đi help main khác.
+                -- Liên tục re-check mỗi vòng: khi main stt1 chuyển done/training thì hàng đợi
+                -- xoay, mình lên stt1 → vòng sau rơi vào nhánh "My turn" ở trên.
+                _G.allyKillReset = false
+                status("[MAIN " .. myStt .. "] Waiting for current main: " .. tostring(currentmain))
             else
-                local roleName = isaccmain[myName] and ("[MAIN " .. myMainIndex .. " as ALLY]") or "[ALLY]"
+                -- CHỈ ALLY THẬT vào đây: liên tục detect jobid của main stt1 → join + help.
+                local roleName = "[ALLY]"
                 -- "Nhận lệnh lên trial door" = phát hiện main đang up (moon/in_trail). Làm như join
                 -- jobid: nếu cache miss/chưa active thì FETCH TƯƠI retry 2 lần → đỡ trễ/đứng chờ oan.
                 local mainActive = false
@@ -1211,11 +1315,10 @@ spawn(function()
                 elseif (currentmain and mainActive and sameServer) or getgenv().Config["VIPServer"] or (isnight() and isfullmoon()) or issobusy then
                         spawn(checkgear)
                         _G.ShouldSendData = true
-                        if not workspace.Map:FindFirstChild("Temple of Time") then
-                            if game:GetService("ReplicatedStorage").MapStash:FindFirstChild("Temple of Time") then
-                                game:GetService("ReplicatedStorage").MapStash["Temple of Time"].Parent = workspace.Map
-                            end
-                        elseif workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 0 then
+                        local ts = templeState()
+                        if ts == "loading" then
+                            status(roleName .. " Đang vào Temple of Time...")
+                        elseif ts == "ffup" then
                             if not isaccmain[myName] then
                                 -- ===== ALLY: AUTO RESET NGAY khi vào khúc kill player =====
                                 -- Ally KHÔNG cần kill hết người — reset luôn (stagger theo thứ tự ally)
@@ -1242,7 +1345,7 @@ spawn(function()
                                 for plr in pairs(getplayers()) do
                                     if plr then
                                         repeat wait() attackTick(plr)
-                                        until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 1
+                                        until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or templeState() ~= "ffup"
                                     end
                                 end
                                 if countplayers() <= 0 then
@@ -1251,7 +1354,7 @@ spawn(function()
                                     if isCurrentMain then
                                         local allies_str = table.concat(getgenv().Config["Allies"] or {}, ",")
                                         if allies_str ~= "" then
-                                            status("[MAIN " .. myMainIndex .. "] Waiting for help accs to reset first...")
+                                            status("[MAIN " .. myStt .. "] Waiting for help accs to reset first...")
                                             local timeout = 0
                                             repeat
                                                 wait(1)
@@ -1284,6 +1387,10 @@ spawn(function()
                     status(roleName .. " Waiting for current main: " .. tostring(currentmain))
                 end
             end
+        end)
+        if not _okLoop then
+            status("⚠ Lỗi vòng chính: " .. tostring(_errLoop))
+            Net.log("ERR", "main loop crash: " .. tostring(_errLoop))
         end
     end
 end)
@@ -2319,7 +2426,7 @@ end
 TextboxCard(mainPage, 4, "Nhập Job ID...", function(text) _G.jobidinput = text end)
 ButtonCard(mainPage, 5, "Join Job Id", function()
     pcall(function()
-        TPService:TeleportToPlaceInstance(game.PlaceId, _G.jobidinput, LocalPlayer)
+        game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", _G.jobidinput)
     end)
 end)
 
@@ -2370,7 +2477,7 @@ for idx, vl in pairs(getgenv().Config["Allies"]) do
     local jobidnow = "no update"
     accOrder = accOrder + 1
     ButtonCard(accPage, accOrder, "Join to " .. vl, function()
-        TPService:TeleportToPlaceInstance(game.PlaceId, jobidnow, LocalPlayer)
+        game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", jobidnow)
     end)
     spawn(function()
         while wait(5) do
