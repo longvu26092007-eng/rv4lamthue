@@ -1290,7 +1290,10 @@ end
 -- Heartbeat + choose-team + /init ở TRÊN đã chạy rồi nên account KHÔNG bị rớt khi chờ.
 -- Có timeout 45s (best-effort) để không treo vĩnh viễn; vòng lặp chính đã bọc pcall nên an toàn.
 -- ============================================================
-do
+-- CHẠY NỀN (task.spawn) → KHÔNG block luồng chính tới đoạn TẠO UI. Trước đây GATE block tới 45s
+-- (nhất là khi team/char/data load chậm hoặc backend chậm) làm "UI mãi mới lên". Vòng lặp chính đã
+-- nil-guard + pcall nên chạy sớm vài nhịp lúc char/data chưa load cũng AN TOÀN (chỉ phí vài tick).
+task.spawn(function()
     local LP = game:GetService("Players").LocalPlayer
     local t0 = tick()
     repeat
@@ -1303,12 +1306,13 @@ do
             and LP:FindFirstChild("Data") and LP.Data:FindFirstChild("Race")
         if ready then break end
     until (tick() - t0) > 45
+    _G.gameReady = true
     Net.log("INFO", ("Game ready gate: team=%s char=%s data=%s elapsed=%.1fs"):format(
         tostring(LP.Team ~= nil),
         tostring(LP.Character ~= nil),
         tostring(LP:FindFirstChild("Data") ~= nil),
         tick() - t0))
-end
+end)
 
 local checktempledoor = readTempleDoor()
 _G.ShouldSendData = false
