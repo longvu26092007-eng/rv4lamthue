@@ -2005,6 +2005,8 @@ end)
 local ABILITY_FIRE_WINDOW = 6   -- giây — chỉ bấm trong khoảng [start, start+window)
 local AT_DOOR_DIST = 150        -- coi như "đứng ở cửa" khi cách Entrance < ngần này (nới nhẹ từ 120)
 local START_LEAD   = 5          -- giây — starttime = bây giờ + 5s
+local ABILITY_COOLDOWN = 30     -- giây — sau khi bấm ActivateAbility phải chờ ngần này mới được bấm lại
+_G.myFireEpoch = _G.myFireEpoch or 0   -- epoch (server) lần cuối bấm ActivateAbility (0 = chưa bấm → sẵn sàng)
 -- ===== FILE SYNC theo ROLE (folder riêng, MỖI ACC 1 FILE → hết tranh ghi) =====
 local SYNC_DIR     = "racev4_vunguyen"
 local START_FILE   = SYNC_DIR .. "/starttime.txt"
@@ -2126,22 +2128,38 @@ local function requiredLabels()
     return labels
 end
 
--- Đọc trạng thái ready của 1 label từ FILE RIÊNG của nó → bool.
--- File hỏng / đang ghi dở / chưa có → false (an toàn: coi như CHƯA sẵn sàng).
+-- canactiveability của CHÍNH MÌNH: true nếu đã QUA cooldown 30s kể từ lần bấm ActivateAbility cuối.
+-- Chưa bấm bao giờ (_G.myFireEpoch<=0) → true (sẵn sàng). Dùng serverNow (epoch server, đồng nhất mọi máy).
+local function myCanActive()
+    local fe = _G.myFireEpoch or 0
+    if fe <= 0 then return true end
+    return serverNow() >= (fe + ABILITY_COOLDOWN)
+end
+
+-- Đọc trạng thái READY của 1 label từ FILE RIÊNG của nó → bool.
+-- READY = doorandability=true VÀ canactiveability=true (ability đã hết cooldown). Thiếu 1 → false.
 local function readLabelReady(label)
     local fp = checkFileForLabel(label)
     if not (isfile and isfile(fp)) then return false end
     local ok, data = pcall(readfile, fp)
     if not ok or not data then return false end
-    return string.match(data, ":doorandability=(%w+)") == "true"
+    local door = string.match(data, "doorandability=(%w+)") == "true"
+    local cana = string.match(data, "canactiveability=(%w+)") == "true"
+    return door and cana
 end
 
 -- Ghi FILE RIÊNG của chính mình (KHÔNG đụng file account khác → hết tranh ghi).
+-- Format: "<Label>:doorandability=<bool>;canactiveability=<bool>;<HH:MM:SS lần bấm ability cuối>"
 local function writeMyCheck(label, cond)
     if not label then return end
     ensureSyncDir()
+    local fe = _G.myFireEpoch or 0
+    local fireStr = (fe > 0) and fmtHanoi(fe) or "00:00:00"
     pcall(function()
-        writefile(checkFileForLabel(label), label .. ":doorandability=" .. (cond and "true" or "false"))
+        writefile(checkFileForLabel(label),
+            label .. ":doorandability=" .. (cond and "true" or "false")
+            .. ";canactiveability=" .. (myCanActive() and "true" or "false")
+            .. ";" .. fireStr)
     end)
 end
 
@@ -2231,6 +2249,7 @@ spawn(function()
                         _G.allyLastFire = st
                     elseif age >= 0 and distToMyDoor() < AT_DOOR_DIST then
                         _G.allyLastFire = st
+                        _G.myFireEpoch = serverNow()   -- bắt đầu cooldown 30s → canactiveability=false tới khi hết
                         game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
                     end
                     -- age < 0 → giờ chốt ở tương lai → chờ tới đúng giờ
