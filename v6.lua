@@ -442,13 +442,20 @@ spawn(function()
             local mains = (getgenv().Config and getgenv().Config["MainAccount"]) or {}
             local pending = #mains
             for _, nm in ipairs(mains) do
-                spawn(function()
-                    pcall(function()
-                        local st = fetchMainStatusLive(nm)
-                        if st ~= nil then statusCache[nm] = { t = tick(), status = st } end
-                    end)
+                if nm == myName then
+                    -- self: status do setMyMainStatus quản lý CỤC BỘ → KHÔNG để warmer ghi đè bằng
+                    -- giá trị server CŨ (tránh flip training→waiting nhấp nháy lúc POST chưa land →
+                    -- rotation bị giật). Server vẫn nhận status mình qua POST /mainstatus.
                     pending = pending - 1
-                end)
+                else
+                    spawn(function()
+                        pcall(function()
+                            local st = fetchMainStatusLive(nm)
+                            if st ~= nil then statusCache[nm] = { t = tick(), status = st } end
+                        end)
+                        pending = pending - 1
+                    end)
+                end
             end
             local t0 = tick()
             while pending > 0 and (tick() - t0) < 3 do wait(0.05) end
@@ -581,7 +588,7 @@ do
         if not v36 then pcall(function() LP.Character.Humanoid.Sit = false end) end
         if _activeTween then pcall(function() _activeTween:Cancel(); _activeTween:Destroy() end); _activeTween = nil end
         local dist = (hrp.Position - targetCFrame.Position).Magnitude
-        local dur = math.clamp(dist / 200, 0.05, 4)                 -- 200 studs/s (bay chậm hơn) + clamp chống tween vô tận
+        local dur = math.clamp(dist / 200, 0.05, 12)                -- 200 studs/s ỔN ĐỊNH (cap 12s ~2400 studs) → bay xa KHÔNG bị tăng tốc/giật
         local tw = TweenS:Create(hrp,
             TweenInfo.new(dur, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
             { CFrame = targetCFrame })
@@ -811,7 +818,7 @@ function doTrialForMyRace()
             local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
             if not hrp then return end
             local dist = (cf.Position - hrp.Position).Magnitude
-            local dur = math.clamp(dist / 200, 0.05, 4)   -- 200 studs/s, cap 4s tránh kẹt
+            local dur = math.clamp(dist / 200, 0.05, 12)   -- 200 studs/s ỔN ĐỊNH, cap 12s (~2400 studs) → hết giật
             local tw = game:GetService("TweenService"):Create(
                 hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = cf })
             tw:Play(); wait(dur); pcall(function() tw:Destroy() end)  -- destroy → hết leak
@@ -1111,7 +1118,11 @@ function getMainOrder()
     local active, waiting, finished = {}, {}, {}
     for _, name in ipairs(mains) do
         local st = getMainStatus(name)
-        if st == "moon" or st == "in_trail" then
+        if st == "offline" then
+            -- main KHÔNG online (server trả "offline") → BỎ QUA, không tính vào hàng đợi.
+            -- = "bỏ dữ liệu con main vừa xong": con đã xong/rời sẽ KHÔNG còn bị thấy "waiting" = #1
+            --   chặn rotation → Main kế tự lên #1.
+        elseif st == "moon" or st == "in_trail" then
             active[#active + 1] = name
         elseif st == "done" or st == "training" then
             finished[#finished + 1] = name
@@ -1412,8 +1423,16 @@ spawn(function()
                         end
                     end
                 else
-                    status("[MAIN " .. myStt .. "] Training done, back to waiting")
-                    setMyMainStatus("waiting")
+                    -- TRAINING XONG: CHỈ giành lượt (về waiting → lên #1) khi MÌNH ĐÃ Ở #1 hàng đợi
+                    -- (không còn main 'waiting'/'active' chen trước) → KHÔNG cắt hàng của Main kế.
+                    -- Khi TẤT CẢ main đang training: con ở #1 (config đầu) flip waiting → lên Main1;
+                    -- các con khác GIỮ training chờ tới lượt.
+                    if currentmain == myName then
+                        status("[MAIN " .. myStt .. "] Training done → tới lượt, về waiting để lên #1")
+                        setMyMainStatus("waiting")
+                    else
+                        status("[MAIN " .. myStt .. "] Training done — chờ tới lượt (sau " .. tostring(currentmain) .. ")")
+                    end
                 end
             elseif isaccmain[myName] and currentmain == myName then
                 status("[MAIN " .. myStt .. "] My turn to upgrade gear!")
