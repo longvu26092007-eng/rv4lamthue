@@ -218,6 +218,8 @@ do
     end
     for _ = 1, 4 do task.spawn(worker) end
 
+    -- mở rawRequest ra để net-probe đo GET/POST đồng bộ (single-shot) cho panel chẩn đoán
+    Net.raw = rawRequest
     Net.log("INFO", "Net init — hasReq=" .. tostring(Net.hasReq))
 end
 
@@ -295,17 +297,14 @@ local function fetchMainStatusLive(accName)
     if res and res["data"] and res["data"]["status"] then return res["data"]["status"] end
     return nil
 end
+-- HOT-PATH AN TOÀN: KHÔNG fetch đồng bộ ở đây nữa. game:HttpGet / request YIELD luồng gọi;
+-- nếu backend chậm / executor KHÔNG tới được api → vòng chính KẸT NGAY TẠI getMainStatus,
+-- TRƯỚC cả status() đầu tiên → panel đứng mãi ở "Đang khởi động...". Giờ chỉ đọc statusCache
+-- (đã được warmer nền + setMyMainStatus cập nhật liên tục). Cache rỗng → "waiting".
 function getMainStatus(accName)
     local c = statusCache[accName]
-    if c and (tick() - c.t) < STATUS_TTL then return c.status end
-    local st = fetchMainStatusLive(accName)
-    if st == nil then
-        -- FIX: lỗi mạng KHÔNG trả "waiting" (gây logic nhảy lung tung) → giữ giá trị cũ.
-        if c then return c.status end
-        return "waiting"
-    end
-    statusCache[accName] = { t = tick(), status = st }
-    return st
+    if c then return c.status end
+    return "waiting"
 end
 
 -- Cờ "còn sống": tắt khi account rời game → mọi vòng nền tự dừng, không gửi nữa.
@@ -340,6 +339,37 @@ spawn(function()
     end
 end)
 
+-- ============================================================
+-- [NET PROBE] Chẩn đoán mạng TỪ TRONG EXECUTOR → hiện thẳng lên panel.
+--   • req=true/false : executor có hàm request không (POST cần cái này).
+--   • GET  OK/FAIL <ms> : gọi GET /timeserver có tới backend không + độ trễ.
+--   • POST OK/FAIL <ms> : gọi POST /heartbeat (đúng cái dùng đồng bộ) có tới không.
+-- Nếu req=false hoặc POST FAIL → server thấy online:0 = bot KHÔNG đồng bộ được.
+-- ============================================================
+_G.netDiag = "NET: đang kiểm tra…"
+spawn(function()
+    local HS = game:GetService("HttpService")
+    while true do
+        pcall(function()
+            if not Net.raw then _G.netDiag = "NET: thiếu Net.raw"; return end
+            local g0 = tick()
+            local gok = Net.raw("GET", BASE_URL .. "/timeserver", nil)
+            local gms = math.floor((tick() - g0) * 1000)
+            local pok, pms = nil, 0
+            if Net.hasReq then
+                local p0 = tick()
+                pok = Net.raw("POST", BASE_URL .. "/heartbeat?name=" .. myName, HS:JSONEncode({ role = myRole }))
+                pms = math.floor((tick() - p0) * 1000)
+            end
+            _G.netDiag = ("req=%s | GET %s %dms | POST %s"):format(
+                tostring(Net.hasReq),
+                gok and "OK" or "FAIL", gms,
+                Net.hasReq and ((pok and "OK " or "FAIL ") .. pms .. "ms") or "N/A (thiếu request)")
+        end)
+        wait(5)
+    end
+end)
+
 -- Phát hiện account RỜI GAME THẬT → báo offline. QUAN TRỌNG: ĐỔI SERVER (hop fullmoon/
 -- teleport) KHÔNG tính offline — báo offline lúc hop sẽ xoá account khỏi stt1 làm LỆCH đồng bộ.
 -- Hop chỉ teleport rồi join lại, heartbeat tiếp tục ở server mới (<30s); rớt thật thì prune lo.
@@ -370,12 +400,16 @@ end
 -- Warmer: làm nóng statusCache nền (rải đều) → getMainStatus trong vòng logic chỉ hit cache.
 spawn(function()
     while true do
-        local mains = (getgenv().Config and getgenv().Config["MainAccount"]) or {}
-        for _, nm in ipairs(mains) do
-            local st = fetchMainStatusLive(nm)
-            if st ~= nil then statusCache[nm] = { t = tick(), status = st } end
-            wait(0.15)
-        end
+        -- BỌC PCALL: 1 lần fetch lỗi KHÔNG được giết warmer (warmer chết = statusCache đứng
+        -- yên = getMainStatus trả giá trị cũ vĩnh viễn). Lỗi nuốt → vòng sau tự thử lại.
+        pcall(function()
+            local mains = (getgenv().Config and getgenv().Config["MainAccount"]) or {}
+            for _, nm in ipairs(mains) do
+                local st = fetchMainStatusLive(nm)
+                if st ~= nil then statusCache[nm] = { t = tick(), status = st } end
+                wait(0.15)
+            end
+        end)
         wait(1.5)
     end
 end)
@@ -1185,6 +1219,10 @@ spawn(function()
     -- nhiều lần/frame → bão request → executor rate-limit → rớt dữ liệu. Giờ chạy 0.35s/vòng,
     -- getMainStatus đọc statusCache (warmer nền) nên gần như không còn request trong vòng này.
     while wait(0.35) do
+        -- HEARTBEAT: chứng minh vòng chính SỐNG ngay nhịp đầu → thay chữ "Đang khởi động..." liền.
+        -- Trước đây status() đầu tiên nằm SAU các call mạng đồng bộ; nếu mạng kẹt thì panel đứng
+        -- mãi ở splash dù coroutine vẫn chạy. Set 1 lần để KHÔNG nhấp nháy với status thật.
+        if not _G.firstLoopHit then _G.firstLoopHit = true; status("Vòng chính đã chạy — đang đồng bộ…") end
         -- gate có thể trả nil/false lúc load → đọc lại (đã cache RAM/file: true rồi sẽ thôi gọi remote)
         if not checktempledoor then checktempledoor = readTempleDoor() end
         -- BỌC PCALL: 1 dòng lỗi (vd trialable/InvokeServer khi game update remote) sẽ KHÔNG
@@ -1343,6 +1381,9 @@ spawn(function()
             else
                 -- CHỈ ALLY THẬT vào đây: liên tục detect jobid của main stt1 → join + help.
                 local roleName = "[ALLY]"
+                -- set status TRƯỚC các call mạng bên dưới (fetchMainStatusLive / isSameServerAsMain
+                -- vẫn YIELD); nếu mạng kẹt thì panel hiện dòng này thay vì đứng "Đang khởi động...".
+                status(roleName .. " Đang dò main đang tới lượt…")
                 -- "Nhận lệnh lên trial door" = phát hiện main đang up (moon/in_trail). Làm như join
                 -- jobid: nếu cache miss/chưa active thì FETCH TƯƠI retry 2 lần → đỡ trễ/đứng chờ oan.
                 local mainActive = false
@@ -2505,6 +2546,14 @@ ButtonCard(mainPage, 6, "Change Race (2500F)", function()
         R:InvokeServer("BlackbeardReward", "Reroll", "1")
         R:InvokeServer("BlackbeardReward", "Reroll", "2")
     end)
+end)
+
+-- 🌐 Net diagnostic card — hiện hasReq + GET/POST tới backend đo TỪ TRONG executor
+local NetDiag = LabelCard(mainPage, 7, "🌐 Net (backend)", "đang kiểm tra…")
+spawn(function()
+    while wait(1) do
+        if _G.netDiag then pcall(function() NetDiag:SetDesc(_G.netDiag) end) end
+    end
 end)
 
 -- live status loop
