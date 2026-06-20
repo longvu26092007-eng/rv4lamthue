@@ -579,8 +579,13 @@ end
 local topofgreattree = CFrame.new(3035.15137, 2281.15918, -7325.19189, 0.0284484141, 2.19495124e-08, 0.999595284,
     -3.29094476e-08, 1, -2.10217994e-08, -0.999595284, -3.22980895e-08, 0.0284484141)
 
+local _doorCache = {}
 function getdoor(vv)
     vv = vv or game:GetService("Players").LocalPlayer.Data.Race.Value
+    -- CACHE: tìm được Entrance 1 lần thì NHỚ → chống streaming chớp nil (đang đứng ở cửa mà
+    -- FindFirstChild lỡ trả nil → "ở cửa vẫn ghi false"). Cache hết hiệu lực khi part bị huỷ.
+    local cached = _doorCache[vv]
+    if cached and cached.Parent then return cached end
     -- FIX: không dùng WaitForChild (treo vô hạn nếu corridor chưa load) → FindFirstChild an toàn
     local temple = workspace.Map:FindFirstChild("Temple of Time")
     if not temple then return nil end
@@ -588,7 +593,9 @@ function getdoor(vv)
     if not corridor then return nil end
     local door = corridor:FindFirstChild("Door")
     if not door then return nil end
-    return door:FindFirstChild("Entrance")
+    local entrance = door:FindFirstChild("Entrance")
+    if entrance then _doorCache[vv] = entrance end
+    return entrance
 end
 
 function getdis(...)
@@ -971,7 +978,9 @@ end
 
 function status(v)
     -- DEBUG: luôn kèm [i=X] (giá trị UpgradeRace Check mới nhất) để xem trạng thái race thực tế
-    _G.statusnow = tostring(v) .. ((_G.lastRaceI ~= nil) and ("  [i=" .. tostring(_G.lastRaceI) .. "]") or "")
+    _G.statusnow = tostring(v)
+        .. ((_G.lastRaceI ~= nil) and ("  [i=" .. tostring(_G.lastRaceI) .. "]") or "")
+        .. ((_G.lastDoorDist ~= nil) and ("  [d=" .. tostring(math.floor(_G.lastDoorDist)) .. (_G.lastSameSrv and "/same" or "/diff") .. "]") or "")
 end
 
 -- ============================================================
@@ -1121,11 +1130,26 @@ BringMob = function()
     end
 end
 
--- đọc cổng "đã mở cửa đền" — bọc pcall để remote lỗi KHÔNG ném ra ngoài (treo load).
+-- "Đã mở cửa đền" là điều kiện nền tảng & ỔN ĐỊNH theo account → CHECK 1 LẦN rồi GHI FILE
+-- riêng theo account (<myName>_kaitunv4.json: {templedoor=true}). Lần sau (kể cả reload/rejoin)
+-- ĐỌC FILE, KHÔNG gọi remote nữa → hết phụ thuộc reply game-server cho gate này (hết treo + load nhanh).
+local TEMPLE_DOOR_FILE = myName .. "_kaitunv4.json"
 local function readTempleDoor()
+    if _G.templeDoorOK then return true end                     -- cache RAM (phiên này)
+    -- cache FILE: đã từng xác nhận true → dùng luôn, bỏ qua remote
+    local fok, fdata = pcall(function() return game.HttpService:JSONDecode(readfile(TEMPLE_DOOR_FILE)) end)
+    if fok and type(fdata) == "table" and fdata.templedoor == true then
+        _G.templeDoorOK = true
+        return true
+    end
+    -- chưa true → gọi remote 1 LẦN (có timeout, không treo); true thì ghi file + nhớ vĩnh viễn
     local ok, res = safeInvoke(3, "CheckTempleDoor")
-    if ok then return res end
-    return nil
+    if ok and res then
+        _G.templeDoorOK = true
+        pcall(function() writefile(TEMPLE_DOOR_FILE, game.HttpService:JSONEncode({ templedoor = true })) end)
+        return true
+    end
+    return res  -- nil/false → vòng sau tự thử lại tới khi true (rồi mới ghi file & dừng hẳn)
 end
 -- ============================================================
 -- GATE SẴN SÀNG: chờ TEAM + NHÂN VẬT + DATA load xong rồi mới chạy logic chính.
@@ -1161,8 +1185,8 @@ spawn(function()
     -- nhiều lần/frame → bão request → executor rate-limit → rớt dữ liệu. Giờ chạy 0.35s/vòng,
     -- getMainStatus đọc statusCache (warmer nền) nên gần như không còn request trong vòng này.
     while wait(0.35) do
-        -- gate có thể trả nil lúc load (remote chưa sẵn) → thử đọc lại tới khi có giá trị
-        if checktempledoor == nil then checktempledoor = readTempleDoor() end
+        -- gate có thể trả nil/false lúc load → đọc lại (đã cache RAM/file: true rồi sẽ thôi gọi remote)
+        if not checktempledoor then checktempledoor = readTempleDoor() end
         -- BỌC PCALL: 1 dòng lỗi (vd trialable/InvokeServer khi game update remote) sẽ KHÔNG
         -- giết coroutine nữa → không còn kẹt im "Đang khởi động"; lỗi hiện thẳng ra status.
         local _okLoop, _errLoop = pcall(function()
@@ -1806,18 +1830,15 @@ local BANANA_DOOR_CFRAME = {
 
 -- Khoảng cách tới cửa corridor của mình (LOCAL, không mạng).
 -- "Thuật toán check chuẩn": thử cả getdoor() lẫn toạ độ Banana, lấy cái gần nhất.
+-- ƯU TIÊN part THẬT (getdoor, đã cache) → chính xác. KHÔNG min với toạ độ hardcode nữa:
+-- min làm "đứng ở temple vẫn ghi true" khi toạ độ Banana lỡ gần chỗ đứng. Banana CHỈ dùng
+-- khi getdoor chưa resolve được lần nào (rất hiếm, vd corridor chưa stream).
 local function distToMyDoor()
-    local best = 1e9
-    pcall(function()
-        local door = getdoor()
-        if door then best = math.min(best, getdis(door.CFrame)) end
-    end)
-    pcall(function()
-        local race = game.Players.LocalPlayer.Data.Race.Value
-        local cf = BANANA_DOOR_CFRAME[race]
-        if cf then best = math.min(best, getdis(cf)) end
-    end)
-    return best
+    local door = getdoor()
+    if door then return getdis(door.CFrame) end
+    local cf = BANANA_DOOR_CFRAME[game.Players.LocalPlayer.Data.Race.Value]
+    if cf then return getdis(cf) end
+    return 1e9
 end
 
 -- ===== GIỜ THỰC UTC+7 (Hà Nội / Bangkok) =====
@@ -1954,7 +1975,11 @@ spawn(function()
             if label then
                 -- chỉ true khi đủ CẢ 2: gần door VÀ cùng jobid (cùng server) với main đang turn.
                 -- Thiếu 1 trong 2 → ghi false. Ghi liên tục mỗi 1s kể từ khi load script.
-                local cond = (distToMyDoor() < AT_DOOR_DIST) and sameServerAsCurrentMain()
+                local dd = distToMyDoor()
+                local ss = sameServerAsCurrentMain()
+                _G.lastDoorDist = dd        -- debug: soi detect cửa trên panel
+                _G.lastSameSrv = ss
+                local cond = (dd < AT_DOOR_DIST) and ss
                 writeMyCheck(label, cond)
 
                 -- Chỉ MAIN đang tới turn mới chốt giờ
