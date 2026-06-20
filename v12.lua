@@ -5,12 +5,17 @@ pcall(function() if isfile and isfile("kaitun_module_bf.lua") and delfile then d
 -- ĐỢI CLIENT LOAD XONG HẲN trước khi làm gì (quan trọng SAU KHI HOP SERVER: instance mới
 -- phải load đủ mới chọn team + chạy script; nếu không sẽ "chọn được team mà script không chạy").
 if not game:IsLoaded() then game.Loaded:Wait() end
+-- timeout 30s: LoadingScreen kẹt / service thiếu sẽ KHÔNG treo vĩnh viễn (mọi remote sau đã qua safeInvoke)
+local _bootT0 = tick()
 repeat
     task.wait(0.1)
-until game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
+until (game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")) or (tick() - _bootT0) > 30
 
 if workspace:GetAttribute("MAP") and workspace:GetAttribute("MAP") ~= "Sea3" then
-    game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("TravelZou")
+    -- bọc thread con: InvokeServer YIELD được → tránh treo lúc load nếu server chậm
+    task.spawn(function()
+        pcall(function() game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("TravelZou") end)
+    end)
 end
 if not isfile("cache_v4.json") then
     writefile("cache_v4.json", "{}")
@@ -412,6 +417,36 @@ end)
 local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
 -- ============================================================
+-- [SAFE INVOKE] Gọi RemoteFunction KHÔNG để treo luồng. InvokeServer tới RemoteFunction
+-- YIELD luồng gọi tới khi server trả lời — nếu handler server-side treo (account vừa
+-- join / đang load, Data chưa sẵn) thì luồng KẸT VĨNH VIỄN. pcall KHÔNG cứu được (chỉ
+-- bắt error, không bắt yield). Đây là nguyên nhân treo "Đang khởi động".
+-- safeInvoke chạy InvokeServer trong thread con, chờ tối đa `timeout`s → loop luôn đi tiếp.
+-- Trả: ok(bool), r1, r2, ...  (hết giờ → ok=false).
+-- ============================================================
+local function _resolveCommF()
+    local rs = game:GetService("ReplicatedStorage")
+    local rem = rs:FindFirstChild("Remotes") or rs:WaitForChild("Remotes", 10)
+    return rem and (rem:FindFirstChild("CommF_") or rem:WaitForChild("CommF_", 10)) or nil
+end
+local _CommF = _resolveCommF()
+local function safeInvoke(timeout, ...)
+    if not _CommF then _CommF = _resolveCommF() end
+    if not _CommF then return false end
+    local args = table.pack(...)
+    local done, packed = false, nil
+    task.spawn(function()
+        packed = table.pack(pcall(function()
+            return _CommF:InvokeServer(table.unpack(args, 1, args.n))
+        end))
+        done = true
+    end)
+    local t0 = tick()
+    while not done and (tick() - t0) < timeout do task.wait() end
+    if not done or not packed then return false end
+    return table.unpack(packed, 1, packed.n)
+end
+-- ============================================================
 -- [MODULE] Bản module_bf NHÚNG THẲNG (không tải GitHub) — đã FIX:
 --   • topos: HỦY tween cũ trước khi tạo mới (hết chồng tween + memory leak + giật),
 --     clamp duration 0.05–4s (không bao giờ tween 300s = kẹt), nil-safe (không WaitForChild vô hạn).
@@ -647,15 +682,25 @@ local race_abilities = {
     ["Cyborg"] = "Energy Core",
     ["Draco"] = "Primordial Reign"
 }
-local races_trial_place = {
-    ["Human"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of Strength"),
-    ["Mink"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of Speed"),
-    ["Fishman"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of Water"),
-    ["Skypiea"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of the King"),
-    ["Ghoul"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of Carnage"),
-    ["Cyborg"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of the Machine"),
-    ["Draco"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of Flames")
+-- FIX: KHÔNG dựng sẵn bằng WaitForChild (không timeout → treo VĨNH VIỄN lúc load nếu
+-- location chưa stream). Lazy getter + cache, dùng FindFirstChild → trả nil khi chưa load
+-- (mọi nơi dùng đã nil-guard sẵn → vòng sau tự lấy lại).
+local RACE_TRIAL_NAME = {
+    ["Human"] = "Trial of Strength", ["Mink"] = "Trial of Speed", ["Fishman"] = "Trial of Water",
+    ["Skypiea"] = "Trial of the King", ["Ghoul"] = "Trial of Carnage",
+    ["Cyborg"] = "Trial of the Machine", ["Draco"] = "Trial of Flames",
 }
+local _raceTrialCache = {}
+local function getRaceTrialPlace(race)
+    local c = _raceTrialCache[race]
+    if c and c.Parent then return c end
+    local wo = workspace:FindFirstChild("_WorldOrigin")
+    local loc = wo and wo:FindFirstChild("Locations")
+    local nm = RACE_TRIAL_NAME[race]
+    local p = (loc and nm) and loc:FindFirstChild(nm) or nil
+    if p then _raceTrialCache[race] = p end
+    return p
+end
 
 -- ============================================================
 -- [TRIAL] Làm trial theo từng tộc — ƯU TIÊN kkv4 (Ceiling/Floor + loop Enemies/SeaBeasts),
@@ -667,7 +712,7 @@ local races_trial_place = {
 function doTrialForMyRace()
     local LP = game.Players.LocalPlayer
     local myrace = LP.Data.Race.Value
-    local race_trial_place = races_trial_place[myrace]
+    local race_trial_place = getRaceTrialPlace(myrace)
     local function tp(cf) pcall(function() module:topos(cf) end) end  -- teleport thô (không tự kill)
     -- BAY TỪ TỪ tới cf (tween mượt). KaitunV4 KHÔNG có Tween2/BKP → tự dựng bằng TweenService.
     -- module:noclip(return true) đã bật sẵn nên xuyên vật cản khi bay.
@@ -679,7 +724,7 @@ function doTrialForMyRace()
             local dur = math.clamp(dist / 325, 0.05, 4)   -- 325 studs/s, cap 4s tránh kẹt
             local tw = game:GetService("TweenService"):Create(
                 hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = cf })
-            tw:Play(); wait(dur)
+            tw:Play(); wait(dur); pcall(function() tw:Destroy() end)  -- destroy → hết leak
         end)
     end
     local function equipMelee()  -- cầm vũ khí Melee (fallback: Sword/Blox Fruit/Gun)
@@ -776,7 +821,7 @@ function doTrialForMyRace()
                     local t0 = tick()
                     repeat wait()
                         if not LP.Backpack:FindFirstChild("Sharkman Karate") then
-                            game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("BuySharkmanKarate")
+                            safeInvoke(3, "BuySharkmanKarate")
                         end
                         tp(v.HumanoidRootPart.CFrame * CFrame.new(0, 500, 0))
                         _G.SHOULDSPAMSKILLS = true
@@ -791,7 +836,7 @@ end
 -- Gộp dispatch "đang trong khu trial → làm trial; chưa → lên cửa đợi" dùng chung MAIN & ALLY
 -- (trước đây 2 nhánh copy-paste, sửa lệch dễ sinh bug). isMain: set status in_trail cho main.
 function runTrialPhase(roleName, isMain)
-    local race_trial_place = races_trial_place[game.Players.LocalPlayer.Data.Race.Value]
+    local race_trial_place = getRaceTrialPlace(game.Players.LocalPlayer.Data.Race.Value)
     if race_trial_place and getdis(race_trial_place.CFrame) < 1500 then
         if isMain then
             local st = getMainStatus(myName)
@@ -880,16 +925,15 @@ function trialable()
     if not game.Players.LocalPlayer.Character:FindFirstChild("RaceTransformed") then
         -- vẫn hỏi UpgradeRace Check để bắt DONE (i==5) dù chưa transform → tránh con full gear
         -- bị tưởng "tới lượt train/trial".
-        local okI, i5 = pcall(function()
-            return (game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("UpgradeRace", "Check"))
-        end)
+        local okI, i5 = safeInvoke(3, "UpgradeRace", "Check")
         _G.lastRaceI = okI and i5 or "?"   -- debug: hiện i hiện tại
         if okI and (i5 == 5 or i5 == 8) then return false, "done" end   -- 5/8 = FULL GEAR
         local abcxyz = checkbackpack(race_abilities[game:GetService("Players").LocalPlayer.Data.Race.Value])
         if abcxyz then return true end
         return false
     end
-    local i, d, f = game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("UpgradeRace", "Check")
+    local ok, i, d, f = safeInvoke(3, "UpgradeRace", "Check")
+    if not ok then _G.lastRaceI = "?"; return false end   -- remote treo/timeout → coi như chưa sẵn sàng
     _G.lastRaceI = i   -- debug: hiện i hiện tại
     -- FULL GEAR = i==5 (Full Update) HOẶC i==8 (full gear + còn training sessions) → DONE.
     if i == 5 or i == 8 then
@@ -902,7 +946,7 @@ function trialable()
         if f then
             local totalfragments = tonumber(f)
             if game:GetService("Players").LocalPlayer.Data.Fragments.Value >= totalfragments then
-                game:GetService("ReplicatedStorage")["Remotes"]["CommF_"]:InvokeServer("UpgradeRace", "Buy")
+                safeInvoke(3, "UpgradeRace", "Buy")
             else
                 return false, "raiding"
             end
@@ -994,7 +1038,7 @@ function isSameServerAsMain(mainName)
 end
 
 function checkgear()
-    local dt = game.ReplicatedStorage.Remotes.CommF_:InvokeServer("TempleClock", "Check")
+    local _okcg, dt = safeInvoke(3, "TempleClock", "Check")
     if dt then
         if dt.HadPoint then
             local g1, g2, g3 = getgenv().Config["Gear"]:match("^(.-)%-(.-)%-(.-)$")
@@ -1005,11 +1049,11 @@ function checkgear()
             local a = dt.RaceDetails.A
             local b = dt.RaceDetails.B
             if a >= 2 then
-                game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("TempleClock", "SpendPoint","Gear" .. tostring(dt.Completed), "Omega")
+                safeInvoke(3, "TempleClock", "SpendPoint", "Gear" .. tostring(dt.Completed), "Omega")
             elseif b >= 2 then
-                game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("TempleClock", "SpendPoint","Gear" .. tostring(dt.Completed), "Alpha")
+                safeInvoke(3, "TempleClock", "SpendPoint", "Gear" .. tostring(dt.Completed), "Alpha")
             else
-                game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("TempleClock", "SpendPoint","Gear" .. tostring(dt.RaceDetails.Completed), choosegear)
+                safeInvoke(3, "TempleClock", "SpendPoint", "Gear" .. tostring(dt.RaceDetails.Completed), choosegear)
             end
         end
     end
@@ -1079,9 +1123,7 @@ end
 
 -- đọc cổng "đã mở cửa đền" — bọc pcall để remote lỗi KHÔNG ném ra ngoài (treo load).
 local function readTempleDoor()
-    local ok, res = pcall(function()
-        return game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("CheckTempleDoor")
-    end)
+    local ok, res = safeInvoke(3, "CheckTempleDoor")
     if ok then return res end
     return nil
 end
@@ -1442,8 +1484,9 @@ spawn(function()
                 if ui_ then
                     for _, vl in pairs(ui_:GetChildren()) do
                         if isvalidnameui[vl.Name] then
-                            local cooldown_frame, title_frame = vl:WaitForChild("Cooldown"), vl:WaitForChild("Title")
-                            if title_frame.TextColor3 == Color3.new(1, 1, 1) or title_frame.TextColor3 == Color3.fromRGB(255, 255, 255) then
+                            local cooldown_frame = vl:WaitForChild("Cooldown", 3)
+                            local title_frame = vl:WaitForChild("Title", 3)
+                            if cooldown_frame and title_frame and (title_frame.TextColor3 == Color3.new(1, 1, 1) or title_frame.TextColor3 == Color3.fromRGB(255, 255, 255)) then
                                 if cooldown_frame.Size == UDim2.new(0, 0, 1, -1) then
                                     if vl.Name == "V" then
                                         if not fruits[ui_.Name] then
