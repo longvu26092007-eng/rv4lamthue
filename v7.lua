@@ -284,6 +284,9 @@ getgenv().Config["Team"] = getgenv().Config["Team"] and (getgenv().Config["Team"
 -- ===== STATUS CACHE: đọc read-through, TTL ngắn → cắt bão getMainStatus mỗi frame =====
 statusCache = {} -- name -> { t, status }  (khai báo TRƯỚC setMyMainStatus tránh phụ thuộc thứ tự)
 local STATUS_TTL = 3
+-- Cache main KHÁC quá cũ (warmer không refresh nổi = mất mạng) → coi như "offline", BỎ khỏi hàng đợi
+-- thay vì bám status cũ (vd "moon" cũ làm ally bám main đã xong). Riêng CHÍNH MÌNH luôn tin cache (local).
+local STATUS_STALE = 15
 
 -- POST mainstatus qua hàng đợi (retry). Cập nhật cache ngay để logic dùng giá trị mới.
 function setMyMainStatus(statusStr)
@@ -321,7 +324,11 @@ end
 -- (đã được warmer nền + setMyMainStatus cập nhật liên tục). Cache rỗng → "waiting".
 function getMainStatus(accName)
     local c = statusCache[accName]
-    if c then return c.status end
+    if c then
+        -- main KHÁC mà cache quá cũ (mất mạng, warmer không refresh) → "offline" để bỏ khỏi hàng đợi
+        if accName ~= myName and (tick() - (c.t or 0)) > STATUS_STALE then return "offline" end
+        return c.status
+    end
     return "waiting"
 end
 
@@ -588,7 +595,7 @@ do
         if not v36 then pcall(function() LP.Character.Humanoid.Sit = false end) end
         if _activeTween then pcall(function() _activeTween:Cancel(); _activeTween:Destroy() end); _activeTween = nil end
         local dist = (hrp.Position - targetCFrame.Position).Magnitude
-        local dur = math.clamp(dist / 200, 0.05, 12)                -- 200 studs/s ỔN ĐỊNH (cap 12s ~2400 studs) → bay xa KHÔNG bị tăng tốc/giật
+        local dur = math.clamp(dist / 200, 0.05, 600)               -- 200 studs/s LUÔN cố định (cap 600s, gần như KHÔNG BAO GIỜ chạm) → không tăng tốc/giật ngược dù xa bao nhiêu
         local tw = TweenS:Create(hrp,
             TweenInfo.new(dur, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
             { CFrame = targetCFrame })
@@ -818,7 +825,7 @@ function doTrialForMyRace()
             local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
             if not hrp then return end
             local dist = (cf.Position - hrp.Position).Magnitude
-            local dur = math.clamp(dist / 200, 0.05, 12)   -- 200 studs/s ỔN ĐỊNH, cap 12s (~2400 studs) → hết giật
+            local dur = math.clamp(dist / 200, 0.05, 600)  -- 200 studs/s LUÔN cố định (cap 600s) → không tăng tốc/giật ngược dù xa bao nhiêu
             local tw = game:GetService("TweenService"):Create(
                 hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = cf })
             tw:Play(); wait(dur); pcall(function() tw:Destroy() end)  -- destroy → hết leak
@@ -1377,6 +1384,7 @@ spawn(function()
             elseif isaccmain[myName] and myStatus == "training" then
                 status("[MAIN " .. myStt .. "] Training (parallel)")
                 if not ab then
+                    setMyMainStatus("training")   -- CHỐT chắc status training (chống dashboard dính moon/in_trail cũ)
                     if AB == "raiding" then
                         local boss = workspace.Enemies:FindFirstChild("Cake Prince") or workspace.Enemies:FindFirstChild("Dough King")
                         if boss then
@@ -1402,20 +1410,34 @@ spawn(function()
                         local pos__ = CFrame.new(214.688675, 126.626984, -12600.2236, -0.180400655, -1.09679892e-08, 0.983593225, 1.94620693e-08, 1, 1.47204746e-08, -0.983593225, 2.17983427e-08, -0.180400655)
                         if getdis(pos__) < 1500 then
                             for _, v in ipairs(getmob1(pos__)) do
-                                local lastY, lastTf = 0, nil
-                                repeat wait()
-                                    module:eq(); module:haki(); BringMob()
-                                    local c   = LP.Character
-                                    local hrp = v:FindFirstChild("HumanoidRootPart")
-                                    local tf  = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
-                                    -- transformed → đứng cao chờ hết V4; chưa → áp sát kill
-                                    if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, tf and 150 or 20, 0)) end) end
-                                    if tf ~= lastTf then  -- đổi status chỉ khi state đổi → hết giật chữ
-                                        status("[MAIN " .. myStt .. (tf and "] Training (Wait for end V4)" or "] Training (Kill Mobs)"))
-                                        lastTf = tf
+                                local lastY, lastTf, lastTrainPost = 0, nil, 0
+                                repeat
+                                    local c  = LP.Character
+                                    local tf = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
+                                    if tf then
+                                        -- ===== ĐANG V4 → CHỈ CHỜ HẾT V4: NGẮT vòng nặng cho đỡ hao tài nguyên =====
+                                        -- KHÔNG eq/haki/BringMob/topos mỗi frame; đứng cao 1 lần rồi nghỉ dài.
+                                        if lastTf ~= true then
+                                            local hrp = v:FindFirstChild("HumanoidRootPart")
+                                            if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 150, 0)) end) end
+                                            status("[MAIN " .. myStt .. "] Training (Wait for end V4)")
+                                            lastTf = true
+                                        end
+                                        -- re-assert "training" mỗi 4s → dashboard LUÔN là training (không dính moon)
+                                        if (tick() - lastTrainPost) > 4 then setMyMainStatus("training"); lastTrainPost = tick() end
+                                        wait(0.5)   -- nghỉ dài: chỉ chờ V4 hết, không làm gì nặng
+                                    else
+                                        -- ===== CHƯA V4 → áp sát + kill nạp energy =====
+                                        module:eq(); module:haki(); BringMob()
+                                        local hrp = v:FindFirstChild("HumanoidRootPart")
+                                        if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 20, 0)) end) end
+                                        if lastTf ~= false then
+                                            status("[MAIN " .. myStt .. "] Training (Kill Mobs)")
+                                            lastTf = false
+                                        end
+                                        if (tick() - lastY > 0.4) then lastY = tick(); pressV4() end
+                                        wait()
                                     end
-                                    -- bấm Y throttle 0.4s, KHÔNG spawn mỗi frame → hết giật
-                                    if (not tf) and (tick() - lastY > 0.4) then lastY = tick(); pressV4() end
                                 until not checkmob_(v)
                             end
                         else
@@ -1956,17 +1978,34 @@ end)
 -- KHÔNG còn dùng web để hẹn giờ bấm (đã bỏ /firesignal, /donedoor, /abilityready cho việc bấm).
 -- Vẫn dùng web CHỈ để đánh số role/index (Main..idx / Ally..i) qua /init.
 -- Cơ chế:
---   1) checkalready.txt: mỗi account ghi đúng DÒNG của mình "<Label>:doorandability=<true|false>".
+--   1) Mỗi account ghi FILE RIÊNG trong folder racev4_vunguyen/: checkalready_<label thường>
+--      nội dung "<Label>:doorandability=<true|false>" (vd checkalready_main1 → "Main1:doorandability=true").
 --      true khi đủ CẢ 2: đứng ở cửa (<AT_DOOR_DIST) VÀ CÙNG jobid (cùng server) với main đang turn.
---      Thiếu 1 → ghi false. Main đang-tới-turn tự tạo file nếu chưa có (bỏ qua nếu đã tồn tại).
---   2) Khi CẢ 3 dòng (Main..idx, Ally1, Ally2...) = true → main tạo starttime.txt = GIỜ THỰC Hà Nội + 10s.
---   3) Cả 3 account đọc starttime.txt mỗi 3s. Tới đúng giờ đó (age ∈ [0, window)) thì bấm ActivateAbility 1 lần.
+--      Mỗi con CHỈ đụng file của mình → HẾT tranh ghi (lost-update) như khi xài chung 1 checkalready.txt.
+--   2) Khi CẢ 3 file (Main1 + Ally1 + Ally2...) = true → main ghi starttime.txt = GIỜ THỰC Hà Nội + LEAD.
+--   3) Cả 3 account đọc starttime mỗi giây. Tới đúng giờ đó (age ∈ [0, window)) thì bấm ActivateAbility 1 lần.
 -- starttime ghi "HH:MM:SS" giờ UTC+7 (Hà Nội/Bangkok); so theo giây-trong-ngày → bấm đồng bộ 1 thời điểm.
 local ABILITY_FIRE_WINDOW = 6   -- giây — chỉ bấm trong khoảng [start, start+window)
 local AT_DOOR_DIST = 150        -- coi như "đứng ở cửa" khi cách Entrance < ngần này (nới nhẹ từ 120)
 local START_LEAD   = 5          -- giây — starttime = bây giờ + 5s
-local CHECK_FILE   = "checkalready.txt"
-local START_FILE   = "starttime.txt"
+-- ===== FILE SYNC theo ROLE (folder riêng, MỖI ACC 1 FILE → hết tranh ghi) =====
+local SYNC_DIR     = "racev4_vunguyen"
+local START_FILE   = SYNC_DIR .. "/starttime.txt"
+local function ensureSyncDir()
+    if isfolder and not isfolder(SYNC_DIR) then pcall(function() makefolder(SYNC_DIR) end) end
+end
+ensureSyncDir()
+-- Dọn file cũ ở thư mục gốc (bản trước dùng chung checkalready.txt / starttime.txt) → tránh đọc nhầm.
+pcall(function()
+    if isfile and delfile then
+        if isfile("checkalready.txt") then delfile("checkalready.txt") end
+        if isfile("starttime.txt") then delfile("starttime.txt") end
+    end
+end)
+-- "Main1" → racev4_vunguyen/checkalready_main1 ; "Ally2" → racev4_vunguyen/checkalready_ally2
+local function checkFileForLabel(label)
+    return SYNC_DIR .. "/checkalready_" .. string.lower(label)
+end
 
 -- Toạ độ cửa trial từng tộc (tham khảo Banana "Teleport To Trial Door") — nguồn check door
 -- dự phòng khi getdoor() trả nil/sai. Lấy khoảng cách NHỎ NHẤT giữa 2 nguồn cho chuẩn.
@@ -2070,45 +2109,31 @@ local function requiredLabels()
     return labels
 end
 
--- Đọc & phân tích checkalready.txt → bảng { Label = true/false }
-local function parseCheck()
-    local t = {}
-    if not (isfile and isfile(CHECK_FILE)) then return t end
-    local ok, data = pcall(readfile, CHECK_FILE)
-    if not ok or not data then return t end
-    for label, val in string.gmatch(data, "(%w+):doorandability=(%w+)") do
-        t[label] = (val == "true")
-    end
-    return t
+-- Đọc trạng thái ready của 1 label từ FILE RIÊNG của nó → bool.
+-- File hỏng / đang ghi dở / chưa có → false (an toàn: coi như CHƯA sẵn sàng).
+local function readLabelReady(label)
+    local fp = checkFileForLabel(label)
+    if not (isfile and isfile(fp)) then return false end
+    local ok, data = pcall(readfile, fp)
+    if not ok or not data then return false end
+    return string.match(data, ":doorandability=(%w+)") == "true"
 end
 
--- Ghi lại toàn bộ bảng ra file (mỗi dòng 1 nhãn, sort cho ổn định)
-local function serializeCheck(t)
-    local keys = {}
-    for k, _ in pairs(t) do table.insert(keys, k) end
-    table.sort(keys)
-    local lines = {}
-    for _, k in ipairs(keys) do
-        table.insert(lines, k .. ":doorandability=" .. (t[k] and "true" or "false"))
-    end
-    return table.concat(lines, "\n")
-end
-
--- Read-modify-write: chỉ đụng DÒNG của chính mình, giữ nguyên dòng account khác
+-- Ghi FILE RIÊNG của chính mình (KHÔNG đụng file account khác → hết tranh ghi).
 local function writeMyCheck(label, cond)
     if not label then return end
-    local t = parseCheck()
-    t[label] = cond and true or false
-    pcall(function() writefile(CHECK_FILE, serializeCheck(t)) end)
+    ensureSyncDir()
+    pcall(function()
+        writefile(checkFileForLabel(label), label .. ":doorandability=" .. (cond and "true" or "false"))
+    end)
 end
 
--- Đủ tất cả nhãn bắt buộc = true?
+-- Đủ tất cả nhãn bắt buộc = true? (đọc từng FILE RIÊNG của main-turn + các ally)
 local function allReady()
-    local t = parseCheck()
     local req = requiredLabels()
     if #req == 0 then return false end
     for _, lb in ipairs(req) do
-        if t[lb] ~= true then return false end
+        if not readLabelReady(lb) then return false end
     end
     return true
 end
@@ -2121,14 +2146,8 @@ local function readStart()
     return parseHanoi((string.gsub(data, "%s", "")))
 end
 
--- Main đang-tới-turn tự tạo checkalready.txt nếu chưa có (bỏ qua nếu đã tồn tại)
-if isaccmain[myName] then
-    spawn(function()
-        if not (isfile and isfile(CHECK_FILE)) then
-            pcall(function() writefile(CHECK_FILE, "") end)
-        end
-    end)
-end
+-- (Bỏ) Không cần main tạo file chung nữa — mỗi account ghi FILE RIÊNG qua writeMyCheck;
+-- folder racev4_vunguyen đã được ensureSyncDir() tạo sẵn ở trên.
 
 -- ===== LOOP GHI: cadence 1s — ghi dòng của mình + (main) chốt starttime khi đủ 3 =====
 spawn(function()
@@ -2156,6 +2175,7 @@ spawn(function()
                     local now = serverNow()
                     local last = _G.myStartEpoch or 0
                     if (now - last) > (START_LEAD + ABILITY_FIRE_WINDOW) and allReady() then
+                        ensureSyncDir()
                         pcall(function() writefile(START_FILE, fmtHanoi(now + START_LEAD)) end)
                         _G.myStartEpoch = now
                     end
@@ -2207,9 +2227,10 @@ spawn(function()
 end)
 
 
--- MỌI account (cả ally) POST jobid mỗi 1s → dashboard hiện server từng con để so cùng/khác server.
+-- MỌI account (cả ally) POST jobid mỗi 3s → dashboard hiện server từng con (giảm tải so với 1s).
+-- 3s vẫn dư tươi: isSameServerAsMain coi jobid hợp lệ trong 60s nên hop/đồng bộ không ảnh hưởng.
 spawn(function()
-    while wait(1) do
+    while wait(3) do
         Net.postJSON(BASE_URL .. "/noguchi?name=" .. myName, { jobid = game.JobId }, "noguchi")
     end
 end)
@@ -2248,7 +2269,7 @@ spawn(function()
                 pcall(function() o.obj[o.prop] = Color3.fromHSV(hue, o.s, o.v) end)
             end
         end
-        RunService.RenderStepped:Wait()
+        task.wait(1/15)   -- ~15fps thay vì mỗi frame → giảm tải CPU (×N account/1 máy)
     end
 end)
 
