@@ -1461,16 +1461,11 @@ spawn(function()
                         end
                     end
                 else
-                    -- TRAINING XONG: CHỈ giành lượt (về waiting → lên #1) khi MÌNH ĐÃ Ở #1 hàng đợi
-                    -- (không còn main 'waiting'/'active' chen trước) → KHÔNG cắt hàng của Main kế.
-                    -- Khi TẤT CẢ main đang training: con ở #1 (config đầu) flip waiting → lên Main1;
-                    -- các con khác GIỮ training chờ tới lượt.
-                    if currentmain == myName then
-                        status("[MAIN " .. myStt .. "] Training done → tới lượt, về waiting để lên #1")
-                        setMyMainStatus("waiting")
-                    else
-                        status("[MAIN " .. myStt .. "] Training done — chờ tới lượt (sau " .. tostring(currentmain) .. ")")
-                    end
+                    -- TRAINING XONG (sẵn sàng trial) → về WAITING để vào hàng đợi (MỌI main, không chỉ stt1).
+                    -- Thứ tự xoay theo INDEX (config) nên con nào xong train trước cũng KHÔNG cắt hàng —
+                    -- main đúng lượt vẫn lên stt1. Để "training" lại = kẹt cuối hàng dù ĐÃ sẵn sàng.
+                    if myStatus ~= "waiting" then setMyMainStatus("waiting") end
+                    status("[MAIN " .. myStt .. "] Training done → waiting (chờ tới lượt)")
                 end
             elseif isaccmain[myName] and currentmain == myName then
                 status("[MAIN " .. myStt .. "] My turn to upgrade gear!")
@@ -1529,11 +1524,17 @@ spawn(function()
                     end
                 end
             elseif isaccmain[myName] then
-                -- MAIN CHƯA TỚI LƯỢT → ĐỨNG IM chờ lên stt1, KHÔNG đi help main khác.
-                -- Liên tục re-check mỗi vòng: khi main stt1 chuyển done/training thì hàng đợi
-                -- xoay, mình lên stt1 → vòng sau rơi vào nhánh "My turn" ở trên.
+                -- MAIN CHƯA TỚI LƯỢT: nếu CÒN TRAIN ĐƯỢC (chưa sẵn sàng trial) → TRAIN SONG SONG luôn
+                -- (đỡ phí thời gian chờ; training KHÔNG cần fullmoon). Đã sẵn sàng (ab=true) → WAITING chờ
+                -- tới lượt lên stt1 (hop fullmoon + làm trial vẫn CHỈ khi tới lượt stt1).
                 _G.allyKillReset = false
-                status("[MAIN " .. myStt .. "] Waiting for current main: " .. tostring(currentmain))
+                if (not ab) and AB ~= "done" then
+                    if myStatus ~= "training" then setMyMainStatus("training") end
+                    status("[MAIN " .. myStt .. "] Training song song (chưa tới lượt)")
+                else
+                    if myStatus == "training" then setMyMainStatus("waiting") end
+                    status("[MAIN " .. myStt .. "] Waiting for current main: " .. tostring(currentmain))
+                end
             else
                 -- CHỈ ALLY THẬT vào đây: liên tục detect jobid của main stt1 → join + help.
                 local roleName = "[ALLY]"
