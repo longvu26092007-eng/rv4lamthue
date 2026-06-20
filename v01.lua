@@ -361,6 +361,8 @@ spawn(function()
                 pok = Net.raw("POST", BASE_URL .. "/heartbeat?name=" .. myName, HS:JSONEncode({ role = myRole }))
                 pms = math.floor((tick() - p0) * 1000)
             end
+            _G.netGetOk = gok and true or false
+            _G.netPostOk = Net.hasReq and (pok and true or false) or nil
             _G.netDiag = ("req=%s | GET %s %dms | POST %s"):format(
                 tostring(Net.hasReq),
                 gok and "OK" or "FAIL", gms,
@@ -1010,11 +1012,43 @@ function cachedTrialable()
     return ab, AB
 end
 
+-- ============================================================
+-- [DEBUG LOG] Ring buffer 200 dòng + CHỐNG SPAM: cùng key trong 15s thì BỎ (không ghi lại).
+--   DBG(msg, level, key): level "ok"=xanh / "err"=đỏ / "info"=xám. key gộp spam (mặc định = msg).
+--   → status() đổi mỗi 0.35s nhưng mỗi nội dung chỉ vào log 1 lần / 15s.
+--   Thứ tần suất cao (loop/net/door/server) KHÔNG vào log — hiện bằng ĐÈN xanh/đỏ ở tab Debug.
+-- ============================================================
+_G.dbgLog = _G.dbgLog or {}
+_G.dbgSeq = _G.dbgSeq or 0
+local _dbgLastKey = {}
+local DBG_MAX, DBG_SPAM_TTL = 200, 15
+function DBG(msg, level, key)
+    key = key or tostring(msg)
+    local t = tick()
+    if _dbgLastKey[key] and (t - _dbgLastKey[key]) < DBG_SPAM_TTL then return end  -- spam <15s → bỏ
+    _dbgLastKey[key] = t
+    _G.dbgSeq = _G.dbgSeq + 1
+    local hm = "--:--:--"
+    pcall(function()
+        local base = (serverNow and serverNow()) or (os and os.time and os.time()) or t
+        local s = math.floor(base + 7 * 3600) % 86400   -- giờ Hà Nội
+        hm = string.format("%02d:%02d:%02d", math.floor(s / 3600), math.floor((s % 3600) / 60), s % 60)
+    end)
+    _G.dbgLog[#_G.dbgLog + 1] = { seq = _G.dbgSeq, text = "[" .. hm .. "] " .. tostring(msg), level = level or "info" }
+    while #_G.dbgLog > DBG_MAX do table.remove(_G.dbgLog, 1) end
+end
+
 function status(v)
     -- DEBUG: luôn kèm [i=X] (giá trị UpgradeRace Check mới nhất) để xem trạng thái race thực tế
     _G.statusnow = tostring(v)
         .. ((_G.lastRaceI ~= nil) and ("  [i=" .. tostring(_G.lastRaceI) .. "]") or "")
-        .. ((_G.lastDoorDist ~= nil) and ("  [d=" .. tostring(math.floor(_G.lastDoorDist)) .. (_G.lastSameSrv and "/same" or "/diff") .. "]") or "")
+        .. ((_G.lastDoorDist ~= nil) and ("  [d=" .. tostring(math.floor(_G.lastDoorDist)) .. (_G.lastDoorSrc or "?") .. (_G.lastSameSrv and "/same" or "/diff") .. "]") or "")
+    -- đẩy vào Debug log (gộp spam theo nội dung gốc v, 15s/lần)
+    local sv = tostring(v)
+    local lvl = "info"
+    if sv:find("Lỗi") or sv:find("⚠") or sv:find("FAIL") or sv:find("Died") then lvl = "err"
+    elseif sv:find("Doing trial") or sv:find("DONE") or sv:find("Ready") or sv:find("Kill Players") then lvl = "ok" end
+    DBG(sv, lvl, sv)
 end
 
 -- ============================================================
@@ -1222,6 +1256,8 @@ spawn(function()
         -- HEARTBEAT: chứng minh vòng chính SỐNG ngay nhịp đầu → thay chữ "Đang khởi động..." liền.
         -- Trước đây status() đầu tiên nằm SAU các call mạng đồng bộ; nếu mạng kẹt thì panel đứng
         -- mãi ở splash dù coroutine vẫn chạy. Set 1 lần để KHÔNG nhấp nháy với status thật.
+        _G.loopTick = (_G.loopTick or 0) + 1
+        _G.loopLastT = tick()
         if not _G.firstLoopHit then _G.firstLoopHit = true; status("Vòng chính đã chạy — đang đồng bộ…") end
         -- gate có thể trả nil/false lúc load → đọc lại (đã cache RAM/file: true rồi sẽ thôi gọi remote)
         if not checktempledoor then checktempledoor = readTempleDoor() end
@@ -1388,10 +1424,15 @@ spawn(function()
                 -- jobid: nếu cache miss/chưa active thì FETCH TƯƠI retry 2 lần → đỡ trễ/đứng chờ oan.
                 local mainActive = false
                 if currentmain then
+                    local cst = statusCache[currentmain]
+                    -- BƯỚC (1): đọc status main từ CACHE (nhanh). Hiện luôn giá trị cache để soi.
+                    status(roleName .. " (1) main " .. tostring(currentmain) .. " st=" .. tostring(cst and cst.status or "nil"))
                     local st = getMainStatus(currentmain)
                     mainActive = (st == "moon" or st == "in_trail")
                     if not mainActive and not isaccmain[myName] then
                         for _ = 1, 2 do
+                            -- BƯỚC (2): fetch LIVE /mainstatus. KẸT Ở ĐÂY = GET /mainstatus chậm/timeout.
+                            status(roleName .. " (2) fetch LIVE status main…")
                             wait(0.2)
                             local live = fetchMainStatusLive(currentmain)
                             if live == "moon" or live == "in_trail" then
@@ -1404,6 +1445,8 @@ spawn(function()
                 -- Main phụ (main-as-ally) KHÔNG hop theo (giữ như bản gốc); chỉ ally thật mới hop.
                 local sameServer, mainJob = true, nil
                 if not isaccmain[myName] then
+                    -- BƯỚC (3): đọc jobid main qua /noguchi. KẸT Ở ĐÂY = GET /noguchi chậm/timeout (3 lần retry).
+                    status(roleName .. " (3) đọc jobid main (same-server?)…")
                     sameServer, mainJob = isSameServerAsMain(currentmain)
                 end
                 if currentmain and mainActive and not sameServer then
@@ -1876,9 +1919,21 @@ local BANANA_DOOR_CFRAME = {
 -- khi getdoor chưa resolve được lần nào (rất hiếm, vd corridor chưa stream).
 local function distToMyDoor()
     local door = getdoor()
-    if door then return getdis(door.CFrame) end
+    if door then
+        local d = getdis(door.CFrame)
+        -- DEBUG: R = part Door.Entrance THẬT của corridor (chuẩn). Nếu ở Temple of Time mà d≈0
+        -- với src=R nghĩa là getdoor() trả part nằm sai chỗ (ngay hub) → cần đổi mốc cửa.
+        _G.lastDoorSrc, _G.lastDoorName, _G.lastDoorDist = "R", door.Name, d
+        return d
+    end
     local cf = BANANA_DOOR_CFRAME[game.Players.LocalPlayer.Data.Race.Value]
-    if cf then return getdis(cf) end
+    if cf then
+        local d = getdis(cf)
+        -- B = toạ độ Banana hardcode (dự phòng). d≈0 với src=B = toạ độ Banana trùng chỗ đứng.
+        _G.lastDoorSrc, _G.lastDoorName, _G.lastDoorDist = "B", "banana", d
+        return d
+    end
+    _G.lastDoorSrc, _G.lastDoorName, _G.lastDoorDist = "X", "none", 1e9
     return 1e9
 end
 
@@ -2556,6 +2611,29 @@ spawn(function()
     end
 end)
 
+-- 🔎 Sync Debug card — dump trạng thái đồng bộ Main/Ally (chỉ đọc cache, KHÔNG gọi mạng)
+local SyncDbg = LabelCard(mainPage, 8, "🔎 Sync Debug", "…")
+spawn(function()
+    while wait(0.5) do
+        pcall(function()
+            local cur = getCurrentMainBeingUpgraded()        -- cache-only, không block
+            local c = cur and statusCache[cur]
+            local me = isaccmain[myName] and ("MAIN" .. tostring(myMainIndex)) or "ALLY"
+            -- me=vai trò | cur=main stt1 | st=status main(tuổi cache) | ss=cùng/khác server
+            -- | i=UpgradeRace Check | d=khoảng cách cửa + nguồn(R/B/X)
+            SyncDbg:SetDesc(("me=%s cur=%s st=%s(%ss) ss=%s i=%s d=%s%s dn=%s"):format(
+                me, tostring(cur):sub(1, 12),
+                tostring(c and c.status or "?"),
+                c and string.format("%.0f", tick() - c.t) or "?",
+                _G.lastSameSrv and "same" or "diff",
+                tostring(_G.lastRaceI),
+                tostring(_G.lastDoorDist and math.floor(_G.lastDoorDist) or "?"),
+                tostring(_G.lastDoorSrc or "?"),
+                tostring(_G.lastDoorName or "?")))
+        end)
+    end
+end)
+
 -- live status loop
 spawn(function()
     while wait() do
@@ -2611,6 +2689,105 @@ for idx, vl in pairs(getgenv().Config["Allies"]) do
         end
     end)
 end
+
+-- =================== PAGE: DEBUG (đèn xanh/đỏ + LOG cuộn 200 dòng) ===================
+local debugPage = CreatePage("Debug")
+
+-- đèn chỉ báo: cập nhật TẠI CHỖ (xanh=ok / đỏ=lỗi) → KHÔNG spam log
+local function IndicatorRow(order, labelText)
+    local f = addCard(debugPage, order, 30)
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.new(0, 12, 0, 12); dot.Position = UDim2.new(0, 12, 0.5, -6)
+    dot.BackgroundColor3 = Color3.fromRGB(110, 116, 140); dot.BorderSizePixel = 0; dot.Parent = f
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -36, 1, 0); t.Position = UDim2.new(0, 32, 0, 0)
+    t.BackgroundTransparency = 1; t.Text = labelText; t.TextColor3 = Color3.fromRGB(220, 225, 240)
+    t.TextXAlignment = Enum.TextXAlignment.Left; t.Font = Enum.Font.Gotham; t.TextSize = 12
+    t.TextTruncate = Enum.TextTruncate.AtEnd; t.Parent = f
+    return function(ok, txt)
+        dot.BackgroundColor3 = ok and Color3.fromRGB(60, 205, 115) or Color3.fromRGB(235, 75, 85)
+        if txt then t.Text = txt end
+    end
+end
+
+local setLoop = IndicatorRow(1, "Loop")
+local setNet  = IndicatorRow(2, "Net")
+local setSrv  = IndicatorRow(3, "Server")
+local setDoor = IndicatorRow(4, "Door")
+local setMain = IndicatorRow(5, "Main stt1")
+
+spawn(function()
+    while wait(0.4) do
+        pcall(function()
+            local alive = _G.loopLastT and (tick() - _G.loopLastT) < 2
+            setLoop(alive == true, "Loop: " .. (alive and ("alive #" .. tostring(_G.loopTick or 0)) or "STALL!"))
+            local g, p = _G.netGetOk, _G.netPostOk
+            setNet(g and p == true, "Net: GET " .. (g and "OK" or "FAIL")
+                .. " | POST " .. (p == nil and "N/A(no req)" or (p and "OK" or "FAIL")))
+            setSrv(_G.lastSameSrv == true, "Server: " .. (_G.lastSameSrv and "SAME (cùng main)" or "DIFF (khác)"))
+            local atDoor = _G.lastDoorDist and _G.lastDoorDist < 150
+            setDoor(atDoor == true, "Door: d=" .. tostring(_G.lastDoorDist and math.floor(_G.lastDoorDist) or "?")
+                .. tostring(_G.lastDoorSrc or "?") .. " " .. tostring(_G.lastDoorName or "?"))
+            local cur = getCurrentMainBeingUpgraded()
+            local c = cur and statusCache[cur]
+            setMain(c ~= nil, "Main1: " .. tostring(cur):sub(1, 12) .. " = " .. tostring(c and c.status or "?"))
+        end)
+    end
+end)
+
+-- LOG box: ScrollingFrame lồng cao 286px, cuộn riêng 200 dòng, tô màu theo level
+local logSF
+do
+    local box = addCard(debugPage, 6, 286)
+    local hl = Instance.new("TextLabel")
+    hl.Size = UDim2.new(1, -16, 0, 18); hl.Position = UDim2.new(0, 10, 0, 4)
+    hl.BackgroundTransparency = 1; hl.Text = "📜 LOG (tối đa 200 dòng · cuộn ↕)"
+    hl.TextColor3 = Color3.fromRGB(150, 200, 255); hl.TextXAlignment = Enum.TextXAlignment.Left
+    hl.Font = Enum.Font.GothamBold; hl.TextSize = 11; hl.Parent = box
+    logSF = Instance.new("ScrollingFrame")
+    logSF.Size = UDim2.new(1, -12, 1, -28); logSF.Position = UDim2.new(0, 6, 0, 24)
+    logSF.BackgroundColor3 = Color3.fromRGB(10, 12, 18); logSF.BackgroundTransparency = 0.3
+    logSF.BorderSizePixel = 0; logSF.ScrollBarThickness = 5
+    logSF.ScrollBarImageColor3 = Color3.fromRGB(120, 160, 240)
+    logSF.CanvasSize = UDim2.new(0, 0, 0, 0); logSF.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    logSF.Parent = box
+    Instance.new("UICorner", logSF).CornerRadius = UDim.new(0, 8)
+    local lay = Instance.new("UIListLayout", logSF)
+    lay.SortOrder = Enum.SortOrder.LayoutOrder; lay.Padding = UDim.new(0, 1)
+    local pad = Instance.new("UIPadding", logSF)
+    pad.PaddingLeft = UDim.new(0, 6); pad.PaddingRight = UDim.new(0, 6)
+    pad.PaddingTop = UDim.new(0, 4); pad.PaddingBottom = UDim.new(0, 4)
+end
+local logLabels = {}   -- seq -> TextLabel
+spawn(function()
+    while wait(0.4) do
+        pcall(function()
+            local present = {}
+            for _, e in ipairs(_G.dbgLog) do
+                present[e.seq] = true
+                if not logLabels[e.seq] then
+                    local lb = Instance.new("TextLabel")
+                    lb.Size = UDim2.new(1, -4, 0, 0); lb.AutomaticSize = Enum.AutomaticSize.Y
+                    lb.BackgroundTransparency = 1; lb.LayoutOrder = e.seq
+                    lb.Font = Enum.Font.Code; lb.TextSize = 11; lb.TextWrapped = true
+                    lb.TextXAlignment = Enum.TextXAlignment.Left; lb.Text = e.text
+                    lb.TextColor3 = (e.level == "ok" and Color3.fromRGB(80, 210, 120))
+                        or (e.level == "err" and Color3.fromRGB(235, 80, 90))
+                        or Color3.fromRGB(190, 198, 215)
+                    lb.Parent = logSF
+                    logLabels[e.seq] = lb
+                end
+            end
+            for seq, lb in pairs(logLabels) do
+                if not present[seq] then lb:Destroy(); logLabels[seq] = nil end
+            end
+            -- auto-cuộn xuống đáy NẾU đang ở gần đáy; nếu user cuộn lên đọc thì GIỮ nguyên
+            local nb = logSF.CanvasPosition.Y >= (logSF.AbsoluteCanvasSize.Y - logSF.AbsoluteWindowSize.Y - 24)
+            if nb then logSF.CanvasPosition = Vector2.new(0, logSF.AbsoluteCanvasSize.Y) end
+        end)
+    end
+end)
 
 selectTab("Main")
 
