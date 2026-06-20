@@ -433,37 +433,46 @@ local function fetchJobLive(accName)
     return nil
 end
 
--- Warmer SONG SONG: nóng statusCache cho TẤT CẢ main cùng lúc (mỗi main 1 thread) → 1 vòng =
--- độ trễ 1 request, KHÔNG cộng dồn. Rồi đọc jobid của main stt1. Cache luôn tươi (~0.7s) →
--- getMainStatus/isSameServerAsMain trong vòng chính CHỈ đọc cache → hết STALL, hết nhận diện sai.
+-- ===== NGUỒN CHỐT THỨ TỰ MAIN do SERVER trả (web là trọng tài) =====
+-- Trả: order (mảng tên main đã xếp), current (tên main stt1). MỌI account đọc cái này → đồng nhất,
+-- hết cảnh mỗi con tự tính getMainOrder cục bộ ra stt1 khác nhau ("detect main linh tinh").
+local function fetchCurMainLive()
+    if Net.raw then
+        local ok, _, body = Net.raw("GET", BASE_URL .. "/curmain", nil)
+        if ok and body then
+            local good, res = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
+            if good and res and type(res.order) == "table" then
+                return res   -- nguyên bảng: order, current, current_jobid, current_time, mains[]
+            end
+        end
+    end
+    return nil
+end
+
+-- Warmer: CHỈ 1 request /curmain mỗi ~0.7s → lấy order (web chốt) + status MỌI main + jobid main stt1.
+-- KHÔNG còn fetch status từng main (trước đây N main = N request/con/vòng → 100 main = bùng request).
+-- Giờ tải PHẲNG: 1 request/con/vòng bất kể 2 hay 100 main. getMainStatus/isSameServerAsMain đọc cache.
 spawn(function()
     while true do
         pcall(function()
-            local mains = (getgenv().Config and getgenv().Config["MainAccount"]) or {}
-            local pending = #mains
-            for _, nm in ipairs(mains) do
-                if nm == myName then
-                    -- self: status do setMyMainStatus quản lý CỤC BỘ → KHÔNG để warmer ghi đè bằng
-                    -- giá trị server CŨ (tránh flip training→waiting nhấp nháy lúc POST chưa land →
-                    -- rotation bị giật). Server vẫn nhận status mình qua POST /mainstatus.
-                    pending = pending - 1
-                else
-                    spawn(function()
-                        pcall(function()
-                            local st = fetchMainStatusLive(nm)
-                            if st ~= nil then statusCache[nm] = { t = tick(), status = st } end
-                        end)
-                        pending = pending - 1
-                    end)
+            local data = fetchCurMainLive()
+            if data and type(data.order) == "table" then
+                _G.srvMainOrder = data.order
+                _G.srvCurMain = data.current
+                -- nóng statusCache cho TẤT CẢ main từ 1 response (TRỪ chính mình — self do
+                -- setMyMainStatus quản lý cục bộ, không để server cũ ghi đè gây nhấp nháy rotation).
+                if type(data.mains) == "table" then
+                    for _, m in ipairs(data.mains) do
+                        if m.name and m.name ~= myName then
+                            statusCache[m.name] = { t = tick(), status = m.status or "waiting" }
+                        end
+                    end
                 end
-            end
-            local t0 = tick()
-            while pending > 0 and (tick() - t0) < 3 do wait(0.05) end
-            -- jobid của main đang tới lượt (để ally biết hop đi đâu) — 1 request
-            local cur = getCurrentMainBeingUpgraded()
-            if cur then
-                local jb, tm = fetchJobLive(cur)
-                if jb then mainJobCache[cur] = { jobid = jb, time = tm, t = tick() } end
+                -- jobid main stt1 (ally cần để biết hop đi đâu) — đã kèm trong /curmain, khỏi gọi riêng
+                local curr = data.current
+                if curr and curr ~= myName and data.current_jobid and data.current_jobid ~= "" then
+                    mainJobCache[curr] = { jobid = data.current_jobid, time = data.current_time or 0, t = tick() }
+                end
             end
         end)
         wait(0.7)
@@ -1114,6 +1123,9 @@ end
 -- nó tự xuống cuối → main kế lên stt1; main sau lại tụt 1 bậc (Main3 → Main2...).
 -- ============================================================
 function getMainOrder()
+    -- ƯU TIÊN order do SERVER chốt (đồng nhất MỌI account → hết "detect main linh tinh").
+    -- Chưa lấy được (mới load, warmer chưa chạy) → tính cục bộ TẠM cho khỏi nil.
+    if _G.srvMainOrder and #_G.srvMainOrder > 0 then return _G.srvMainOrder end
     local mains = getgenv().Config["MainAccount"] or {}
     local active, waiting, finished = {}, {}, {}
     for _, name in ipairs(mains) do
@@ -1147,6 +1159,8 @@ end
 
 -- Main đang ở "stt1" (tới lượt được trial). Trả (name, 1).
 function getCurrentMainBeingUpgraded()
+    -- main stt1 do SERVER chốt; chưa có → suy từ getMainOrder (đã ưu tiên server bên trong)
+    if _G.srvCurMain then return _G.srvCurMain, 1 end
     local order = getMainOrder()
     if #order == 0 then return nil, nil end
     return order[1], 1
