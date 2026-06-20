@@ -23,7 +23,7 @@ getgenv().Settings = getgenv().Settings or {
 getgenv().HOP_CONFIG = getgenv().HOP_CONFIG or {
     MaxPlayers    = 7,     -- chỉ hop vào server < N người (nil = bỏ qua)
     ForcedRegion  = nil,   -- "US" / "EU" / "AP" (nil = bỏ qua)
-    HopCooldown   = 3,     -- giây tối thiểu giữa 2 lần hop (chống spam teleport)
+    HopCooldown   = 2,     -- giây tối thiểu giữa 2 lần hop (chống spam teleport)
     CacheDuration = 60,    -- giây cache danh sách server
     MaxPages      = 100,   -- số trang tối đa khi lấy danh sách server
     Verbose       = false, -- true = in log hop chi tiết
@@ -111,10 +111,8 @@ task.spawn(function()
     end, function(err) warn("[Team]", err) end)
 end)
 
-repeat task.wait(2) until Character
-    and Character:FindFirstChild("HumanoidRootPart")
-    and Character:FindFirstChildWhichIsA("Humanoid")
-    and Character:IsDescendantOf(workspace:FindFirstChild("Characters") or workspace)
+-- LƯU Ý: đoạn "chờ nhân vật spawn" được dời xuống SAU khi tạo UI
+-- (tránh kẹt luồng chính khiến UI không bao giờ hiện).
 
 -- ==========================================
 -- [ HELPER FUNCTIONS ]
@@ -530,11 +528,13 @@ end)
 -- ==========================================
 -- [ UI ]
 -- ==========================================
-if services.CoreGui:FindFirstChild("VFAndSA_UI") then services.CoreGui.VFAndSA_UI:Destroy() end
+local guiParent = (gethui and gethui()) or services.CoreGui
+if guiParent:FindFirstChild("VFAndSA_UI") then guiParent.VFAndSA_UI:Destroy() end
 
-local ScreenGui = Instance.new("ScreenGui", services.CoreGui)
+local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "VFAndSA_UI"
 ScreenGui.ResetOnSpawn = false
+pcall(function() ScreenGui.Parent = guiParent end)
 
 local MainFrame = Instance.new("Frame", ScreenGui)
 MainFrame.Size = UDim2.new(0, 300, 0, 175); MainFrame.Position = UDim2.new(0.5, -150, 0.5, -87)
@@ -612,8 +612,23 @@ services.UserInputService.InputBegan:Connect(function(input, gpe)
     if not gpe and input.KeyCode == Enum.KeyCode.LeftAlt then MainFrame.Visible = not MainFrame.Visible end
 end)
 
-SetStatus("Status: Checking Fragment...", Color3.fromRGB(0, 150, 255))
 print("[VFAndSA] ✅ Loaded | LeftAlt ẩn/hiện")
+
+-- Chờ nhân vật sẵn sàng — CÓ TIMEOUT 90s để KHÔNG bao giờ kẹt cứng luồng
+do
+    SetStatus("Đợi nhân vật spawn...", Color3.fromRGB(0, 150, 255))
+    local t0 = tick()
+    repeat task.wait(0.5) until (Character
+        and Character:FindFirstChild("HumanoidRootPart")
+        and Character:FindFirstChildWhichIsA("Humanoid")
+        and Character:IsDescendantOf(workspace:FindFirstChild("Characters") or workspace))
+        or (tick() - t0 > 90)
+    if not (Character and Character:FindFirstChild("HumanoidRootPart")) then
+        warn("[VFAndSA] Hết 90s chờ nhân vật — vẫn chạy tiếp (có thể cần chọn team thủ công)")
+    end
+end
+
+SetStatus("Status: Checking Fragment...", Color3.fromRGB(0, 150, 255))
 
 -- ==========================================
 -- [ CHECK FRAGMENT (farm Katakuri tới 5000) ]
