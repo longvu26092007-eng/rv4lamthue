@@ -2,12 +2,20 @@
 -- dính bản module_bf.lua lỗi (tween leak / noclip loadstring mỗi frame).
 pcall(function() if isfile and isfile("kaitun_module_bf.lua") and delfile then delfile("kaitun_module_bf.lua") end end)
 
+-- ĐỢI CLIENT LOAD XONG HẲN trước khi làm gì (quan trọng SAU KHI HOP SERVER: instance mới
+-- phải load đủ mới chọn team + chạy script; nếu không sẽ "chọn được team mà script không chạy").
+if not game:IsLoaded() then game.Loaded:Wait() end
+-- timeout 30s: LoadingScreen kẹt / service thiếu sẽ KHÔNG treo vĩnh viễn (mọi remote sau đã qua safeInvoke)
+local _bootT0 = tick()
 repeat
     task.wait(0.1)
-until game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
+until (game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")) or (tick() - _bootT0) > 30
 
 if workspace:GetAttribute("MAP") and workspace:GetAttribute("MAP") ~= "Sea3" then
-    game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("TravelZou")
+    -- bọc thread con: InvokeServer YIELD được → tránh treo lúc load nếu server chậm
+    task.spawn(function()
+        pcall(function() game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("TravelZou") end)
+    end)
 end
 if not isfile("cache_v4.json") then
     writefile("cache_v4.json", "{}")
@@ -210,6 +218,8 @@ do
     end
     for _ = 1, 4 do task.spawn(worker) end
 
+    -- mở rawRequest ra để net-probe đo GET/POST đồng bộ (single-shot) cho panel chẩn đoán
+    Net.raw = rawRequest
     Net.log("INFO", "Net init — hasReq=" .. tostring(Net.hasReq))
 end
 
@@ -282,47 +292,174 @@ function setMyMainStatus(statusStr)
     Net.postJSON(BASE_URL .. "/mainstatus?name=" .. myName, { status = statusStr }, "mainstatus")
 end
 
+-- Báo status lên server cho BẤT KỲ account nào (kể cả ALLY — không cần myMainIndex) → dashboard/đồng bộ
+-- detect được "đang làm trial". Dùng cho IN-TRIAL latch của ally.
+function reportStatus(statusStr)
+    statusCache[myName] = { t = tick(), status = statusStr }
+    Net.postJSON(BASE_URL .. "/mainstatus?name=" .. myName, { status = statusStr }, "mainstatus")
+end
+
 local function fetchMainStatusLive(accName)
+    -- 1-SHOT qua Net.raw → KHÔNG qua semaphore GET (max 4) và KHÔNG retry-storm của getJSON.
+    -- (Trước đây getJSON 3-retry + semaphore → hot-path block làm CẠN slot → warmer bị đói →
+    --  statusCache cũ → nhận diện SAI main #1. Đây là gốc của "ally thấy Clifford=waiting".)
+    if Net.raw then
+        local ok, _, body = Net.raw("GET", BASE_URL .. "/mainstatus?name=" .. accName, nil)
+        if ok and body then
+            local good, res = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
+            if good and res and res["data"] and res["data"]["status"] then return res["data"]["status"] end
+        end
+        return nil
+    end
     local res = Net.getJSON(BASE_URL .. "/mainstatus?name=" .. accName, 0)
     if res and res["data"] and res["data"]["status"] then return res["data"]["status"] end
     return nil
 end
+-- HOT-PATH AN TOÀN: KHÔNG fetch đồng bộ ở đây nữa. game:HttpGet / request YIELD luồng gọi;
+-- nếu backend chậm / executor KHÔNG tới được api → vòng chính KẸT NGAY TẠI getMainStatus,
+-- TRƯỚC cả status() đầu tiên → panel đứng mãi ở "Đang khởi động...". Giờ chỉ đọc statusCache
+-- (đã được warmer nền + setMyMainStatus cập nhật liên tục). Cache rỗng → "waiting".
 function getMainStatus(accName)
     local c = statusCache[accName]
-    if c and (tick() - c.t) < STATUS_TTL then return c.status end
-    local st = fetchMainStatusLive(accName)
-    if st == nil then
-        -- FIX: lỗi mạng KHÔNG trả "waiting" (gây logic nhảy lung tung) → giữ giá trị cũ.
-        if c then return c.status end
-        return "waiting"
-    end
-    statusCache[accName] = { t = tick(), status = st }
-    return st
+    if c then return c.status end
+    return "waiting"
 end
+
+-- Cờ "còn sống": tắt khi account rời game → mọi vòng nền tự dừng, không gửi nữa.
+local ALIVE = true
 
 -- Heartbeat: báo server account còn sống (qua hàng đợi, coalesce).
 function sendHeartbeat()
+    if not ALIVE then return end
     Net.postJSON(BASE_URL .. "/heartbeat?name=" .. myName, { role = myRole }, "heartbeat")
+end
+
+-- Báo server account OUT → server xoá NGAY (không chờ prune 30s).
+-- Gửi cả POST (qua queue) lẫn GET đồng bộ (chắc tới được trong lúc teardown,
+-- vì queue/worker có thể chưa kịp flush khi instance bị huỷ).
+local offlineSent = false
+function sendOffline()
+    if offlineSent then return end
+    offlineSent = true
+    ALIVE = false
+    pcall(function() Net.postJSON(BASE_URL .. "/offline?name=" .. myName, { role = myRole }, "offline") end)
+    pcall(function() Net.getRaw(BASE_URL .. "/offline?name=" .. myName) end)
 end
 
 -- Vòng nền gửi heartbeat mỗi 5s (server prune ngưỡng 30s → chịu được vài lần rớt)
 spawn(function()
-    while true do
+    while ALIVE do
         sendHeartbeat()
+        for _ = 1, 5 do
+            if not ALIVE then break end
+            wait(1)
+        end
+    end
+end)
+
+-- ============================================================
+-- [NET PROBE] Chẩn đoán mạng TỪ TRONG EXECUTOR → hiện thẳng lên panel.
+--   • req=true/false : executor có hàm request không (POST cần cái này).
+--   • GET  OK/FAIL <ms> : gọi GET /timeserver có tới backend không + độ trễ.
+--   • POST OK/FAIL <ms> : gọi POST /heartbeat (đúng cái dùng đồng bộ) có tới không.
+-- Nếu req=false hoặc POST FAIL → server thấy online:0 = bot KHÔNG đồng bộ được.
+-- ============================================================
+_G.netDiag = "NET: đang kiểm tra…"
+spawn(function()
+    local HS = game:GetService("HttpService")
+    while true do
+        pcall(function()
+            if not Net.raw then _G.netDiag = "NET: thiếu Net.raw"; return end
+            local g0 = tick()
+            local gok = Net.raw("GET", BASE_URL .. "/timeserver", nil)
+            local gms = math.floor((tick() - g0) * 1000)
+            local pok, pms = nil, 0
+            if Net.hasReq then
+                local p0 = tick()
+                pok = Net.raw("POST", BASE_URL .. "/heartbeat?name=" .. myName, HS:JSONEncode({ role = myRole }))
+                pms = math.floor((tick() - p0) * 1000)
+            end
+            _G.netGetOk = gok and true or false
+            _G.netPostOk = Net.hasReq and (pok and true or false) or nil
+            _G.netDiag = ("req=%s | GET %s %dms | POST %s"):format(
+                tostring(Net.hasReq),
+                gok and "OK" or "FAIL", gms,
+                Net.hasReq and ((pok and "OK " or "FAIL ") .. pms .. "ms") or "N/A (thiếu request)")
+        end)
         wait(5)
     end
 end)
 
--- Warmer: làm nóng statusCache nền (rải đều) → getMainStatus trong vòng logic chỉ hit cache.
+-- Phát hiện account RỜI GAME THẬT → báo offline. QUAN TRỌNG: ĐỔI SERVER (hop fullmoon/
+-- teleport) KHÔNG tính offline — báo offline lúc hop sẽ xoá account khỏi stt1 làm LỆCH đồng bộ.
+-- Hop chỉ teleport rồi join lại, heartbeat tiếp tục ở server mới (<30s); rớt thật thì prune lo.
+local teleporting = false
+do
+    local Players = game:GetService("Players")
+    local LP = Players.LocalPlayer
+    -- đánh dấu đang teleport (hop server) → chặn offline trong lúc này
+    pcall(function()
+        LP.OnTeleport:Connect(function(state)
+            if state == Enum.TeleportState.Started or state == Enum.TeleportState.InProgress then
+                teleporting = true
+            elseif state == Enum.TeleportState.Failed or state == Enum.TeleportState.Cancelled then
+                teleporting = false   -- hop hỏng → cho phép offline nếu sau đó rời thật
+            end
+        end)
+    end)
+    -- chính mình rời server (quit thật) — BỎ QUA nếu đang teleport (hop)
+    Players.PlayerRemoving:Connect(function(plr)
+        if plr == LP and not teleporting then sendOffline() end
+    end)
+    -- đóng instance (đóng tab/kill) — cũng bỏ qua nếu đang teleport
+    pcall(function() game:BindToClose(function()
+        if not teleporting then sendOffline() end
+    end) end)
+end
+
+-- mainJobCache: name -> { jobid, time, t } — jobid của main do warmer đọc nền → isSameServerAsMain
+-- đọc CACHE (không gọi mạng, không block vòng chính).
+mainJobCache = mainJobCache or {}
+local function fetchJobLive(accName)
+    if Net.raw then
+        local ok, _, body = Net.raw("GET", BASE_URL .. "/noguchi?name=" .. accName, nil)
+        if ok and body then
+            local good, res = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
+            if good and res and res["data"] and res["data"]["jobid"] then
+                return res["data"]["jobid"], res["data"]["time"] or 0
+            end
+        end
+    end
+    return nil
+end
+
+-- Warmer SONG SONG: nóng statusCache cho TẤT CẢ main cùng lúc (mỗi main 1 thread) → 1 vòng =
+-- độ trễ 1 request, KHÔNG cộng dồn. Rồi đọc jobid của main stt1. Cache luôn tươi (~0.7s) →
+-- getMainStatus/isSameServerAsMain trong vòng chính CHỈ đọc cache → hết STALL, hết nhận diện sai.
 spawn(function()
     while true do
-        local mains = (getgenv().Config and getgenv().Config["MainAccount"]) or {}
-        for _, nm in ipairs(mains) do
-            local st = fetchMainStatusLive(nm)
-            if st ~= nil then statusCache[nm] = { t = tick(), status = st } end
-            wait(0.15)
-        end
-        wait(1.5)
+        pcall(function()
+            local mains = (getgenv().Config and getgenv().Config["MainAccount"]) or {}
+            local pending = #mains
+            for _, nm in ipairs(mains) do
+                spawn(function()
+                    pcall(function()
+                        local st = fetchMainStatusLive(nm)
+                        if st ~= nil then statusCache[nm] = { t = tick(), status = st } end
+                    end)
+                    pending = pending - 1
+                end)
+            end
+            local t0 = tick()
+            while pending > 0 and (tick() - t0) < 3 do wait(0.05) end
+            -- jobid của main đang tới lượt (để ally biết hop đi đâu) — 1 request
+            local cur = getCurrentMainBeingUpgraded()
+            if cur then
+                local jb, tm = fetchJobLive(cur)
+                if jb then mainJobCache[cur] = { jobid = jb, time = tm, t = tick() } end
+            end
+        end)
+        wait(0.7)
     end
 end)
 
@@ -362,6 +499,36 @@ end)
 
 local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
+-- ============================================================
+-- [SAFE INVOKE] Gọi RemoteFunction KHÔNG để treo luồng. InvokeServer tới RemoteFunction
+-- YIELD luồng gọi tới khi server trả lời — nếu handler server-side treo (account vừa
+-- join / đang load, Data chưa sẵn) thì luồng KẸT VĨNH VIỄN. pcall KHÔNG cứu được (chỉ
+-- bắt error, không bắt yield). Đây là nguyên nhân treo "Đang khởi động".
+-- safeInvoke chạy InvokeServer trong thread con, chờ tối đa `timeout`s → loop luôn đi tiếp.
+-- Trả: ok(bool), r1, r2, ...  (hết giờ → ok=false).
+-- ============================================================
+local function _resolveCommF()
+    local rs = game:GetService("ReplicatedStorage")
+    local rem = rs:FindFirstChild("Remotes") or rs:WaitForChild("Remotes", 10)
+    return rem and (rem:FindFirstChild("CommF_") or rem:WaitForChild("CommF_", 10)) or nil
+end
+local _CommF = _resolveCommF()
+local function safeInvoke(timeout, ...)
+    if not _CommF then _CommF = _resolveCommF() end
+    if not _CommF then return false end
+    local args = table.pack(...)
+    local done, packed = false, nil
+    task.spawn(function()
+        packed = table.pack(pcall(function()
+            return _CommF:InvokeServer(table.unpack(args, 1, args.n))
+        end))
+        done = true
+    end)
+    local t0 = tick()
+    while not done and (tick() - t0) < timeout do task.wait() end
+    if not done or not packed then return false end
+    return table.unpack(packed, 1, packed.n)
+end
 -- ============================================================
 -- [MODULE] Bản module_bf NHÚNG THẲNG (không tải GitHub) — đã FIX:
 --   • topos: HỦY tween cũ trước khi tạo mới (hết chồng tween + memory leak + giật),
@@ -414,7 +581,7 @@ do
         if not v36 then pcall(function() LP.Character.Humanoid.Sit = false end) end
         if _activeTween then pcall(function() _activeTween:Cancel(); _activeTween:Destroy() end); _activeTween = nil end
         local dist = (hrp.Position - targetCFrame.Position).Magnitude
-        local dur = math.clamp(dist / 300, 0.05, 4)                 -- clamp chống tween vô tận
+        local dur = math.clamp(dist / 200, 0.05, 4)                 -- 200 studs/s (bay chậm hơn) + clamp chống tween vô tận
         local tw = TweenS:Create(hrp,
             TweenInfo.new(dur, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
             { CFrame = targetCFrame })
@@ -437,7 +604,7 @@ do
 
     function module:tele(v)
         pcall(function()
-            game:GetService("ReplicatedStorage").__ServerBrowser:InvokeServer("teleport", v or game.JobId)
+            game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", v or game.JobId)
         end)
     end
 
@@ -495,8 +662,13 @@ end
 local topofgreattree = CFrame.new(3035.15137, 2281.15918, -7325.19189, 0.0284484141, 2.19495124e-08, 0.999595284,
     -3.29094476e-08, 1, -2.10217994e-08, -0.999595284, -3.22980895e-08, 0.0284484141)
 
+local _doorCache = {}
 function getdoor(vv)
     vv = vv or game:GetService("Players").LocalPlayer.Data.Race.Value
+    -- CACHE: tìm được Entrance 1 lần thì NHỚ → chống streaming chớp nil (đang đứng ở cửa mà
+    -- FindFirstChild lỡ trả nil → "ở cửa vẫn ghi false"). Cache hết hiệu lực khi part bị huỷ.
+    local cached = _doorCache[vv]
+    if cached and cached.Parent then return cached end
     -- FIX: không dùng WaitForChild (treo vô hạn nếu corridor chưa load) → FindFirstChild an toàn
     local temple = workspace.Map:FindFirstChild("Temple of Time")
     if not temple then return nil end
@@ -504,7 +676,9 @@ function getdoor(vv)
     if not corridor then return nil end
     local door = corridor:FindFirstChild("Door")
     if not door then return nil end
-    return door:FindFirstChild("Entrance")
+    local entrance = door:FindFirstChild("Entrance")
+    if entrance then _doorCache[vv] = entrance end
+    return entrance
 end
 
 function getdis(...)
@@ -549,6 +723,37 @@ function goToMyDoor()
     return getdis(door.CFrame) <= 150
 end
 
+-- ============================================================
+-- TEMPLE OF TIME — AN TOÀN, CHỐNG ĐƠ/CRASH.
+-- Trước đây: reparent CẢ MODEL "Temple of Time" từ MapStash vào Map MỖI 0.35s + đọc thô
+-- workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency. Reparent model lớn
+-- client-side lặp liên tục = ĐƠ/CRASH (nặng hơn khi nhiều account 1 máy); đọc thô = ném lỗi
+-- nếu game đổi cấu trúc. Sửa: THROTTLE reparent 5s + pcall, đọc forcefield bằng FindFirstChild.
+-- Trả: "loading" (chưa vào Map) | "ffup" (forcefield đóng → khúc kill-player) | "ffdown" (mở → vào trial).
+-- ============================================================
+function templeState()
+    local temple = workspace.Map:FindFirstChild("Temple of Time")
+    if not temple then
+        if not _G.lastTempleReparent or (tick() - _G.lastTempleReparent) > 5 then
+            _G.lastTempleReparent = tick()
+            pcall(function()
+                local stash = game:GetService("ReplicatedStorage"):FindFirstChild("MapStash")
+                local m = stash and stash:FindFirstChild("Temple of Time")
+                if m then m.Parent = workspace.Map end
+            end)
+        end
+        return "loading"
+    end
+    local ff
+    pcall(function()
+        local border = temple:FindFirstChild("FFABorder")
+        local field = border and border:FindFirstChild("Forcefield")
+        if field then ff = field.Transparency end
+    end)
+    if ff == 0 then return "ffup" end
+    return "ffdown"
+end
+
 local pos_plr_trial = {
     CFrame.new(28692.3477, 14887.5605, -53.7669983, 0.707131445, -0, -0.707082093, 0, 1, -0, 0.707082093, 0, 0.707131445),
     CFrame.new(28782.7246, 14898.9902, -59.6069946, 0.707134247, 0, 0.707079291, 0, 1, 0, -0.707079291, 0, 0.707134247),
@@ -567,15 +772,25 @@ local race_abilities = {
     ["Cyborg"] = "Energy Core",
     ["Draco"] = "Primordial Reign"
 }
-local races_trial_place = {
-    ["Human"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of Strength"),
-    ["Mink"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of Speed"),
-    ["Fishman"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of Water"),
-    ["Skypiea"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of the King"),
-    ["Ghoul"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of Carnage"),
-    ["Cyborg"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of the Machine"),
-    ["Draco"] = workspace._WorldOrigin.Locations:WaitForChild("Trial of Flames")
+-- FIX: KHÔNG dựng sẵn bằng WaitForChild (không timeout → treo VĨNH VIỄN lúc load nếu
+-- location chưa stream). Lazy getter + cache, dùng FindFirstChild → trả nil khi chưa load
+-- (mọi nơi dùng đã nil-guard sẵn → vòng sau tự lấy lại).
+local RACE_TRIAL_NAME = {
+    ["Human"] = "Trial of Strength", ["Mink"] = "Trial of Speed", ["Fishman"] = "Trial of Water",
+    ["Skypiea"] = "Trial of the King", ["Ghoul"] = "Trial of Carnage",
+    ["Cyborg"] = "Trial of the Machine", ["Draco"] = "Trial of Flames",
 }
+local _raceTrialCache = {}
+local function getRaceTrialPlace(race)
+    local c = _raceTrialCache[race]
+    if c and c.Parent then return c end
+    local wo = workspace:FindFirstChild("_WorldOrigin")
+    local loc = wo and wo:FindFirstChild("Locations")
+    local nm = RACE_TRIAL_NAME[race]
+    local p = (loc and nm) and loc:FindFirstChild(nm) or nil
+    if p then _raceTrialCache[race] = p end
+    return p
+end
 
 -- ============================================================
 -- [TRIAL] Làm trial theo từng tộc — ƯU TIÊN kkv4 (Ceiling/Floor + loop Enemies/SeaBeasts),
@@ -587,7 +802,7 @@ local races_trial_place = {
 function doTrialForMyRace()
     local LP = game.Players.LocalPlayer
     local myrace = LP.Data.Race.Value
-    local race_trial_place = races_trial_place[myrace]
+    local race_trial_place = getRaceTrialPlace(myrace)
     local function tp(cf) pcall(function() module:topos(cf) end) end  -- teleport thô (không tự kill)
     -- BAY TỪ TỪ tới cf (tween mượt). KaitunV4 KHÔNG có Tween2/BKP → tự dựng bằng TweenService.
     -- module:noclip(return true) đã bật sẵn nên xuyên vật cản khi bay.
@@ -596,10 +811,10 @@ function doTrialForMyRace()
             local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
             if not hrp then return end
             local dist = (cf.Position - hrp.Position).Magnitude
-            local dur = math.clamp(dist / 325, 0.05, 4)   -- 325 studs/s, cap 4s tránh kẹt
+            local dur = math.clamp(dist / 200, 0.05, 4)   -- 200 studs/s, cap 4s tránh kẹt
             local tw = game:GetService("TweenService"):Create(
                 hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = cf })
-            tw:Play(); wait(dur)
+            tw:Play(); wait(dur); pcall(function() tw:Destroy() end)  -- destroy → hết leak
         end)
     end
     local function equipMelee()  -- cầm vũ khí Melee (fallback: Sword/Blox Fruit/Gun)
@@ -696,7 +911,7 @@ function doTrialForMyRace()
                     local t0 = tick()
                     repeat wait()
                         if not LP.Backpack:FindFirstChild("Sharkman Karate") then
-                            game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("BuySharkmanKarate")
+                            safeInvoke(3, "BuySharkmanKarate")
                         end
                         tp(v.HumanoidRootPart.CFrame * CFrame.new(0, 500, 0))
                         _G.SHOULDSPAMSKILLS = true
@@ -711,7 +926,7 @@ end
 -- Gộp dispatch "đang trong khu trial → làm trial; chưa → lên cửa đợi" dùng chung MAIN & ALLY
 -- (trước đây 2 nhánh copy-paste, sửa lệch dễ sinh bug). isMain: set status in_trail cho main.
 function runTrialPhase(roleName, isMain)
-    local race_trial_place = races_trial_place[game.Players.LocalPlayer.Data.Race.Value]
+    local race_trial_place = getRaceTrialPlace(game.Players.LocalPlayer.Data.Race.Value)
     if race_trial_place and getdis(race_trial_place.CFrame) < 1500 then
         if isMain then
             local st = getMainStatus(myName)
@@ -800,41 +1015,37 @@ function trialable()
     if not game.Players.LocalPlayer.Character:FindFirstChild("RaceTransformed") then
         -- vẫn hỏi UpgradeRace Check để bắt DONE (i==5) dù chưa transform → tránh con full gear
         -- bị tưởng "tới lượt train/trial".
-        local okI, i5 = pcall(function()
-            return (game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("UpgradeRace", "Check"))
-        end)
+        local okI, i5 = safeInvoke(3, "UpgradeRace", "Check")
         _G.lastRaceI = okI and i5 or "?"   -- debug: hiện i hiện tại
-        if okI and i5 == 5 then return false, "done" end
+        if okI and (i5 == 5 or i5 == 8) then return false, "done" end   -- 5/8 = FULL GEAR
         local abcxyz = checkbackpack(race_abilities[game:GetService("Players").LocalPlayer.Data.Race.Value])
         if abcxyz then return true end
         return false
     end
-    local i, d, f = game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("UpgradeRace", "Check")
+    local ok, i, d, f = safeInvoke(3, "UpgradeRace", "Check")
+    if not ok then _G.lastRaceI = "?"; return false end   -- remote treo/timeout → coi như chưa sẵn sàng
     _G.lastRaceI = i   -- debug: hiện i hiện tại
-    if i == 5 then
-        return false, "done"   -- DONE YOUR RACE = full gear (nâng xong Gear2/3/4)
-    else
-        if i == 6 then
-            return false, d - 2
-        elseif i == 1 or i == 3 then
-            return false
-        elseif i == 2 or i == 4 or i == 7 then
-            if f then
-                local totalfragments = tonumber(f)
-                if game:GetService("Players").LocalPlayer.Data.Fragments.Value >= totalfragments then
-                    game:GetService("ReplicatedStorage")["Remotes"]["CommF_"]:InvokeServer("UpgradeRace", "Buy")
-                else
-                    return false, "raiding"
-                end
+    -- FULL GEAR = i==5 (Full Update) HOẶC i==8 (full gear + còn training sessions) → DONE.
+    if i == 5 or i == 8 then
+        return false, "done"
+    elseif i == 6 then
+        return false, d - 2
+    elseif i == 1 or i == 3 then
+        return false
+    elseif i == 2 or i == 4 or i == 7 then
+        if f then
+            local totalfragments = tonumber(f)
+            if game:GetService("Players").LocalPlayer.Data.Fragments.Value >= totalfragments then
+                safeInvoke(3, "UpgradeRace", "Buy")
+            else
+                return false, "raiding"
             end
-            return false, f
-        elseif i == 0 then
-            return true, d
-        elseif i ~= 8 then
-            return false
-        else
-            return true, 10 - d
         end
+        return false, f
+    elseif i == 0 then
+        return true, d   -- Ready For Trial
+    else
+        return false
     end
 end
 
@@ -848,60 +1059,103 @@ function cachedTrialable()
     return ab, AB
 end
 
-function status(v)
-    -- DEBUG: luôn kèm [i=X] (giá trị UpgradeRace Check mới nhất) để xem trạng thái race thực tế
-    _G.statusnow = tostring(v) .. ((_G.lastRaceI ~= nil) and ("  [i=" .. tostring(_G.lastRaceI) .. "]") or "")
+-- ============================================================
+-- [DEBUG LOG] Ring buffer 200 dòng + CHỐNG SPAM: cùng key trong 15s thì BỎ (không ghi lại).
+--   DBG(msg, level, key): level "ok"=xanh / "err"=đỏ / "info"=xám. key gộp spam (mặc định = msg).
+--   → status() đổi mỗi 0.35s nhưng mỗi nội dung chỉ vào log 1 lần / 15s.
+--   Thứ tần suất cao (loop/net/door/server) KHÔNG vào log — hiện bằng ĐÈN xanh/đỏ ở tab Debug.
+-- ============================================================
+_G.dbgLog = _G.dbgLog or {}
+_G.dbgSeq = _G.dbgSeq or 0
+local _dbgLastKey = {}
+local DBG_MAX, DBG_SPAM_TTL = 200, 15
+function DBG(msg, level, key)
+    key = key or tostring(msg)
+    local t = tick()
+    if _dbgLastKey[key] and (t - _dbgLastKey[key]) < DBG_SPAM_TTL then return end  -- spam <15s → bỏ
+    _dbgLastKey[key] = t
+    _G.dbgSeq = _G.dbgSeq + 1
+    local hm = "--:--:--"
+    pcall(function()
+        local base = (serverNow and serverNow()) or (os and os.time and os.time()) or t
+        local s = math.floor(base + 7 * 3600) % 86400   -- giờ Hà Nội
+        hm = string.format("%02d:%02d:%02d", math.floor(s / 3600), math.floor((s % 3600) / 60), s % 60)
+    end)
+    _G.dbgLog[#_G.dbgLog + 1] = { seq = _G.dbgSeq, text = "[" .. hm .. "] " .. tostring(msg), level = level or "info" }
+    while #_G.dbgLog > DBG_MAX do table.remove(_G.dbgLog, 1) end
 end
 
-function getCurrentMainBeingUpgraded()
-    local mains = getgenv().Config["MainAccount"]
-    if not mains or #mains == 0 then
-        return nil, nil
-    end
-    for i, name in ipairs(mains) do
+function status(v)
+    -- DEBUG: luôn kèm [i=X] (giá trị UpgradeRace Check mới nhất) để xem trạng thái race thực tế
+    _G.statusnow = tostring(v)
+        .. ((_G.lastRaceI ~= nil) and ("  [i=" .. tostring(_G.lastRaceI) .. "]") or "")
+        .. ((_G.lastDoorDist ~= nil) and ("  [d=" .. tostring(math.floor(_G.lastDoorDist)) .. (_G.lastDoorSrc or "?") .. (_G.lastSameSrv and "/same" or "/diff") .. "]") or "")
+    -- đẩy vào Debug log (gộp spam theo nội dung gốc v, 15s/lần)
+    local sv = tostring(v)
+    local lvl = "info"
+    if sv:find("Lỗi") or sv:find("⚠") or sv:find("FAIL") or sv:find("Died") then lvl = "err"
+    elseif sv:find("Doing trial") or sv:find("DONE") or sv:find("Ready") or sv:find("Kill Players") then lvl = "ok" end
+    DBG(sv, lvl, sv)
+end
+
+-- ============================================================
+-- HÀNG ĐỢI ĐỘNG theo "stt":
+--   1) main đang trial (moon/in_trail) → đầu hàng
+--   2) main đang chờ (waiting/"")       → theo thứ tự config
+--   3) main đã xong (done/training)     → đẩy XUỐNG CUỐI
+-- order[1] = main đang ở "stt1" (tới lượt trial). Khi main stt1 chuyển done/training
+-- nó tự xuống cuối → main kế lên stt1; main sau lại tụt 1 bậc (Main3 → Main2...).
+-- ============================================================
+function getMainOrder()
+    local mains = getgenv().Config["MainAccount"] or {}
+    local active, waiting, finished = {}, {}, {}
+    for _, name in ipairs(mains) do
         local st = getMainStatus(name)
         if st == "moon" or st == "in_trail" then
-            return name, i
+            active[#active + 1] = name
+        elseif st == "done" or st == "training" then
+            finished[#finished + 1] = name
+        else -- "waiting" / ""
+            waiting[#waiting + 1] = name
         end
     end
-    for i, name in ipairs(mains) do
-        local st = getMainStatus(name)
-        if st == "waiting" or st == "" then
-            if i == 1 then
-                return name, i
-            else
-                local prevSt = getMainStatus(mains[i - 1])
-                if prevSt == "training" or prevSt == "waiting" or prevSt == "" then
-                    return name, i
-                end
-            end
-        end
+    local order = {}
+    for _, n in ipairs(active) do order[#order + 1] = n end
+    for _, n in ipairs(waiting) do order[#order + 1] = n end
+    for _, n in ipairs(finished) do order[#order + 1] = n end
+    return order
+end
+
+-- stt ĐỘNG (1-based) của 1 main trong hàng đợi; nil nếu không phải main.
+function mainSttOf(name)
+    for i, v in ipairs(getMainOrder()) do
+        if v == name then return i end
     end
-    return mains[1], 1
+    return nil
+end
+
+-- Main đang ở "stt1" (tới lượt được trial). Trả (name, 1).
+function getCurrentMainBeingUpgraded()
+    local order = getMainOrder()
+    if #order == 0 then return nil, nil end
+    return order[1], 1
 end
 
 -- Đọc jobid của main hiện tại → trả (cùng_server?, jobid_của_main).
 -- Dùng cho nhánh ally quyết định: cùng server thì ra cửa, khác server thì hop.
 function isSameServerAsMain(mainName)
     if not mainName then return false, nil end
-    local same, job = false, nil
-    -- RETRY 3 lần: 1 lần đọc /noguchi lỗi/timeout sẽ làm ally KHÔNG lấy được jobid → không hop
-    -- → "lâu lâu chỉ 1 con join theo". Retry để mọi ally đều có jobid main.
-    for attempt = 1, 3 do
-        local data = Net.getJSON(BASE_URL .. "/noguchi?name=" .. mainName, 1)
-        if data and data["data"] and data["data"]["jobid"] then
-            job = data["data"]["jobid"]
-            local time_ = data["data"]["time"] or 0
-            if (gettimeserver() - time_) < 60 and job == game.JobId then same = true end
-            break
-        end
-        wait(0.3)
-    end
-    return same, job
+    -- CACHE-ONLY: đọc mainJobCache (warmer nền cập nhật mỗi ~0.7s). KHÔNG gọi mạng → KHÔNG block
+    -- vòng chính (trước đây 3×retry + getJSON-retry = block tới ~vài giây → STALL + không hop).
+    local c = mainJobCache and mainJobCache[mainName]
+    if not c or not c.jobid then return false, nil end
+    local fresh = (gettimeserver() - (c.time or 0)) < 60
+    local same = fresh and (c.jobid == game.JobId)
+    return same, c.jobid
 end
 
 function checkgear()
-    local dt = game.ReplicatedStorage.Remotes.CommF_:InvokeServer("TempleClock", "Check")
+    local _okcg, dt = safeInvoke(3, "TempleClock", "Check")
     if dt then
         if dt.HadPoint then
             local g1, g2, g3 = getgenv().Config["Gear"]:match("^(.-)%-(.-)%-(.-)$")
@@ -912,11 +1166,11 @@ function checkgear()
             local a = dt.RaceDetails.A
             local b = dt.RaceDetails.B
             if a >= 2 then
-                game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("TempleClock", "SpendPoint","Gear" .. tostring(dt.Completed), "Omega")
+                safeInvoke(3, "TempleClock", "SpendPoint", "Gear" .. tostring(dt.Completed), "Omega")
             elseif b >= 2 then
-                game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("TempleClock", "SpendPoint","Gear" .. tostring(dt.Completed), "Alpha")
+                safeInvoke(3, "TempleClock", "SpendPoint", "Gear" .. tostring(dt.Completed), "Alpha")
             else
-                game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("TempleClock", "SpendPoint","Gear" .. tostring(dt.RaceDetails.Completed), choosegear)
+                safeInvoke(3, "TempleClock", "SpendPoint", "Gear" .. tostring(dt.RaceDetails.Completed), choosegear)
             end
         end
     end
@@ -984,7 +1238,54 @@ BringMob = function()
     end
 end
 
-local checktempledoor = game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("CheckTempleDoor")
+-- "Đã mở cửa đền" là điều kiện nền tảng & ỔN ĐỊNH theo account → CHECK 1 LẦN rồi GHI FILE
+-- riêng theo account (<myName>_kaitunv4.json: {templedoor=true}). Lần sau (kể cả reload/rejoin)
+-- ĐỌC FILE, KHÔNG gọi remote nữa → hết phụ thuộc reply game-server cho gate này (hết treo + load nhanh).
+local TEMPLE_DOOR_FILE = myName .. "_kaitunv4.json"
+local function readTempleDoor()
+    if _G.templeDoorOK then return true end                     -- cache RAM (phiên này)
+    -- cache FILE: đã từng xác nhận true → dùng luôn, bỏ qua remote
+    local fok, fdata = pcall(function() return game.HttpService:JSONDecode(readfile(TEMPLE_DOOR_FILE)) end)
+    if fok and type(fdata) == "table" and fdata.templedoor == true then
+        _G.templeDoorOK = true
+        return true
+    end
+    -- chưa true → gọi remote 1 LẦN (có timeout, không treo); true thì ghi file + nhớ vĩnh viễn
+    local ok, res = safeInvoke(3, "CheckTempleDoor")
+    if ok and res then
+        _G.templeDoorOK = true
+        pcall(function() writefile(TEMPLE_DOOR_FILE, game.HttpService:JSONEncode({ templedoor = true })) end)
+        return true
+    end
+    return res  -- nil/false → vòng sau tự thử lại tới khi true (rồi mới ghi file & dừng hẳn)
+end
+-- ============================================================
+-- GATE SẴN SÀNG: chờ TEAM + NHÂN VẬT + DATA load xong rồi mới chạy logic chính.
+-- Cần sau khi HOP SERVER: nếu chạy logic khi nhân vật/Data chưa load → lỗi / "không chạy".
+-- Heartbeat + choose-team + /init ở TRÊN đã chạy rồi nên account KHÔNG bị rớt khi chờ.
+-- Có timeout 45s (best-effort) để không treo vĩnh viễn; vòng lặp chính đã bọc pcall nên an toàn.
+-- ============================================================
+do
+    local LP = game:GetService("Players").LocalPlayer
+    local t0 = tick()
+    repeat
+        task.wait(0.2)
+        local c = LP.Character
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        local ready = LP.Team
+            and c and c:FindFirstChild("HumanoidRootPart")
+            and hum and hum.Health > 0
+            and LP:FindFirstChild("Data") and LP.Data:FindFirstChild("Race")
+        if ready then break end
+    until (tick() - t0) > 45
+    Net.log("INFO", ("Game ready gate: team=%s char=%s data=%s elapsed=%.1fs"):format(
+        tostring(LP.Team ~= nil),
+        tostring(LP.Character ~= nil),
+        tostring(LP:FindFirstChild("Data") ~= nil),
+        tick() - t0))
+end
+
+local checktempledoor = readTempleDoor()
 _G.ShouldSendData = false
 local issobusy = false
 spawn(function()
@@ -992,43 +1293,83 @@ spawn(function()
     -- nhiều lần/frame → bão request → executor rate-limit → rớt dữ liệu. Giờ chạy 0.35s/vòng,
     -- getMainStatus đọc statusCache (warmer nền) nên gần như không còn request trong vòng này.
     while wait(0.35) do
-        if not checktempledoor then
-        else
+        -- HEARTBEAT: chứng minh vòng chính SỐNG ngay nhịp đầu → thay chữ "Đang khởi động..." liền.
+        -- Trước đây status() đầu tiên nằm SAU các call mạng đồng bộ; nếu mạng kẹt thì panel đứng
+        -- mãi ở splash dù coroutine vẫn chạy. Set 1 lần để KHÔNG nhấp nháy với status thật.
+        _G.loopTick = (_G.loopTick or 0) + 1
+        _G.loopLastT = tick()
+        if not _G.firstLoopHit then _G.firstLoopHit = true; status("Vòng chính đã chạy — đang đồng bộ…") end
+        -- gate có thể trả nil/false lúc load → đọc lại (đã cache RAM/file: true rồi sẽ thôi gọi remote)
+        if not checktempledoor then checktempledoor = readTempleDoor() end
+        -- BỌC PCALL: 1 dòng lỗi (vd trialable/InvokeServer khi game update remote) sẽ KHÔNG
+        -- giết coroutine nữa → không còn kẹt im "Đang khởi động"; lỗi hiện thẳng ra status.
+        local _okLoop, _errLoop = pcall(function()
+            if not checktempledoor then
+                status("Chờ mở cửa đền (CheckTempleDoor=" .. tostring(checktempledoor) .. ")")
+                return
+            end
             _G.ShouldSendData = false
             local ab, AB = cachedTrialable()
             local currentmain, currentidx = getCurrentMainBeingUpgraded()
+            local myStt = mainSttOf(myName) or myMainIndex   -- stt ĐỘNG để hiển thị
             local myStatus = ""
             if isaccmain[myName] then
                 myStatus = getMainStatus(myName)
             end
             if isaccmain[myName] then
-                if AB == "done" then _G.raceDone = true end   -- ✅ nhớ vĩnh viễn (tránh đọc chập chờn lật lại)
-                if _G.raceDone then
-                    -- XONG TỘC (full gear) → set status "done" để không tới lượt/không train nữa
+                if AB == "done" then
+                    -- DONE chỉ khi i==5/8 HIỆN TẠI. KHÔNG nhớ vĩnh viễn (đổi tộc → V3 i=? thì hết done).
                     if myStatus ~= "done" then setMyMainStatus("done"); myStatus = "done" end
-                elseif (myStatus == "in_trail" or myStatus == "moon") and not ab then
-                    status("[MAIN " .. myMainIndex .. "] Trial completed, switching to training!")
-                    setMyMainStatus("training")
-                    myStatus = "training"
+                else
+                    -- Không còn done (đổi tộc/V3/đang tiến hành) → bỏ status done về waiting để chạy lại
+                    if myStatus == "done" then setMyMainStatus("waiting"); myStatus = "waiting" end
+                    if (myStatus == "in_trail" or myStatus == "moon") and not ab then
+                        status("[MAIN " .. myStt .. "] Trial completed, switching to training!")
+                        setMyMainStatus("training")
+                        myStatus = "training"
+                    end
                 end
                 if myStatus == "in_trail" and ab then
                     local in_temple = getdis(CFrame.new(28310.0234, 14895.1123, 109.456741)) < 3000
                     if not in_temple then
-                        status("[MAIN " .. myMainIndex .. "] Died in trial, retrying...")
+                        status("[MAIN " .. myStt .. "] Died in trial, retrying...")
                         setMyMainStatus("waiting")
                         myStatus = "waiting"
                     end
                 end
             end
+
+            -- ===== IN-TRIAL LATCH =====
+            -- Đã VÀO khu trial (ability sync đẩy vào) + bản thân CÒN cần trial (ab) → CHỐT in_trial:
+            -- DỪNG mọi điều phối (hop / chờ main / kill-player), CHỈ làm trial. Áp cho CẢ Main lẫn Ally.
+            -- → Khi main đổi trạng thái giữa chừng, ally/main KHÔNG rớt về "Waiting" → 3 con cùng làm
+            --   trial tới khi xong, KHÔNG đứng im. Tự nhả khi trial xong (ab=false) hoặc rời khu trial.
+            local _tplace = getRaceTrialPlace(game.Players.LocalPlayer.Data.Race.Value)
+            local _inTrialNow = (_tplace and ab and getdis(_tplace.CFrame) < 1500) and true or false
+            if _inTrialNow then
+                if isaccmain[myName] then
+                    if myStatus ~= "in_trail" then setMyMainStatus("in_trail"); myStatus = "in_trail" end
+                elseif not _G.inTrial then
+                    reportStatus("in_trail")          -- ally: báo 1 lần lúc vừa bước vào trial
+                end
+                _G.inTrial = true
+                status((isaccmain[myName] and ("[MAIN " .. tostring(myStt) .. "]") or "[ALLY]") .. " 🔥 IN-TRIAL → đang làm trial")
+                doTrialForMyRace()
+                return
+            else
+                if _G.inTrial and not isaccmain[myName] then reportStatus("ally") end  -- vừa RỜI trial → trả status ally
+                _G.inTrial = false
+            end
+
             if isaccmain[myName] and myStatus == "done" then
-                status("[MAIN " .. myMainIndex .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
+                status("[MAIN " .. myStt .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
             elseif isaccmain[myName] and myStatus == "training" then
-                status("[MAIN " .. myMainIndex .. "] Training (parallel)")
+                status("[MAIN " .. myStt .. "] Training (parallel)")
                 if not ab then
                     if AB == "raiding" then
                         local boss = workspace.Enemies:FindFirstChild("Cake Prince") or workspace.Enemies:FindFirstChild("Dough King")
                         if boss then
-                            status("[MAIN " .. myMainIndex .. "] Raiding for fragment")
+                            status("[MAIN " .. myStt .. "] Raiding for fragment")
                             repeat wait()
                                 pcall(function() topos(boss.HumanoidRootPart.CFrame * CFrame.new(0, 25, 0)) end)
                                 module:eq(); module:haki(); BringMob()
@@ -1059,7 +1400,7 @@ spawn(function()
                                     -- transformed → đứng cao chờ hết V4; chưa → áp sát kill
                                     if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, tf and 150 or 20, 0)) end) end
                                     if tf ~= lastTf then  -- đổi status chỉ khi state đổi → hết giật chữ
-                                        status("[MAIN " .. myMainIndex .. (tf and "] Training (Wait for end V4)" or "] Training (Kill Mobs)"))
+                                        status("[MAIN " .. myStt .. (tf and "] Training (Wait for end V4)" or "] Training (Kill Mobs)"))
                                         lastTf = tf
                                     end
                                     -- bấm Y throttle 0.4s, KHÔNG spawn mỗi frame → hết giật
@@ -1071,11 +1412,11 @@ spawn(function()
                         end
                     end
                 else
-                    status("[MAIN " .. myMainIndex .. "] Training done, back to waiting")
+                    status("[MAIN " .. myStt .. "] Training done, back to waiting")
                     setMyMainStatus("waiting")
                 end
             elseif isaccmain[myName] and currentmain == myName then
-                status("[MAIN " .. myMainIndex .. "] My turn to upgrade gear!")
+                status("[MAIN " .. myStt .. "] My turn to upgrade gear!")
                 if myStatus == "waiting" or myStatus == "" then
                     setMyMainStatus("moon")
                 end
@@ -1096,7 +1437,7 @@ spawn(function()
                                     if jobid and jobid ~= game.JobId and v.player <= 8 then
                                         local lastVisit = cachedJobs[jobid]
                                         if not lastVisit or (math.floor(tick()) - lastVisit) > 3600 then
-                                            status("[MAIN " .. myMainIndex .. "] Hop fullmoon server")
+                                            status("[MAIN " .. myStt .. "] Hop fullmoon server")
                                             game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", jobid)
                                             hopped = true
                                             break
@@ -1115,45 +1456,46 @@ spawn(function()
                 if not skip then
                     spawn(checkgear)
                     _G.ShouldSendData = true
-                    if not workspace.Map:FindFirstChild("Temple of Time") then
-                        if game:GetService("ReplicatedStorage").MapStash:FindFirstChild("Temple of Time") then
-                            game:GetService("ReplicatedStorage").MapStash["Temple of Time"].Parent = workspace.Map
-                        end
-                    elseif workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 0 then
-                        status("[MAIN " .. myMainIndex .. "] Kill Players After Trial")
+                    local ts = templeState()
+                    if ts == "loading" then
+                        status("[MAIN " .. myStt .. "] Đang vào Temple of Time...")
+                    elseif ts == "ffup" then
+                        status("[MAIN " .. myStt .. "] Kill Players After Trial")
                         for plr in pairs(getplayers()) do
                             if plr then
                                 repeat wait() attackTick(plr)
-                                until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 1
+                                until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or templeState() ~= "ffup"
                             end
                         end
                     else
-                        runTrialPhase("[MAIN " .. myMainIndex .. "]", true)
+                        runTrialPhase("[MAIN " .. myStt .. "]", true)
                     end
                 end
+            elseif isaccmain[myName] then
+                -- MAIN CHƯA TỚI LƯỢT → ĐỨNG IM chờ lên stt1, KHÔNG đi help main khác.
+                -- Liên tục re-check mỗi vòng: khi main stt1 chuyển done/training thì hàng đợi
+                -- xoay, mình lên stt1 → vòng sau rơi vào nhánh "My turn" ở trên.
+                _G.allyKillReset = false
+                status("[MAIN " .. myStt .. "] Waiting for current main: " .. tostring(currentmain))
             else
-                local roleName = isaccmain[myName] and ("[MAIN " .. myMainIndex .. " as ALLY]") or "[ALLY]"
+                -- CHỈ ALLY THẬT vào đây: liên tục detect jobid của main stt1 → join + help.
+                local roleName = "[ALLY]"
+                -- set status TRƯỚC các call mạng bên dưới (fetchMainStatusLive / isSameServerAsMain
+                -- vẫn YIELD); nếu mạng kẹt thì panel hiện dòng này thay vì đứng "Đang khởi động...".
+                status(roleName .. " Đang dò main đang tới lượt…")
                 -- "Nhận lệnh lên trial door" = phát hiện main đang up (moon/in_trail). Làm như join
                 -- jobid: nếu cache miss/chưa active thì FETCH TƯƠI retry 2 lần → đỡ trễ/đứng chờ oan.
+                -- TẤT CẢ đọc CACHE (warmer nền giữ tươi ~0.7s) → KHÔNG gọi mạng, KHÔNG block, hết STALL.
                 local mainActive = false
                 if currentmain then
-                    local st = getMainStatus(currentmain)
+                    local st = getMainStatus(currentmain)                  -- cache-only
                     mainActive = (st == "moon" or st == "in_trail")
-                    if not mainActive and not isaccmain[myName] then
-                        for _ = 1, 2 do
-                            wait(0.2)
-                            local live = fetchMainStatusLive(currentmain)
-                            if live == "moon" or live == "in_trail" then
-                                statusCache[currentmain] = { t = tick(), status = live }
-                                mainActive = true; break
-                            end
-                        end
-                    end
+                    status(roleName .. " main " .. tostring(currentmain) .. " = " .. tostring(st))
                 end
                 -- Main phụ (main-as-ally) KHÔNG hop theo (giữ như bản gốc); chỉ ally thật mới hop.
                 local sameServer, mainJob = true, nil
                 if not isaccmain[myName] then
-                    sameServer, mainJob = isSameServerAsMain(currentmain)
+                    sameServer, mainJob = isSameServerAsMain(currentmain)   -- cache-only (mainJobCache)
                 end
                 if currentmain and mainActive and not sameServer then
                     -- Khác server với main đang up → hop sang server của main (throttle 5s tránh spam)
@@ -1171,11 +1513,10 @@ spawn(function()
                 elseif (currentmain and mainActive and sameServer) or getgenv().Config["VIPServer"] or (isnight() and isfullmoon()) or issobusy then
                         spawn(checkgear)
                         _G.ShouldSendData = true
-                        if not workspace.Map:FindFirstChild("Temple of Time") then
-                            if game:GetService("ReplicatedStorage").MapStash:FindFirstChild("Temple of Time") then
-                                game:GetService("ReplicatedStorage").MapStash["Temple of Time"].Parent = workspace.Map
-                            end
-                        elseif workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 0 then
+                        local ts = templeState()
+                        if ts == "loading" then
+                            status(roleName .. " Đang vào Temple of Time...")
+                        elseif ts == "ffup" then
                             if not isaccmain[myName] then
                                 -- ===== ALLY: AUTO RESET NGAY khi vào khúc kill player =====
                                 -- Ally KHÔNG cần kill hết người — reset luôn (stagger theo thứ tự ally)
@@ -1202,7 +1543,7 @@ spawn(function()
                                 for plr in pairs(getplayers()) do
                                     if plr then
                                         repeat wait() attackTick(plr)
-                                        until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or workspace.Map["Temple of Time"].FFABorder.Forcefield.Transparency == 1
+                                        until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or templeState() ~= "ffup"
                                     end
                                 end
                                 if countplayers() <= 0 then
@@ -1211,7 +1552,7 @@ spawn(function()
                                     if isCurrentMain then
                                         local allies_str = table.concat(getgenv().Config["Allies"] or {}, ",")
                                         if allies_str ~= "" then
-                                            status("[MAIN " .. myMainIndex .. "] Waiting for help accs to reset first...")
+                                            status("[MAIN " .. myStt .. "] Waiting for help accs to reset first...")
                                             local timeout = 0
                                             repeat
                                                 wait(1)
@@ -1244,6 +1585,10 @@ spawn(function()
                     status(roleName .. " Waiting for current main: " .. tostring(currentmain))
                 end
             end
+        end)
+        if not _okLoop then
+            status("⚠ Lỗi vòng chính: " .. tostring(_errLoop))
+            Net.log("ERR", "main loop crash: " .. tostring(_errLoop))
         end
     end
 end)
@@ -1295,8 +1640,9 @@ spawn(function()
                 if ui_ then
                     for _, vl in pairs(ui_:GetChildren()) do
                         if isvalidnameui[vl.Name] then
-                            local cooldown_frame, title_frame = vl:WaitForChild("Cooldown"), vl:WaitForChild("Title")
-                            if title_frame.TextColor3 == Color3.new(1, 1, 1) or title_frame.TextColor3 == Color3.fromRGB(255, 255, 255) then
+                            local cooldown_frame = vl:WaitForChild("Cooldown", 3)
+                            local title_frame = vl:WaitForChild("Title", 3)
+                            if cooldown_frame and title_frame and (title_frame.TextColor3 == Color3.new(1, 1, 1) or title_frame.TextColor3 == Color3.fromRGB(255, 255, 255)) then
                                 if cooldown_frame.Size == UDim2.new(0, 0, 1, -1) then
                                     if vl.Name == "V" then
                                         if not fruits[ui_.Name] then
@@ -1616,18 +1962,27 @@ local BANANA_DOOR_CFRAME = {
 
 -- Khoảng cách tới cửa corridor của mình (LOCAL, không mạng).
 -- "Thuật toán check chuẩn": thử cả getdoor() lẫn toạ độ Banana, lấy cái gần nhất.
+-- ƯU TIÊN part THẬT (getdoor, đã cache) → chính xác. KHÔNG min với toạ độ hardcode nữa:
+-- min làm "đứng ở temple vẫn ghi true" khi toạ độ Banana lỡ gần chỗ đứng. Banana CHỈ dùng
+-- khi getdoor chưa resolve được lần nào (rất hiếm, vd corridor chưa stream).
 local function distToMyDoor()
-    local best = 1e9
-    pcall(function()
-        local door = getdoor()
-        if door then best = math.min(best, getdis(door.CFrame)) end
-    end)
-    pcall(function()
-        local race = game.Players.LocalPlayer.Data.Race.Value
-        local cf = BANANA_DOOR_CFRAME[race]
-        if cf then best = math.min(best, getdis(cf)) end
-    end)
-    return best
+    local door = getdoor()
+    if door then
+        local d = getdis(door.CFrame)
+        -- DEBUG: R = part Door.Entrance THẬT của corridor (chuẩn). Nếu ở Temple of Time mà d≈0
+        -- với src=R nghĩa là getdoor() trả part nằm sai chỗ (ngay hub) → cần đổi mốc cửa.
+        _G.lastDoorSrc, _G.lastDoorName, _G.lastDoorDist = "R", door.Name, d
+        return d
+    end
+    local cf = BANANA_DOOR_CFRAME[game.Players.LocalPlayer.Data.Race.Value]
+    if cf then
+        local d = getdis(cf)
+        -- B = toạ độ Banana hardcode (dự phòng). d≈0 với src=B = toạ độ Banana trùng chỗ đứng.
+        _G.lastDoorSrc, _G.lastDoorName, _G.lastDoorDist = "B", "banana", d
+        return d
+    end
+    _G.lastDoorSrc, _G.lastDoorName, _G.lastDoorDist = "X", "none", 1e9
+    return 1e9
 end
 
 -- ===== GIỜ THỰC UTC+7 (Hà Nội / Bangkok) =====
@@ -1760,11 +2115,17 @@ end
 spawn(function()
     while true do
         pcall(function()
+            _G.myDoorReady = false   -- mặc định CHƯA sẵn sàng (chưa ở cửa / chưa cùng server)
             local label = myAbilityLabel()
             if label then
                 -- chỉ true khi đủ CẢ 2: gần door VÀ cùng jobid (cùng server) với main đang turn.
                 -- Thiếu 1 trong 2 → ghi false. Ghi liên tục mỗi 1s kể từ khi load script.
-                local cond = (distToMyDoor() < AT_DOOR_DIST) and sameServerAsCurrentMain()
+                local dd = distToMyDoor()
+                local ss = sameServerAsCurrentMain()
+                _G.lastDoorDist = dd        -- debug: soi detect cửa trên panel
+                _G.lastSameSrv = ss
+                local cond = (dd < AT_DOOR_DIST) and ss
+                _G.myDoorReady = cond and true or false   -- = checkalready của mình → cổng cho loop bấm
                 writeMyCheck(label, cond)
 
                 -- Chỉ MAIN đang tới turn mới chốt giờ
@@ -1797,26 +2158,32 @@ spawn(function()
     end
 end)
 
--- ===== LOOP BẤM: 0.2s — ĐỌC TƯƠI mỗi nhịp (không phụ thuộc loop 1s) → không miss window =====
+-- ===== LOOP BẤM: CHỈ check starttime liên tục KHI Ở CỬA + checkalready(_G.myDoorReady)=true.
+-- Ở cửa + sẵn sàng → TĂNG CƯỜNG poll 0.1s (không miss window). Chưa ở cửa/chưa sẵn sàng → 0.5s tiết kiệm,
+-- KHÔNG đọc/bấm starttime (tránh bấm bậy khi chưa tới cửa). =====
 spawn(function()
     while true do
-        pcall(function()
-            local st = readStart() or _G.syncStart   -- ưu tiên đọc tươi, fallback giá trị cache
-            if st then _G.syncStart = st end
-            if st and st ~= _G.allyLastFire then
-                local age = hanoiSecOfDay(serverNow()) - st
-                if age < -43200 then age = age + 86400 end   -- wrap qua nửa đêm
-                if age >= ABILITY_FIRE_WINDOW then
-                    -- giờ chốt ĐÃ TRÔI QUA cửa sổ → BỎ QUA (không bắn trễ), đánh dấu đã xử lý
-                    _G.allyLastFire = st
-                elseif age >= 0 and distToMyDoor() < AT_DOOR_DIST then
-                    _G.allyLastFire = st
-                    game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
+        if _G.myDoorReady == true then
+            pcall(function()
+                local st = readStart() or _G.syncStart   -- ưu tiên đọc tươi, fallback giá trị cache
+                if st then _G.syncStart = st end
+                if st and st ~= _G.allyLastFire then
+                    local age = hanoiSecOfDay(serverNow()) - st
+                    if age < -43200 then age = age + 86400 end   -- wrap qua nửa đêm
+                    if age >= ABILITY_FIRE_WINDOW then
+                        -- giờ chốt ĐÃ TRÔI QUA cửa sổ → BỎ QUA (không bắn trễ), đánh dấu đã xử lý
+                        _G.allyLastFire = st
+                    elseif age >= 0 and distToMyDoor() < AT_DOOR_DIST then
+                        _G.allyLastFire = st
+                        game.ReplicatedStorage.Remotes.CommE:FireServer("ActivateAbility")
+                    end
+                    -- age < 0 → giờ chốt ở tương lai → chờ tới đúng giờ
                 end
-                -- age < 0 → giờ chốt ở tương lai → chờ tới đúng giờ
-            end
-        end)
-        wait(0.2)
+            end)
+            wait(0.1)   -- TĂNG CƯỜNG: ở cửa + ready → poll nhanh
+        else
+            wait(0.5)   -- chưa ở cửa / chưa ready → nghỉ, không check starttime
+        end
     end
 end)
 
@@ -2279,34 +2646,47 @@ end
 TextboxCard(mainPage, 4, "Nhập Job ID...", function(text) _G.jobidinput = text end)
 ButtonCard(mainPage, 5, "Join Job Id", function()
     pcall(function()
-        TPService:TeleportToPlaceInstance(game.PlaceId, _G.jobidinput, LocalPlayer)
+        game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", _G.jobidinput)
     end)
 end)
 
--- Auto Choose Gear — bật/tắt. On: tự CHỌN gear (TempleClock SpendPoint theo Config A-B-B/A-A-B)
--- LIÊN TỤC, gồm cả mức config cuối sau Gear4 (lvl 5). Không phải "buy".
-do
-    local savedACG = false
+-- Change Race (đổi tộc 2500 Fragments) — bản Banana: BlackbeardReward "Reroll" 1+2
+ButtonCard(mainPage, 6, "Change Race (2500F)", function()
     pcall(function()
-        local y = game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json"))
-        if y and y["Auto Choose Gear"] ~= nil then savedACG = y["Auto Choose Gear"] and true or false end
+        local R = game:GetService("ReplicatedStorage").Remotes.CommF_
+        R:InvokeServer("BlackbeardReward", "Reroll", "1")
+        R:InvokeServer("BlackbeardReward", "Reroll", "2")
     end)
-    _G.AutoChooseGear = savedACG
-    ToggleCard(mainPage, 6, "Auto Choose Gear", "Tự chọn gear theo Config (gồm mức cuối)", savedACG, function(v)
-        _G.AutoChooseGear = v
-        pcall(function()
-            local m = {}; pcall(function() m = game.HttpService:JSONDecode(readfile("nawy/kaitunv4.json")) end)
-            if type(m) ~= "table" then m = {} end
-            if not isfolder("nawy") then makefolder("nawy") end
-            m["Auto Choose Gear"] = v
-            writefile("nawy/kaitunv4.json", game.HttpService:JSONEncode(m))
-        end)
-    end)
-end
--- Vòng nền Auto Choose Gear: gọi checkgear() (SpendPoint chọn Alpha/Omega/config), throttle 0.3s
+end)
+
+-- 🌐 Net diagnostic card — hiện hasReq + GET/POST tới backend đo TỪ TRONG executor
+local NetDiag = LabelCard(mainPage, 7, "🌐 Net (backend)", "đang kiểm tra…")
 spawn(function()
-    while wait(0.3) do
-        if _G.AutoChooseGear then pcall(function() checkgear() end) end
+    while wait(1) do
+        if _G.netDiag then pcall(function() NetDiag:SetDesc(_G.netDiag) end) end
+    end
+end)
+
+-- 🔎 Sync Debug card — dump trạng thái đồng bộ Main/Ally (chỉ đọc cache, KHÔNG gọi mạng)
+local SyncDbg = LabelCard(mainPage, 8, "🔎 Sync Debug", "…")
+spawn(function()
+    while wait(0.5) do
+        pcall(function()
+            local cur = getCurrentMainBeingUpgraded()        -- cache-only, không block
+            local c = cur and statusCache[cur]
+            local me = isaccmain[myName] and ("MAIN" .. tostring(myMainIndex)) or "ALLY"
+            -- me=vai trò | cur=main stt1 | st=status main(tuổi cache) | ss=cùng/khác server
+            -- | i=UpgradeRace Check | d=khoảng cách cửa + nguồn(R/B/X)
+            SyncDbg:SetDesc(("me=%s cur=%s st=%s(%ss) ss=%s i=%s d=%s%s dn=%s"):format(
+                me, tostring(cur):sub(1, 12),
+                tostring(c and c.status or "?"),
+                c and string.format("%.0f", tick() - c.t) or "?",
+                _G.lastSameSrv and "same" or "diff",
+                tostring(_G.lastRaceI),
+                tostring(_G.lastDoorDist and math.floor(_G.lastDoorDist) or "?"),
+                tostring(_G.lastDoorSrc or "?"),
+                tostring(_G.lastDoorName or "?")))
+        end)
     end
 end)
 
@@ -2348,7 +2728,7 @@ for idx, vl in pairs(getgenv().Config["Allies"]) do
     local jobidnow = "no update"
     accOrder = accOrder + 1
     ButtonCard(accPage, accOrder, "Join to " .. vl, function()
-        TPService:TeleportToPlaceInstance(game.PlaceId, jobidnow, LocalPlayer)
+        game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", jobidnow)
     end)
     spawn(function()
         while wait(5) do
@@ -2365,6 +2745,105 @@ for idx, vl in pairs(getgenv().Config["Allies"]) do
         end
     end)
 end
+
+-- =================== PAGE: DEBUG (đèn xanh/đỏ + LOG cuộn 200 dòng) ===================
+local debugPage = CreatePage("Debug")
+
+-- đèn chỉ báo: cập nhật TẠI CHỖ (xanh=ok / đỏ=lỗi) → KHÔNG spam log
+local function IndicatorRow(order, labelText)
+    local f = addCard(debugPage, order, 30)
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.new(0, 12, 0, 12); dot.Position = UDim2.new(0, 12, 0.5, -6)
+    dot.BackgroundColor3 = Color3.fromRGB(110, 116, 140); dot.BorderSizePixel = 0; dot.Parent = f
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -36, 1, 0); t.Position = UDim2.new(0, 32, 0, 0)
+    t.BackgroundTransparency = 1; t.Text = labelText; t.TextColor3 = Color3.fromRGB(220, 225, 240)
+    t.TextXAlignment = Enum.TextXAlignment.Left; t.Font = Enum.Font.Gotham; t.TextSize = 12
+    t.TextTruncate = Enum.TextTruncate.AtEnd; t.Parent = f
+    return function(ok, txt)
+        dot.BackgroundColor3 = ok and Color3.fromRGB(60, 205, 115) or Color3.fromRGB(235, 75, 85)
+        if txt then t.Text = txt end
+    end
+end
+
+local setLoop = IndicatorRow(1, "Loop")
+local setNet  = IndicatorRow(2, "Net")
+local setSrv  = IndicatorRow(3, "Server")
+local setDoor = IndicatorRow(4, "Door")
+local setMain = IndicatorRow(5, "Main stt1")
+
+spawn(function()
+    while wait(0.4) do
+        pcall(function()
+            local alive = _G.loopLastT and (tick() - _G.loopLastT) < 2
+            setLoop(alive == true, "Loop: " .. (alive and ("alive #" .. tostring(_G.loopTick or 0)) or "STALL!"))
+            local g, p = _G.netGetOk, _G.netPostOk
+            setNet(g and p == true, "Net: GET " .. (g and "OK" or "FAIL")
+                .. " | POST " .. (p == nil and "N/A(no req)" or (p and "OK" or "FAIL")))
+            setSrv(_G.lastSameSrv == true, "Server: " .. (_G.lastSameSrv and "SAME (cùng main)" or "DIFF (khác)"))
+            local atDoor = _G.lastDoorDist and _G.lastDoorDist < 150
+            setDoor(atDoor == true, "Door: d=" .. tostring(_G.lastDoorDist and math.floor(_G.lastDoorDist) or "?")
+                .. tostring(_G.lastDoorSrc or "?") .. " " .. tostring(_G.lastDoorName or "?"))
+            local cur = getCurrentMainBeingUpgraded()
+            local c = cur and statusCache[cur]
+            setMain(c ~= nil, "Main1: " .. tostring(cur):sub(1, 12) .. " = " .. tostring(c and c.status or "?"))
+        end)
+    end
+end)
+
+-- LOG box: ScrollingFrame lồng cao 286px, cuộn riêng 200 dòng, tô màu theo level
+local logSF
+do
+    local box = addCard(debugPage, 6, 286)
+    local hl = Instance.new("TextLabel")
+    hl.Size = UDim2.new(1, -16, 0, 18); hl.Position = UDim2.new(0, 10, 0, 4)
+    hl.BackgroundTransparency = 1; hl.Text = "📜 LOG (tối đa 200 dòng · cuộn ↕)"
+    hl.TextColor3 = Color3.fromRGB(150, 200, 255); hl.TextXAlignment = Enum.TextXAlignment.Left
+    hl.Font = Enum.Font.GothamBold; hl.TextSize = 11; hl.Parent = box
+    logSF = Instance.new("ScrollingFrame")
+    logSF.Size = UDim2.new(1, -12, 1, -28); logSF.Position = UDim2.new(0, 6, 0, 24)
+    logSF.BackgroundColor3 = Color3.fromRGB(10, 12, 18); logSF.BackgroundTransparency = 0.3
+    logSF.BorderSizePixel = 0; logSF.ScrollBarThickness = 5
+    logSF.ScrollBarImageColor3 = Color3.fromRGB(120, 160, 240)
+    logSF.CanvasSize = UDim2.new(0, 0, 0, 0); logSF.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    logSF.Parent = box
+    Instance.new("UICorner", logSF).CornerRadius = UDim.new(0, 8)
+    local lay = Instance.new("UIListLayout", logSF)
+    lay.SortOrder = Enum.SortOrder.LayoutOrder; lay.Padding = UDim.new(0, 1)
+    local pad = Instance.new("UIPadding", logSF)
+    pad.PaddingLeft = UDim.new(0, 6); pad.PaddingRight = UDim.new(0, 6)
+    pad.PaddingTop = UDim.new(0, 4); pad.PaddingBottom = UDim.new(0, 4)
+end
+local logLabels = {}   -- seq -> TextLabel
+spawn(function()
+    while wait(0.4) do
+        pcall(function()
+            local present = {}
+            for _, e in ipairs(_G.dbgLog) do
+                present[e.seq] = true
+                if not logLabels[e.seq] then
+                    local lb = Instance.new("TextLabel")
+                    lb.Size = UDim2.new(1, -4, 0, 0); lb.AutomaticSize = Enum.AutomaticSize.Y
+                    lb.BackgroundTransparency = 1; lb.LayoutOrder = e.seq
+                    lb.Font = Enum.Font.Code; lb.TextSize = 11; lb.TextWrapped = true
+                    lb.TextXAlignment = Enum.TextXAlignment.Left; lb.Text = e.text
+                    lb.TextColor3 = (e.level == "ok" and Color3.fromRGB(80, 210, 120))
+                        or (e.level == "err" and Color3.fromRGB(235, 80, 90))
+                        or Color3.fromRGB(190, 198, 215)
+                    lb.Parent = logSF
+                    logLabels[e.seq] = lb
+                end
+            end
+            for seq, lb in pairs(logLabels) do
+                if not present[seq] then lb:Destroy(); logLabels[seq] = nil end
+            end
+            -- auto-cuộn xuống đáy NẾU đang ở gần đáy; nếu user cuộn lên đọc thì GIỮ nguyên
+            local nb = logSF.CanvasPosition.Y >= (logSF.AbsoluteCanvasSize.Y - logSF.AbsoluteWindowSize.Y - 24)
+            if nb then logSF.CanvasPosition = Vector2.new(0, logSF.AbsoluteCanvasSize.Y) end
+        end)
+    end
+end)
 
 selectTab("Main")
 
