@@ -1512,12 +1512,20 @@ spawn(function()
                     if ts == "loading" then
                         status("[MAIN " .. myStt .. "] Đang vào Temple of Time...")
                     elseif ts == "ffup" then
-                        status("[MAIN " .. myStt .. "] Kill Players After Trial")
-                        for plr in pairs(getplayers()) do
-                            if plr then
-                                repeat wait() attackTick(plr)
-                                until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or templeState() ~= "ffup"
+                        -- CHỈ kill player KHI ĐÃ qua in_trial (myStatus=="in_trail") → đúng khúc FFA CỦA MÌNH.
+                        -- Chưa in_trial (còn moon/đang chờ ở cửa) → KHÔNG bay ra kill (người khác có thể đang
+                        -- trial → mình bay ra kill sẽ bị KICK); chỉ bám cửa chờ ability mở trial.
+                        if myStatus == "in_trail" then
+                            status("[MAIN " .. myStt .. "] Kill Players After Trial")
+                            for plr in pairs(getplayers()) do
+                                if plr then
+                                    repeat wait() attackTick(plr)
+                                    until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or templeState() ~= "ffup"
+                                end
                             end
+                        else
+                            status("[MAIN " .. myStt .. "] Chờ ở cửa (chưa in_trial → KHÔNG kill)")
+                            goToMyDoor()
                         end
                     else
                         runTrialPhase("[MAIN " .. myStt .. "]", true)
