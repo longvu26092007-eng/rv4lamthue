@@ -320,9 +320,6 @@ end
 -- TRƯỚC cả status() đầu tiên → panel đứng mãi ở "Đang khởi động...". Giờ chỉ đọc statusCache
 -- (đã được warmer nền + setMyMainStatus cập nhật liên tục). Cache rỗng → "waiting".
 function getMainStatus(accName)
-    -- Trả status từ cache (warmer nền cập nhật ~0.7s). KHÔNG tự suy "offline" theo tuổi cache:
-    -- dưới tải 4 instance/1 máy warmer có thể trễ → suy offline làm "current main = nil" → ally đứng
-    -- "Waiting for nil". Main ĐÃ RỜI đã được SERVER trả "offline" (warmer cache lại) nên vẫn bị bỏ đúng.
     local c = statusCache[accName]
     if c then return c.status end
     return "waiting"
@@ -2223,10 +2220,9 @@ spawn(function()
 end)
 
 
--- MỌI account (cả ally) POST jobid mỗi 3s → dashboard hiện server từng con (giảm tải so với 1s).
--- 3s vẫn dư tươi: isSameServerAsMain coi jobid hợp lệ trong 60s nên hop/đồng bộ không ảnh hưởng.
+-- MỌI account (cả ally) POST jobid mỗi 1s → dashboard hiện server từng con để so cùng/khác server.
 spawn(function()
-    while wait(3) do
+    while wait(1) do
         Net.postJSON(BASE_URL .. "/noguchi?name=" .. myName, { jobid = game.JobId }, "noguchi")
     end
 end)
@@ -2265,7 +2261,7 @@ spawn(function()
                 pcall(function() o.obj[o.prop] = Color3.fromHSV(hue, o.s, o.v) end)
             end
         end
-        task.wait(1/15)   -- ~15fps thay vì mỗi frame → giảm tải CPU (×N account/1 máy)
+        RunService.RenderStepped:Wait()
     end
 end)
 
