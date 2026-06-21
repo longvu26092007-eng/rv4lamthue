@@ -115,39 +115,45 @@ end
 local function goToSea3() CommF("TravelZou") end -- TravelZou = Teleport Third Sea
 
 --==================  LOAD TEAM  ==================--
--- Chon phe = click UI ChooseTeam (firesignal) nhu KaitunV4 module:join.
--- Acc cu khong co UI ChooseTeam -> da co phe -> bo qua. Khong spam SetTeam.
+-- Join team BEN (copy KaitunV4:498-529): retry remote SetTeam + ChooseTeam UI (getgc)
+-- toi khi LP.Team co that. Chay NEN (spawn) - KHONG chan farm.
 local function EnsureTeam()
-    local t0 = tick()
-    repeat task.wait() until game:IsLoaded() or tick() - t0 > 15
-    local team = CONFIG.Team
-    if team ~= "Pirates" and team ~= "Marines" then team = "Pirates" end
-    for _ = 1, 40 do
-        local pg = LocalPlayer:FindFirstChild("PlayerGui")
-        local needSelect = false
-        if pg then
-            for _, g in ipairs(pg:GetChildren()) do
-                local ct = g:FindFirstChild("ChooseTeam")
-                if ct then
-                    needSelect = true
-                    local cont = ct:FindFirstChild("Container")
-                    local btn = cont and cont:FindFirstChild(team)
-                    btn = btn and btn:FindFirstChild("Frame"); btn = btn and btn:FindFirstChild("TextButton")
-                    if btn and firesignal then
-                        Status("Chon phe (ChooseTeam UI): " .. team)
-                        pcall(function() firesignal(btn.Activated) end)
+    task.spawn(function()
+        local LP = LocalPlayer
+        local team = CONFIG.Team
+        if team ~= "Marines" and team ~= "Pirates" then team = "Pirates" end
+        local attempts = 0
+        while not LP.Team and attempts < 40 do
+            attempts = attempts + 1
+            DBG.team = "chon phe... " .. attempts
+            -- Cach 1: remote SetTeam
+            pcall(function()
+                ReplicatedStorage.Remotes.CommF_:InvokeServer("SetTeam", team)
+            end)
+            task.wait(0.4)
+            if LP.Team then break end
+            -- Cach 2: ChooseTeam UI qua getgc (khi remote khong an)
+            pcall(function()
+                local chooseGui = LP.PlayerGui:FindFirstChild("ChooseTeam", true)
+                local uiCtrl    = LP.PlayerGui:FindFirstChild("UIController", true)
+                if chooseGui and chooseGui.Visible and uiCtrl and getgc then
+                    for _, fn in pairs(getgc(true)) do
+                        if type(fn) == "function" and getfenv(fn).script == uiCtrl then
+                            local consts = getconstants and getconstants(fn)
+                            if consts and #consts == 1 and (consts[1] == "Pirates" or consts[1] == "Marines") then
+                                if consts[1] == team then pcall(fn, team) end
+                            end
+                        end
                     end
-                    pcall(function() CommF("SetTeam", team) end) -- them remote cho chac
                 end
-            end
+            end)
+            task.wait(0.8)
         end
-        if not needSelect then break end -- khong co UI -> da co phe
-        task.wait(0.5)
-    end
-    DBG.team = (LocalPlayer.Team and tostring(LocalPlayer.Team)) or "(co san)"
+        DBG.team = LP.Team and tostring(LP.Team) or "(chua co)"
+    end)
 end
 
---==================  COMBAT: 3 LOP DANH CHONG (be tu KaitunV4)  ==================--
+--==================  COMBAT (1 method HitRegistration cua Banana - co ma hoa)  ==================--
 -- equip CHI Melee (getgenv().USESWORD = true thi dung Sword). Khong dung tool khac.
 local function equipWeapon()
     local c = char(); local bp = LocalPlayer:FindFirstChild("Backpack")
@@ -175,62 +181,69 @@ local _Net           = _Modules and _Modules:FindFirstChild("Net")
 local RegisterAttack = _Net and (_Net:FindFirstChild("RE/RegisterAttack") or _Net:WaitForChild("RE/RegisterAttack", 5))
 local RegisterHit    = _Net and (_Net:FindFirstChild("RE/RegisterHit") or _Net:WaitForChild("RE/RegisterHit", 5))
 
--- chi danh Enemies (farm boss/mob - khong PvP)
-local function atkTargets()
-    local root = hrp(); local out = {}
-    local folder = Workspace:FindFirstChild("Enemies")
-    if not (root and folder) then return out end
-    for _, v in ipairs(folder:GetChildren()) do
-        local hum, vh = v:FindFirstChild("Humanoid"), v:FindFirstChild("HumanoidRootPart")
-        if v ~= char() and hum and vh and hum.Health > 0 and (vh.Position - root.Position).Magnitude <= ATK_RANGE then
-            out[#out + 1] = v
+-- ===== DANH = copy HitRegistrationModule.Execute cua Banana (ban moi, co MA HOA) =====
+-- Tim remote ma hoa (RemoteEvent co attribute Id)
+local AttackRemoteTarget, AttackRemoteId
+for _, name in ipairs({ "Util", "Common", "Remotes", "Assets", "FX" }) do
+    local folder = ReplicatedStorage:FindFirstChild(name)
+    if folder then
+        for _, child in ipairs(folder:GetChildren()) do
+            if child:IsA("RemoteEvent") and child:GetAttribute("Id") then
+                AttackRemoteTarget, AttackRemoteId = child, child:GetAttribute("Id")
+            end
         end
+        folder.ChildAdded:Connect(function(child)
+            if child:IsA("RemoteEvent") and child:GetAttribute("Id") then
+                AttackRemoteTarget, AttackRemoteId = child, child:GetAttribute("Id")
+            end
+        end)
     end
-    return out
 end
-
--- DANH = copy AttackNoCoolDown KaitunV4 (1808-1858)
-local ARMS = { "RightLowerArm", "RightUpperArm", "LeftLowerArm", "LeftUpperArm", "RightHand", "LeftHand" }
-
--- Lay SendHitsToServer (getsenv PlayerScripts LocalScript) - RETRY toi khi lay duoc (KHONG cache that bai)
-local _Z
-local function resolveZ()
-    if _Z then return _Z end
-    if not getsenv then return nil end
-    local ps = LocalPlayer:FindFirstChild("PlayerScripts"); if not ps then return nil end
-    local b = ps:FindFirstChildOfClass("LocalScript"); if not b then return nil end
-    local ok, env = pcall(getsenv, b)
-    if ok and env then
-        local g = env._G
-        if g then _Z = g.SendHitsToServer end
-    end
-    return _Z
-end
+local _cloneref = cloneref or function(x) return x end
 
 local function doAttack()
-    local c = char(); if not c then return end
-    -- phai DANG CAM vu khi (Tool trong Character)
-    local hasTool = false
-    for _, t in ipairs(c:GetChildren()) do if t:IsA("Tool") then hasTool = true; break end end
-    if not hasTool then return end
-    if not (RegisterAttack and RegisterHit) then return end
-    local ts = atkTargets(); if #ts == 0 then return end
-    local l, M = {}, nil
-    for _, e in ipairs(ts) do
-        if not e:GetAttribute("IsBoat") then
-            local p = e:FindFirstChild(ARMS[math.random(#ARMS)]) or e.PrimaryPart
-            if p then l[#l + 1] = { e, p }; M = p end
+    local c = char(); local root = hrp(); if not (c and root) then return end
+    local tool = c:FindFirstChildOfClass("Tool")
+    local wt = tool and tool:GetAttribute("WeaponType")
+    if not (tool and (wt == "Melee" or wt == "Sword" or tostring(tool.ToolTip) == "Melee" or tostring(tool.ToolTip) == "Sword")) then return end
+    if not (RegisterAttack and RegisterHit and _Net) then return end
+
+    -- gom muc tieu (Enemies, khong PvP) trong tam, lay MOI BasePart cua tung con
+    local hitTargets = {}
+    local folder = Workspace:FindFirstChild("Enemies")
+    if folder then
+        for _, target in ipairs(folder:GetChildren()) do
+            local hum = target:FindFirstChild("Humanoid")
+            local rp  = target:FindFirstChild("HumanoidRootPart")
+            if hum and rp and hum.Health > 0 and target ~= c and (rp.Position - root.Position).Magnitude <= ATK_RANGE then
+                for _, child in ipairs(target:GetChildren()) do
+                    if child:IsA("BasePart") then hitTargets[#hitTargets + 1] = { target, child } end
+                end
+            end
         end
     end
-    if not M then return end
-    RegisterAttack:FireServer(0)
-    local Z = resolveZ()
-    if Z then pcall(Z, M, l) else RegisterHit:FireServer(M, l) end -- uu tien SendHitsToServer, ko thi raw
+    if #hitTargets == 0 then return end
+
+    local targetHead = hitTargets[1][1]:FindFirstChild("Head") or hitTargets[1][2]
+    local seed = 0
+    pcall(function() seed = _Net.seed:InvokeServer() end)
+
+    RegisterAttack:FireServer()                         -- KHONG arg (banana)
+    RegisterHit:FireServer(targetHead, hitTargets, {})  -- 3 arg (banana)
+
+    if AttackRemoteTarget then                          -- ban ma hoa (cai nay moi an damage)
+        local key = math.floor(Workspace:GetServerTimeNow() / 10 % 10) + 1
+        local encoded = string.gsub("RE/RegisterHit", ".", function(ch)
+            return string.char(bit32.bxor(string.byte(ch), key))
+        end)
+        local finalId = bit32.bxor(AttackRemoteId + 909090, seed * 2)
+        _cloneref(AttackRemoteTarget):FireServer(encoded, finalId, targetHead, hitTargets)
+    end
 end
 
 task.spawn(function()
     while task.wait() do
-        if ATK.on and RegisterAttack and RegisterHit then pcall(doAttack) end
+        if ATK.on then pcall(doAttack) end
     end
 end)
 
