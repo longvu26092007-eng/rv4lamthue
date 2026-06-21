@@ -22,7 +22,7 @@ local LocalPlayer       = Players.LocalPlayer
 
 --==================  CONFIG  ==================--
 local CONFIG = {
-    TweenSpeed = 340,
+    TweenSpeed = 300,
     LoopWait   = 0.3,
     Team       = "Pirates",
 }
