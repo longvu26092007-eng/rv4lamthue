@@ -968,6 +968,12 @@ function isfullmoon()
     return game:GetService("Lighting"):GetAttribute("MoonPhase") == 5
 end
 
+-- CHỈ lấy server CÙNG PlaceId với mình. API fi11 trả cả Sea3 mới (100117331123089) lẫn cũ (7449423635)
+-- → teleport sang khác placeid dễ lỗi / sai bản game. So sánh số (tonumber an toàn nếu API trả chuỗi).
+function isSamePlace(serverEntry)
+    return serverEntry ~= nil and tonumber(serverEntry.placeid) == game.PlaceId
+end
+
 if module then module:noclip([[return true]]) end
 
 function getmob1(pos)
@@ -1476,17 +1482,22 @@ spawn(function()
                 local skip = false
                 if getgenv().Config["Hop Server FullMoon"] then
                     local isInFullmoonServer = isfullmoon()
-                    if not isInFullmoonServer or not isnight() then
+                    -- KHÔNG hop fullmoon khi đang in_trial / khúc kill-player (myStatus=="in_trail") dù đã
+                    -- hết fullmoon → tránh teleport cắt ngang trial/FFA (đang làm dở mà hop là hỏng + dễ kick).
+                    -- Chỉ hop lúc moon (đầu lượt, trước khi vào trial). Xong in_trial+kill-player mới hop lượt sau.
+                    if (not isInFullmoonServer or not isnight()) and myStatus ~= "in_trail" then
                         local hopped = false
                         pcall(function()
                             local cachedJobs = {}
                             local okCache, cacheData = pcall(function() return game.HttpService:JSONDecode(readfile("cache_v4.json")) end)
                             if okCache and cacheData then cachedJobs = cacheData end
                             local thua = Net.getJSON("http://fi11.bot-hosting.net:20758/api/name=fullmoon", 5)
-                            if thua and thua["success"] and thua["data"] then
+                            -- API trả {success, count, data:[{jobid, placeid, player}], updated_at}
+                            if thua and thua["success"] and type(thua["data"]) == "table" then
                                 for _, v in pairs(thua["data"]) do
                                     local jobid = v["jobid"]
-                                    if jobid and jobid ~= game.JobId and v.player <= 8 then
+                                    -- CÙNG PlaceId + bỏ server hiện tại + chỉ server ≤ 8 người (còn chỗ)
+                                    if jobid and jobid ~= game.JobId and v.player <= 8 and isSamePlace(v) then
                                         local lastVisit = cachedJobs[jobid]
                                         if not lastVisit or (math.floor(tick()) - lastVisit) > 3600 then
                                             status("[MAIN " .. myStt .. "] Hop fullmoon server")
