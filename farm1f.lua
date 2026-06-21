@@ -45,7 +45,7 @@ local function inSea3() return SEA_3[tostring(game.PlaceId)] == true end
 
 --==================  DEBUG / LOG  ==================--
 local killCount = 0            -- dem quai Tiki da giet (phia minh thay chet)
-local DBG = { action = "...", tyrant = false, mobs = 0, team = "?" }
+local DBG = { action = "...", tyrant = false, mobs = 0, team = "?", atk = "?" }
 local LOG = {}
 local function pushLog(m)
     table.insert(LOG, os.date("%H:%M:%S") .. "  " .. tostring(m))
@@ -204,11 +204,10 @@ end
 local _cloneref = cloneref or function(x) return x end
 
 local function doAttack()
-    local c = char(); local root = hrp(); if not (c and root) then return end
+    local c = char(); local root = hrp(); if not (c and root) then DBG.atk = "no char"; return end
     local tool = c:FindFirstChildOfClass("Tool")
-    local wt = tool and tool:GetAttribute("WeaponType")
-    if not (tool and (wt == "Melee" or wt == "Sword" or tostring(tool.ToolTip) == "Melee" or tostring(tool.ToolTip) == "Sword")) then return end
-    if not (RegisterAttack and RegisterHit and _Net) then return end
+    if not tool then DBG.atk = "CHUA CAM VU KHI"; return end           -- nhan moi tool dang cam (khong ep WeaponType)
+    if not (RegisterAttack and RegisterHit and _Net) then DBG.atk = "THIEU remote RegisterAttack/Hit"; return end
 
     -- gom muc tieu (Enemies, khong PvP) trong tam, lay MOI BasePart cua tung con
     local hitTargets = {}
@@ -224,16 +223,16 @@ local function doAttack()
             end
         end
     end
-    if #hitTargets == 0 then return end
+    if #hitTargets == 0 then DBG.atk = "ko co muc tieu <=60"; return end
 
     local targetHead = hitTargets[1][1]:FindFirstChild("Head") or hitTargets[1][2]
-    local seed = 0
-    pcall(function() seed = _Net.seed:InvokeServer() end)
+    local seed
+    pcall(function() if _Net:FindFirstChild("seed") then seed = _Net.seed:InvokeServer() end end)
 
     RegisterAttack:FireServer()                         -- KHONG arg (banana)
     RegisterHit:FireServer(targetHead, hitTargets, {})  -- 3 arg (banana)
 
-    if AttackRemoteTarget then                          -- ban ma hoa (cai nay moi an damage)
+    if AttackRemoteTarget and seed then                 -- ban ma hoa (cai nay moi an damage)
         local key = math.floor(Workspace:GetServerTimeNow() / 10 % 10) + 1
         local encoded = string.gsub("RE/RegisterHit", ".", function(ch)
             return string.char(bit32.bxor(string.byte(ch), key))
@@ -241,6 +240,7 @@ local function doAttack()
         local finalId = bit32.bxor(AttackRemoteId + 909090, seed * 2)
         _cloneref(AttackRemoteTarget):FireServer(encoded, finalId, targetHead, hitTargets)
     end
+    DBG.atk = ("DANH ok | tool:%s tgt:%d seed:%s enc:%s"):format(tool.Name, #hitTargets, seed and "ok" or "X", AttackRemoteTarget and "ok" or "X")
 end
 
 task.spawn(function()
@@ -390,7 +390,7 @@ local function MakeUI()
     gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.Parent = parent
 
     local main = Instance.new("Frame")
-    main.Size = UDim2.new(0, 320, 0, 304); main.Position = UDim2.new(0, 18, 0, 100)
+    main.Size = UDim2.new(0, 320, 0, 322); main.Position = UDim2.new(0, 18, 0, 100)
     main.BackgroundColor3 = Color3.fromRGB(18, 18, 24); main.BorderSizePixel = 0
     main.Active = true; main.Parent = gui
     Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
@@ -445,8 +445,9 @@ local function MakeUI()
     local lSea    = row(16, Color3.fromRGB(180, 200, 255), false, 3)
     local lKill   = row(16, Color3.fromRGB(150, 230, 150), true, 4)
     local lBoss   = row(16, Color3.fromRGB(255, 170, 170), true, 5)
-    local lLogT   = row(14, Color3.fromRGB(120, 130, 150), true, 6); lLogT.Text = "Log:"
-    local lLog    = row(88, Color3.fromRGB(160, 165, 180), false, 7)
+    local lAtk    = row(16, Color3.fromRGB(255, 180, 255), true, 6)
+    local lLogT   = row(14, Color3.fromRGB(120, 130, 150), true, 7); lLogT.Text = "Log:"
+    local lLog    = row(74, Color3.fromRGB(160, 165, 180), false, 8)
 
     -- keo tha
     local dragging, ds, sp
@@ -467,7 +468,7 @@ local function MakeUI()
     local mini = false
     btnMin.MouseButton1Click:Connect(function()
         mini = not mini; body.Visible = not mini
-        main.Size = mini and UDim2.new(0, 320, 0, 30) or UDim2.new(0, 320, 0, 304)
+        main.Size = mini and UDim2.new(0, 320, 0, 30) or UDim2.new(0, 320, 0, 322)
     end)
 
     task.spawn(function()
@@ -480,6 +481,7 @@ local function MakeUI()
             lKill.Text = ("Mat: %d/4  |  Kill: %d/%d  |  Con lai: %d %s"):format(eyesLit(), killCount, SUMMON_NEED, remain, ready and "→ SUMMON" or "")
             lKill.TextColor3 = ready and Color3.fromRGB(120, 230, 120) or Color3.fromRGB(230, 220, 120)
             lBoss.Text = ("Tyrant: %s    |    Mob spawn gan: %d"):format(DBG.tyrant and "✅ co" or "❌ chua", DBG.mobs)
+            lAtk.Text  = "Attack: " .. tostring(DBG.atk)
             lLog.Text  = table.concat(LOG, "\n")
         end
     end)
