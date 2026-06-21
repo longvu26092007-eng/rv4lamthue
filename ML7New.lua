@@ -21,9 +21,9 @@ getgenv().Settings = getgenv().Settings or {
 }
 
 getgenv().HOP_CONFIG = getgenv().HOP_CONFIG or {
-    MaxPlayers    = 7,     -- chỉ hop vào server < N người (nil = bỏ qua)
+    MaxPlayers    = 9,     -- chỉ hop vào server < N người (nil = bỏ qua)
     ForcedRegion  = nil,   -- "US" / "EU" / "AP" (nil = bỏ qua)
-    HopCooldown   = 2,     -- giây tối thiểu giữa 2 lần hop (chống spam teleport)
+    HopCooldown   = 8,     -- giây tối thiểu giữa 2 lần hop (chống spam teleport)
     CacheDuration = 60,    -- giây cache danh sách server
     MaxPages      = 100,   -- số trang tối đa khi lấy danh sách server
     Verbose       = false, -- true = in log hop chi tiết
@@ -200,7 +200,12 @@ end
 -- FastAttack (giữ nguyên cơ chế obfuscated gốc)
 local remoteAttack, idremote
 local seed = 0
-pcall(function() seed = ReplicatedStorage.Modules.Net.seed:InvokeServer() end)
+-- FIX UI: InvokeServer YIELD — để TOP-LEVEL mà remote 'seed' treo sẽ CHẶN luồng chính → UI (tạo bên
+-- dưới) KHÔNG BAO GIỜ hiện ("load team không lên UI"). Đẩy vào task.spawn → seed lấy nền, luồng chính
+-- chạy thẳng tới tạo UI. FastAttack đọc seed (mặc định 0) → set đúng sau ~tích tắc, không ảnh hưởng.
+task.spawn(function()
+    pcall(function() seed = ReplicatedStorage.Modules.Net.seed:InvokeServer() end)
+end)
 task.spawn(function()
     for _, v in next, {ReplicatedStorage:FindFirstChild("Util"), ReplicatedStorage:FindFirstChild("Common"),
                        ReplicatedStorage:FindFirstChild("Remotes"), ReplicatedStorage:FindFirstChild("Assets"),
