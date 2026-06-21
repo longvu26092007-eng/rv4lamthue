@@ -11,10 +11,24 @@ repeat
     task.wait(0.1)
 until (game:GetService("ReplicatedStorage") and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes") and game.Players and game.Players.LocalPlayer and not game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")) or (tick() - _bootT0) > 30
 
-if workspace:GetAttribute("MAP") and workspace:GetAttribute("MAP") ~= "Sea3" then
+-- ĐẦU GAME: phải đang ở SEA 3 (placeid 7449423635 cũ HOẶC 100117331123089 mới). Check bằng PLACEID
+-- (chắc hơn attribute MAP). KHÔNG phải Sea3 → travel lên Sea3 (Sea1→Sea2→Sea3), retry tới khi teleport.
+local SEA3_PLACEIDS = { [7449423635] = true, [100117331123089] = true }
+local SEA2_PLACEIDS = { [4442272183] = true, [79091703265657] = true }
+if not SEA3_PLACEIDS[game.PlaceId] then
     -- bọc thread con: InvokeServer YIELD được → tránh treo lúc load nếu server chậm
     task.spawn(function()
-        pcall(function() game:GetService("ReplicatedStorage").Remotes.CommF_:InvokeServer("TravelZou") end)
+        local R = game:GetService("ReplicatedStorage").Remotes.CommF_
+        while not SEA3_PLACEIDS[game.PlaceId] do
+            pcall(function()
+                if SEA2_PLACEIDS[game.PlaceId] then
+                    R:InvokeServer("TravelZou")        -- Sea2 → Sea3
+                else
+                    R:InvokeServer("TravelDressrosa")  -- Sea1/khác → Sea2 (vòng sau script chạy lại sẽ lên Sea3)
+                end
+            end)
+            task.wait(5)
+        end
     end)
 end
 if not isfile("cache_v4.json") then
