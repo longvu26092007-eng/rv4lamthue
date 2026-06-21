@@ -29,9 +29,11 @@ local CONFIG = {
 
 -- co bat/tat (doc getgenv neu co)
 local STATE = { farm = true, summon = false }
+local SUMMON_NEED = 300        -- so quai can giet de 4 mat dai bang sang (4 mat x 75 = 300)
 pcall(function()
     if getgenv().FarmTyrant ~= nil then STATE.farm = getgenv().FarmTyrant end
     if getgenv().SummonTyrant ~= nil then STATE.summon = getgenv().SummonTyrant end
+    if getgenv().SummonNeed then SUMMON_NEED = tonumber(getgenv().SummonNeed) or 300 end
     if getgenv().Team then CONFIG.Team = getgenv().Team end
 end)
 
@@ -40,6 +42,7 @@ local SEA_3 = { ["7449423635"] = true, ["100117331123089"] = true }
 local function inSea3() return SEA_3[tostring(game.PlaceId)] == true end
 
 --==================  DEBUG / LOG  ==================--
+local killCount = 0            -- dem quai Tiki da giet (phia minh thay chet)
 local DBG = { action = "...", tyrant = false, mobs = 0, team = "?" }
 local LOG = {}
 local function pushLog(m)
@@ -308,6 +311,30 @@ local function getTyrant()
     return e and e:FindFirstChild(TYRANT)
 end
 
+-- ===== DEM QUAI (tu lam - file goc KHONG co counter cho Tyrant) =====
+-- Theo doi quai Tiki bien mat khoi Enemies (~ da giet). 4 mat dai bang, moi mat 75 -> 300.
+local _seen = {}
+task.spawn(function()
+    while task.wait(0.25) do
+        local e = Workspace:FindFirstChild("Enemies")
+        if e and inSea3() then
+            local aliveNow = {}
+            for _, v in ipairs(e:GetChildren()) do
+                if isSpawnMob(v.Name) and v:FindFirstChild("Humanoid") then
+                    aliveNow[v] = true; _seen[v] = true
+                end
+            end
+            for v in pairs(_seen) do
+                if not aliveNow[v] then killCount = killCount + 1; _seen[v] = nil end
+            end
+        end
+    end
+end)
+
+-- KIEU A: chi dem kill. 4 mat dai bang, moi mat 75 kill -> 4x75 = 300 -> du thi summon.
+local function eyesLit() return math.min(4, math.floor(killCount / 75)) end -- 0..4 mat (theo kill)
+local function canSummon() return killCount >= SUMMON_NEED end              -- du 300 -> dap binh
+
 -- 1 buoc farm: co boss -> danh boss; chua co -> farm mob spawn / bay toi spawn
 local function farmStep()
     local enemies = Workspace:FindFirstChild("Enemies"); if not enemies then return end
@@ -337,33 +364,38 @@ local function farmStep()
     end
 end
 
--- summon: dap 7 be bang Z/X/C (khi chua co boss)
+-- summon: dap MOI binh (3 lan/luot) - LAP LAI cac be CHO DEN KHI boss spawn thi thoi
+-- (binh dat ngau nhien, co luot khong co binh -> phai dap nhieu vong)
 local function summonStep()
-    for _, cf in ipairs(TYRANT_PADS) do
-        if not (STATE.summon and inSea3()) or getTyrant() then break end
-        DBG.action = "Summon: dap be"
-        TP(cf * CFrame.new(0, 5, 0)); task.wait(0.3)
+    while STATE.summon and inSea3() and not getTyrant() do
+        for _, cf in ipairs(TYRANT_PADS) do
+            if not (STATE.summon and inSea3()) or getTyrant() then break end
+            DBG.action = "Summon: dap binh (cho boss spawn)"
+            TP(cf * CFrame.new(0, 5, 0)); task.wait(0.3)
 
-        -- GIU Y NGUYEN player khi pha binh: huy tween + ANCHOR (skill khong lam bay)
-        local root = hrp()
-        if _activeTween then pcall(function() _activeTween:Cancel() end) end
-        if root then pcall(function() root.Anchored = true end) end
+            -- GIU Y NGUYEN player khi pha binh: huy tween + ANCHOR (skill khong lam bay)
+            local root = hrp()
+            if _activeTween then pcall(function() _activeTween:Cancel() end) end
+            if root then pcall(function() root.Anchored = true end) end
 
-        pcall(function()
-            for _, tool in ipairs(LocalPlayer.Backpack:GetChildren()) do
-                if tool:IsA("Tool") then
-                    char().Humanoid:EquipTool(tool); task.wait(0.1)
-                    for _, k in ipairs({ "Z", "X", "C" }) do
-                        VIM:SendKeyEvent(true, k, false, game); task.wait(0.05); VIM:SendKeyEvent(false, k, false, game)
+            pcall(function()
+                for round = 1, 3 do -- dap moi binh 3 lan
+                    for _, tool in ipairs(LocalPlayer.Backpack:GetChildren()) do
+                        if tool:IsA("Tool") then
+                            char().Humanoid:EquipTool(tool); task.wait(0.1)
+                            for _, k in ipairs({ "Z", "X", "C" }) do
+                                VIM:SendKeyEvent(true, k, false, game); task.wait(0.05); VIM:SendKeyEvent(false, k, false, game)
+                            end
+                        end
                     end
                 end
-            end
-        end)
+            end)
 
-        -- LUON mo anchor lai (du skill loi)
-        if root then pcall(function() root.Anchored = false end) end
-        task.wait(1.5)
+            if root then pcall(function() root.Anchored = false end) end -- LUON mo anchor lai
+            task.wait(0.4)
+        end
     end
+    if getTyrant() then DBG.action = "Tyrant da spawn!" end
 end
 
 --==================  UI STATUS / DEBUG  ==================--
@@ -375,7 +407,7 @@ local function MakeUI()
     gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.Parent = parent
 
     local main = Instance.new("Frame")
-    main.Size = UDim2.new(0, 320, 0, 280); main.Position = UDim2.new(0, 18, 0, 100)
+    main.Size = UDim2.new(0, 320, 0, 304); main.Position = UDim2.new(0, 18, 0, 100)
     main.BackgroundColor3 = Color3.fromRGB(18, 18, 24); main.BorderSizePixel = 0
     main.Active = true; main.Parent = gui
     Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
@@ -428,9 +460,10 @@ local function MakeUI()
     end
     local lStatus = row(30, Color3.fromRGB(255, 210, 120), true, 2)
     local lSea    = row(16, Color3.fromRGB(180, 200, 255), false, 3)
-    local lBoss   = row(16, Color3.fromRGB(255, 170, 170), true, 4)
-    local lLogT   = row(14, Color3.fromRGB(120, 130, 150), true, 5); lLogT.Text = "Log:"
-    local lLog    = row(96, Color3.fromRGB(160, 165, 180), false, 6)
+    local lKill   = row(16, Color3.fromRGB(150, 230, 150), true, 4)
+    local lBoss   = row(16, Color3.fromRGB(255, 170, 170), true, 5)
+    local lLogT   = row(14, Color3.fromRGB(120, 130, 150), true, 6); lLogT.Text = "Log:"
+    local lLog    = row(88, Color3.fromRGB(160, 165, 180), false, 7)
 
     -- keo tha
     local dragging, ds, sp
@@ -451,14 +484,18 @@ local function MakeUI()
     local mini = false
     btnMin.MouseButton1Click:Connect(function()
         mini = not mini; body.Visible = not mini
-        main.Size = mini and UDim2.new(0, 320, 0, 30) or UDim2.new(0, 320, 0, 280)
+        main.Size = mini and UDim2.new(0, 320, 0, 30) or UDim2.new(0, 320, 0, 304)
     end)
 
     task.spawn(function()
         while gui.Parent do
             task.wait(0.3)
-            lStatus.Text = "● " .. tostring(_G.FarmFragStatus or DBG.action or "...")
+            lStatus.Text = "● " .. tostring(DBG.action or _G.FarmFragStatus or "...")
             lSea.Text  = ("Place: %s  (%s)   |   Team: %s"):format(tostring(game.PlaceId), inSea3() and "Sea 3" or "KHONG Sea 3", DBG.team)
+            local ready  = canSummon()
+            local remain = math.max(0, SUMMON_NEED - killCount)
+            lKill.Text = ("Mat: %d/4  |  Kill: %d/%d  |  Con lai: %d %s"):format(eyesLit(), killCount, SUMMON_NEED, remain, ready and "→ SUMMON" or "")
+            lKill.TextColor3 = ready and Color3.fromRGB(120, 230, 120) or Color3.fromRGB(230, 220, 120)
             lBoss.Text = ("Tyrant: %s    |    Mob spawn gan: %d"):format(DBG.tyrant and "✅ co" or "❌ chua", DBG.mobs)
             lLog.Text  = table.concat(LOG, "\n")
         end
@@ -467,8 +504,9 @@ end
 pcall(MakeUI)
 
 --==================  MAIN LOOP  ==================--
+local _hadBoss = false
 local function Main()
-    print("[Frag] Place:", game.PlaceId, "| Farm:", STATE.farm, "| Summon:", STATE.summon)
+    print("[Frag] Place:", game.PlaceId, "| Farm:", STATE.farm, "| Summon:", STATE.summon, "| Need:", SUMMON_NEED)
     EnsureTeam()
     while task.wait(CONFIG.LoopWait) do
         _noclip = inSea3() and (STATE.farm or STATE.summon) == true
@@ -480,12 +518,23 @@ local function Main()
                 goToSea3()
                 return
             end
-            if STATE.summon and not getTyrant() then
-                summonStep()
+
+            local boss = getTyrant()
+            DBG.tyrant = boss ~= nil
+            -- boss vua summon -> reset dem (mat sang reset sau khi trieu hoi)
+            if boss and not _hadBoss then killCount = 0; _seen = {}; Status("Tyrant da spawn -> reset dem") end
+            _hadBoss = boss ~= nil
+
+            if boss then
+                if STATE.farm then farmStep() else DBG.action = "Boss co san (Farm OFF)" end
+            elseif canSummon() then
+                -- du 300 kill / mat sang -> chi qua summon khi bat SummonTyrant
+                if STATE.summon then summonStep()
+                else DBG.action = ("Du %d kill (mat sang) -> bat SummonTyrant de trieu hoi"):format(killCount) end
             elseif STATE.farm then
-                farmStep()
+                farmStep() -- chua du -> farm mob (dem len)
             else
-                DBG.action = "Tat ca OFF (bat Farm/Summon tren UI)"
+                DBG.action = "Chua du kill & Farm OFF"
             end
         end)
         if not ok then
