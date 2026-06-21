@@ -2,7 +2,7 @@
     FarmFrag.lua  -  Auto Farm + Summon "Tyrant of the Skies" (Sea 3)
     ----------------------------------------------------------------------
     - Ban A (huy_Banana / 1.txt / 5.txt:11795-11875): farm mob spawn boss + danh boss + summon pad.
-    - Combat = 3 lop danh chong (be tu KaitunV4): RegisterAttack/RegisterHit + LeftClickRemote + RegisterHit ma hoa.
+    - Combat = 1 ham danh sach (RegisterAttack + RegisterHit) kieu AttackNoCoolDown KaitunV4 (khong chong nhau).
     - Khong o Sea 3 -> tu len Sea 3 (TravelZou). Load team (SetTeam). Co bang Status/Debug (keo tha + nut bat/tat).
 
     getgenv().FarmTyrant  = true   -- bat auto farm Tyrant (mac dinh true)
@@ -155,20 +155,6 @@ local _Modules       = ReplicatedStorage:FindFirstChild("Modules")
 local _Net           = _Modules and _Modules:FindFirstChild("Net")
 local RegisterAttack = _Net and (_Net:FindFirstChild("RE/RegisterAttack") or _Net:WaitForChild("RE/RegisterAttack", 5))
 local RegisterHit    = _Net and (_Net:FindFirstChild("RE/RegisterHit") or _Net:WaitForChild("RE/RegisterHit", 5))
-local _cloneref      = cloneref or function(x) return x end
-
-local encRemote, encId
-for _, name in ipairs({ "Util", "Common", "Remotes", "Assets", "FX" }) do
-    local c = ReplicatedStorage:FindFirstChild(name)
-    if c then
-        for _, n in ipairs(c:GetChildren()) do
-            if n:IsA("RemoteEvent") and n:GetAttribute("Id") then encRemote, encId = n, n:GetAttribute("Id") end
-        end
-        c.ChildAdded:Connect(function(n)
-            if n:IsA("RemoteEvent") and n:GetAttribute("Id") then encRemote, encId = n, n:GetAttribute("Id") end
-        end)
-    end
-end
 
 -- chi danh Enemies (farm boss/mob - khong PvP)
 local function atkTargets()
@@ -184,91 +170,64 @@ local function atkTargets()
     return out
 end
 
--- LOP 1
+-- 1 HAM DANH SACH (AttackNoCoolDown KaitunV4) - KHONG chong 3 lop
+local ARMS = { "RightLowerArm", "RightUpperArm", "LeftLowerArm", "LeftUpperArm", "RightHand", "LeftHand", "Torso", "UpperTorso", "HumanoidRootPart" }
+
+-- Lay SendHitsToServer cua client (qua getsenv) + co COMBAT_REMOTE_THREAD.
+-- Nhieu phien ban can hit qua SendHitsToServer (validation) moi AN DAMAGE; khong thi fallback raw.
+local _Z, _Zdone, _thread
+local function getCombat()
+    if not _Zdone then
+        _Zdone = true
+        pcall(function()
+            if not getsenv then return end
+            local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+            local ls = ps and ps:FindFirstChildOfClass("LocalScript")
+            if ls then
+                local env = getsenv(ls)
+                if env and env._G then _Z = env._G.SendHitsToServer end
+            end
+        end)
+    end
+    if _thread == nil then
+        _thread = false
+        pcall(function()
+            local f = _Modules and _Modules:FindFirstChild("Flags")
+            if f then local t = require(f); _thread = (t and t.COMBAT_REMOTE_THREAD) and true or false end
+        end)
+    end
+end
+
+local function doAttack()
+    local c = char(); if not c then return end
+    if not c:FindFirstChildOfClass("Tool") then return end -- phai dang cam vu khi (Melee)
+    local ts = atkTargets(); if #ts == 0 then return end
+    local list, base = {}, nil
+    for _, t in ipairs(ts) do
+        if not t:GetAttribute("IsBoat") then
+            local p
+            for _, n in ipairs(ARMS) do p = t:FindFirstChild(n); if p then break end end
+            p = p or t.PrimaryPart
+            if p then list[#list + 1] = { t, p }; base = p end
+        end
+    end
+    if not base then return end
+    getCombat()
+    RegisterAttack:FireServer(0)
+    if _thread and _Z then
+        pcall(_Z, base, list)               -- qua SendHitsToServer (validation)
+    else
+        RegisterHit:FireServer(base, list)  -- raw fallback
+    end
+end
+
 task.spawn(function()
     while task.wait() do
-        if ATK.on and RegisterAttack and RegisterHit then
-            pcall(function()
-                local ts = atkTargets(); if #ts == 0 then return end
-                local list, base = {}, nil
-                local arms = { "RightLowerArm", "RightUpperArm", "LeftLowerArm", "LeftUpperArm", "RightHand", "LeftHand" }
-                for _, t in ipairs(ts) do
-                    if not t:GetAttribute("IsBoat") then
-                        local p = t:FindFirstChild(arms[math.random(#arms)]) or t.PrimaryPart or t:FindFirstChild("HumanoidRootPart")
-                        if p then list[#list + 1] = { t, p }; base = p end
-                    end
-                end
-                if base then RegisterAttack:FireServer(0); RegisterHit:FireServer(base, list) end
-            end)
-        end
+        if ATK.on and RegisterAttack and RegisterHit then pcall(doAttack) end
     end
 end)
 
--- LOP 2
-task.spawn(function()
-    while task.wait() do
-        if ATK.on then
-            pcall(function()
-                local c = char(); if not c then return end
-                local tool = c:FindFirstChildOfClass("Tool")
-                if not tool or tool.ToolTip == "Gun" then return end
-                local ts = atkTargets(); if #ts == 0 then return end
-                if tool:FindFirstChild("LeftClickRemote") then
-                    for _, e in ipairs(ts) do
-                        local eh = e:FindFirstChild("HumanoidRootPart")
-                        if eh then
-                            local dir = (eh.Position - c:GetPivot().Position).Unit
-                            pcall(function() tool.LeftClickRemote:FireServer(dir, 1) end)
-                        end
-                    end
-                elseif RegisterAttack and RegisterHit then
-                    local list, base = {}, nil
-                    for _, e in ipairs(ts) do
-                        local head = e:FindFirstChild("Head") or e:FindFirstChild("HumanoidRootPart")
-                        if head then list[#list + 1] = { e, head }; base = head end
-                    end
-                    if base then RegisterAttack:FireServer(0); RegisterHit:FireServer(base, list) end
-                end
-            end)
-        end
-    end
-end)
-
--- LOP 3 (ma hoa)
-task.spawn(function()
-    while task.wait(0.05) do
-        if ATK.on and _Net and RegisterAttack and RegisterHit then
-            pcall(function()
-                local c = char(); local root = hrp(); if not (c and root) then return end
-                local tool = c:FindFirstChildOfClass("Tool")
-                if not (tool and (tool:GetAttribute("WeaponType") == "Melee" or tool:GetAttribute("WeaponType") == "Sword")) then return end
-                local parts = {}
-                local folder = Workspace:FindFirstChild("Enemies")
-                if folder then for _, v in ipairs(folder:GetChildren()) do
-                    local vh, hum = v:FindFirstChild("HumanoidRootPart"), v:FindFirstChild("Humanoid")
-                    if v ~= c and vh and hum and hum.Health > 0 and (vh.Position - root.Position).Magnitude <= ATK_RANGE then
-                        for _, _v in ipairs(v:GetChildren()) do
-                            if _v:IsA("BasePart") then parts[#parts + 1] = { v, _v } end
-                        end
-                    end
-                end end
-                if #parts == 0 then return end
-                local head = parts[1][1]:FindFirstChild("Head"); if not head then return end
-                RegisterAttack:FireServer()
-                RegisterHit:FireServer(head, parts, {}, tostring(LocalPlayer.UserId):sub(2, 4) .. tostring(coroutine.running()):sub(11, 15))
-                if encRemote and encId then
-                    _cloneref(encRemote):FireServer(
-                        string.gsub("RE/RegisterHit", ".", function(ch)
-                            return string.char(bit32.bxor(string.byte(ch), math.floor(workspace:GetServerTimeNow() / 10 % 10) + 1))
-                        end),
-                        bit32.bxor(encId + 909090, _Net.seed:InvokeServer() * 2), head, parts)
-                end
-            end)
-        end
-    end
-end)
-
--- bring + giet 1 muc tieu bang 3 lop (khong spam chieu - day la quai)
+-- bring + giet 1 muc tieu (khong spam chieu - day la quai)
 -- Farm 1 muc tieu theo dung logic training KaitunV4:
 --   eq (Melee) + haki + bat dong hoa (WalkSpeed/JumpPower 0, ChangeState Physics, SimRadius huge) + topos len dau +20
 local function bringAndKill(v, untilFn)
