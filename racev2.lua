@@ -45,6 +45,14 @@ local SEA_2 = {["4442272183"] = true, ["79091703265657"] = true}
 local SEA_3 = {["7449423635"] = true, ["100117331123089"] = true}
 local function inSea2() return SEA_2[tostring(game.PlaceId)] == true end
 
+-- Trang thai debug (main loop cap nhat, UI doc) + log dong
+local DBG = { v2 = false, wenlock = false, v3 = false }
+local LOG = {}
+local function pushLog(m)
+    table.insert(LOG, os.date("%H:%M:%S") .. "  " .. tostring(m))
+    while #LOG > 8 do table.remove(LOG, 1) end
+end
+
 --==================  HELPERS  ==================--
 local function Remotes() return ReplicatedStorage:FindFirstChild("Remotes") end
 
@@ -90,6 +98,7 @@ end
 -- Trang thai / log
 local function Status(msg)
     _G.UpgradeRaceStatus = msg
+    pushLog(msg)
     print("[Race] " .. tostring(msg))
 end
 
@@ -111,44 +120,164 @@ local function hasItem(name)
     return (LocalPlayer.Backpack:FindFirstChild(name) or (char() and char():FindFirstChild(name))) ~= nil
 end
 
---==================  COMBAT (don gian, tu chua)  ==================--
+--==================  COMBAT: 3 LOP DANH CHONG (be nguyen tu KaitunV4)  ==================--
 local function equipFirstWeapon()
     local c = char(); if not c then return end
-    -- uu tien Melee, khong thi lay tool dau tien
     for _, v in ipairs(LocalPlayer.Backpack:GetChildren()) do
-        if v:IsA("Tool") and tostring(v.ToolTip) == "Melee" then
-            c.Humanoid:EquipTool(v); return
-        end
+        if v:IsA("Tool") and tostring(v.ToolTip) == "Melee" then c.Humanoid:EquipTool(v); return end
     end
     for _, v in ipairs(LocalPlayer.Backpack:GetChildren()) do
         if v:IsA("Tool") then c.Humanoid:EquipTool(v); return end
     end
 end
 
-local function clickAttack()
-    pcall(function()
-        VirtualUser:Button1Down(Vector2.new(1280, 600))
-        VirtualUser:Button1Up(Vector2.new(1280, 600))
-    end)
-end
-
 local function buso()
     if char() and not char():FindFirstChild("HasBuso") then CommF("Buso") end
 end
 
--- Giet mob co Humanoid (TP len dau + click + Z/X/C)
+-- Cong tac danh: on = bat 3 lop; players = co danh ca nguoi (Characters) hay khong
+local ATK = { on = false, players = false }
+local ATK_RANGE = 60
+
+local _Modules       = ReplicatedStorage:FindFirstChild("Modules")
+local _Net           = _Modules and _Modules:FindFirstChild("Net")
+local RegisterAttack = _Net and (_Net:FindFirstChild("RE/RegisterAttack") or _Net:WaitForChild("RE/RegisterAttack", 5))
+local RegisterHit    = _Net and (_Net:FindFirstChild("RE/RegisterHit") or _Net:WaitForChild("RE/RegisterHit", 5))
+local _cloneref      = cloneref or function(x) return x end
+
+-- remote ma hoa (RemoteEvent co attribute Id) cho lop 3
+local encRemote, encId
+for _, name in ipairs({ "Util", "Common", "Remotes", "Assets", "FX" }) do
+    local c = ReplicatedStorage:FindFirstChild(name)
+    if c then
+        for _, n in ipairs(c:GetChildren()) do
+            if n:IsA("RemoteEvent") and n:GetAttribute("Id") then encRemote, encId = n, n:GetAttribute("Id") end
+        end
+        c.ChildAdded:Connect(function(n)
+            if n:IsA("RemoteEvent") and n:GetAttribute("Id") then encRemote, encId = n, n:GetAttribute("Id") end
+        end)
+    end
+end
+
+-- folder muc tieu: luon Enemies; them Characters khi ATK.players
+local function atkFolders()
+    local f = { Workspace:FindFirstChild("Enemies") }
+    if ATK.players then table.insert(f, Workspace:FindFirstChild("Characters")) end
+    return f
+end
+local function atkTargets()
+    local root = hrp(); local out = {}
+    if not root then return out end
+    for _, folder in ipairs(atkFolders()) do
+        if folder then for _, v in ipairs(folder:GetChildren()) do
+            local hum, vh = v:FindFirstChild("Humanoid"), v:FindFirstChild("HumanoidRootPart")
+            if v ~= char() and hum and vh and hum.Health > 0 and (vh.Position - root.Position).Magnitude <= ATK_RANGE then
+                out[#out + 1] = v
+            end
+        end end
+    end
+    return out
+end
+
+-- LOP 1: RegisterAttack + RegisterHit (kieu AttackNoCoolDown)
+task.spawn(function()
+    while task.wait() do
+        if ATK.on and RegisterAttack and RegisterHit then
+            pcall(function()
+                local ts = atkTargets(); if #ts == 0 then return end
+                local list, base = {}, nil
+                local arms = { "RightLowerArm", "RightUpperArm", "LeftLowerArm", "LeftUpperArm", "RightHand", "LeftHand" }
+                for _, t in ipairs(ts) do
+                    if not t:GetAttribute("IsBoat") then
+                        local p = t:FindFirstChild(arms[math.random(#arms)]) or t.PrimaryPart or t:FindFirstChild("HumanoidRootPart")
+                        if p then list[#list + 1] = { t, p }; base = p end
+                    end
+                end
+                if not base then return end
+                RegisterAttack:FireServer(0)
+                RegisterHit:FireServer(base, list)
+            end)
+        end
+    end
+end)
+
+-- LOP 2: LeftClickRemote tung muc tieu (kieu FastAttack)
+task.spawn(function()
+    while task.wait() do
+        if ATK.on then
+            pcall(function()
+                local c = char(); if not c then return end
+                local tool = c:FindFirstChildOfClass("Tool")
+                if not tool or tool.ToolTip == "Gun" then return end
+                local ts = atkTargets(); if #ts == 0 then return end
+                if tool:FindFirstChild("LeftClickRemote") then
+                    for _, e in ipairs(ts) do
+                        local eh = e:FindFirstChild("HumanoidRootPart")
+                        if eh then
+                            local dir = (eh.Position - c:GetPivot().Position).Unit
+                            pcall(function() tool.LeftClickRemote:FireServer(dir, 1) end)
+                        end
+                    end
+                elseif RegisterAttack and RegisterHit then
+                    local list, base = {}, nil
+                    for _, e in ipairs(ts) do
+                        local head = e:FindFirstChild("Head") or e:FindFirstChild("HumanoidRootPart")
+                        if head then list[#list + 1] = { e, head }; base = head end
+                    end
+                    if base then RegisterAttack:FireServer(0); RegisterHit:FireServer(base, list) end
+                end
+            end)
+        end
+    end
+end)
+
+-- LOP 3: RegisterHit ma hoa (cloneref remote XOR seed)
+task.spawn(function()
+    while task.wait(0.05) do
+        if ATK.on and _Net and RegisterAttack and RegisterHit then
+            pcall(function()
+                local c = char(); local root = hrp(); if not (c and root) then return end
+                local tool = c:FindFirstChildOfClass("Tool")
+                if not (tool and (tool:GetAttribute("WeaponType") == "Melee" or tool:GetAttribute("WeaponType") == "Sword")) then return end
+                local parts = {}
+                for _, folder in ipairs(atkFolders()) do
+                    if folder then for _, v in ipairs(folder:GetChildren()) do
+                        local vh, hum = v:FindFirstChild("HumanoidRootPart"), v:FindFirstChild("Humanoid")
+                        if v ~= c and vh and hum and hum.Health > 0 and (vh.Position - root.Position).Magnitude <= ATK_RANGE then
+                            for _, _v in ipairs(v:GetChildren()) do
+                                if _v:IsA("BasePart") then parts[#parts + 1] = { v, _v } end
+                            end
+                        end
+                    end end
+                end
+                if #parts == 0 then return end
+                local head = parts[1][1]:FindFirstChild("Head"); if not head then return end
+                RegisterAttack:FireServer()
+                RegisterHit:FireServer(head, parts, {}, tostring(LocalPlayer.UserId):sub(2, 4) .. tostring(coroutine.running()):sub(11, 15))
+                if encRemote and encId then
+                    _cloneref(encRemote):FireServer(
+                        string.gsub("RE/RegisterHit", ".", function(ch)
+                            return string.char(bit32.bxor(string.byte(ch), math.floor(workspace:GetServerTimeNow() / 10 % 10) + 1))
+                        end),
+                        bit32.bxor(encId + 909090, _Net.seed:InvokeServer() * 2), head, parts)
+                end
+            end)
+        end
+    end
+end)
+
+-- Giet QUAI: chi bat 3 lop, KHONG spam chieu (race v2 zombie / boss quest)
 local function killMob(v, stillOn)
     if not (v and v:FindFirstChild("Humanoid") and v:FindFirstChild("HumanoidRootPart")) then return end
     equipFirstWeapon()
+    ATK.players = false
+    ATK.on = true
     repeat
         buso()
-        TP(v.HumanoidRootPart.CFrame * CFrame.new(0, 20, 0))
-        clickAttack()
-        VIM:SendKeyEvent(true, "Z", false, game); VIM:SendKeyEvent(false, "Z", false, game)
-        VIM:SendKeyEvent(true, "X", false, game); VIM:SendKeyEvent(false, "X", false, game)
-        VIM:SendKeyEvent(true, "C", false, game); VIM:SendKeyEvent(false, "C", false, game)
+        TP(v.HumanoidRootPart.CFrame * CFrame.new(0, 18, 0))
         task.wait(0.2)
     until not v.Parent or v.Humanoid.Health <= 0 or (stillOn and not stillOn())
+    ATK.on = false
 end
 
 local function findEnemy(name)
@@ -367,9 +496,11 @@ local function v3_Fishman()
     end
 end
 
--- PvP: giet 1 player model (dung cho Skypiea + Ghoul)
+-- PvP: giet 1 player model (Skypiea + Ghoul) -> 3 lop + SPAM CHIEU Z/X/C
 local function killPlayer(model)
     equipFirstWeapon()
+    ATK.players = true
+    ATK.on = true
     repeat
         buso()
         if LocalPlayer.PlayerGui.Main:FindFirstChild("PvpDisabled") and LocalPlayer.PlayerGui.Main.PvpDisabled.Visible then
@@ -377,12 +508,12 @@ local function killPlayer(model)
         end
         local off = ({ CFrame.new(0,35,1), CFrame.new(0,1,35), CFrame.new(35,1,0), CFrame.new(-35,1,0) })[math.random(1,4)]
         TP(model.HumanoidRootPart.CFrame * off)
-        clickAttack()
         VIM:SendKeyEvent(true, "Z", false, game); VIM:SendKeyEvent(false, "Z", false, game)
         VIM:SendKeyEvent(true, "X", false, game); VIM:SendKeyEvent(false, "X", false, game)
         VIM:SendKeyEvent(true, "C", false, game); VIM:SendKeyEvent(false, "C", false, game)
         task.wait(0.2)
     until not model.Parent or (model:FindFirstChild("Humanoid") and model.Humanoid.Health <= 0)
+    ATK.on = false
 end
 
 -- SKYPIEA: giet 1 nguoi toc Skypiea (het -> hop)
@@ -480,6 +611,207 @@ local function doV3()
     if fn then Status("V3: " .. raceName()); fn() else Status("Toc '" .. raceName() .. "' khong ho tro V3") end
 end
 
+--==================  CHON TOC / REROLL (getgenv().race)  ==================--
+-- getgenv().race = "rabbit;shark;angel;human;ghoul;cyborg"
+--   rabbit->Mink  shark->Fishman  angel->Skypiea  human  : roll 2500 Fragment toi khi ra
+--   ghoul, cyborg : KHONG roll duoc -> lam/mua theo Banana
+local RACE_MAP = {
+    rabbit = "Mink",    mink = "Mink",
+    shark = "Fishman",  fishman = "Fishman",
+    angel = "Skypiea",  skypiea = "Skypiea",
+    human = "Human",
+    ghoul = "Ghoul",
+    cyborg = "Cyborg",
+}
+local REROLLABLE = { Human = true, Mink = true, Fishman = true, Skypiea = true }
+
+local function targetRace()
+    local r
+    pcall(function() r = getgenv().race end)
+    if not r or r == "" then return nil end
+    return RACE_MAP[string.lower(tostring(r))]
+end
+
+-- Mua Ghoul/Cyborg = remote CO DINH (Banana "Buy Ghoul/Cyborg Race"). Throttle 3s + 1.5s detect.
+local _lastBuy = 0
+
+-- GHOUL: Ectoplasm BuyCheck 4 -> Change 4
+local function getGhoul()
+    if tick() - _lastBuy < 3 then return end
+    _lastBuy = tick()
+    Status("Buy Ghoul Race (Ectoplasm)")
+    CommF("Ectoplasm", "BuyCheck", 4)
+    task.wait(0.5)
+    CommF("Ectoplasm", "Change", 4)
+    task.wait(1.5)
+end
+
+-- CYBORG: CyborgTrainer Buy
+local function getCyborg()
+    if tick() - _lastBuy < 3 then return end
+    _lastBuy = tick()
+    Status("Buy Cyborg Race (CyborgTrainer)")
+    CommF("CyborgTrainer", "Buy")
+    task.wait(1.5)
+end
+
+-- Tra ve true neu da dung toc (hoac khong set muc tieu); false neu dang doi/lam.
+local _lastRoll = 0
+local function ensureRace()
+    local target = targetRace()
+    if not target then return true end           -- khong set getgenv().race
+    if raceName() == target then return true end -- da dung toc
+
+    if target == "Ghoul" then getGhoul(); return false end
+    if target == "Cyborg" then getCyborg(); return false end
+
+    if REROLLABLE[target] then
+        local d = LocalPlayer:FindFirstChild("Data")
+        if d and d:FindFirstChild("Fragments") and d.Fragments.Value < 2500 then
+            Status("Reroll: thieu Fragment (<2500) | toc hien tai " .. raceName()); return false
+        end
+        if tick() - _lastRoll >= 3 then           -- moi roll cach nhau 3s
+            Status("Reroll race -> " .. target .. " (dang la " .. raceName() .. ")")
+            CommF("BlackbeardReward", "Reroll", "1")
+            CommF("BlackbeardReward", "Reroll", "2")
+            _lastRoll = tick()
+            task.wait(1.5)                         -- delay 1.5s detect toc hien tai
+        end
+        return false
+    end
+    return true
+end
+
+--==================  UI STATUS / DEBUG  ==================--
+local function tickMark(b) return b and "✅" or "❌" end
+
+local function seaName()
+    local p = tostring(game.PlaceId)
+    if SEA_1[p] then return "Sea 1" elseif SEA_2[p] then return "Sea 2" elseif SEA_3[p] then return "Sea 3" end
+    return "?"
+end
+
+local function fmtNum(n)
+    local s = tostring(math.floor(tonumber(n) or 0))
+    return (s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
+end
+
+local function detailText()
+    local r = raceName()
+    if r == "Mink" then return "Mink: Chest " .. mink_count .. "/30"
+    elseif r == "Human" then return ("Human: Fajita %s Jeremy %s Diamond %s"):format(tickMark(kHuman.Fajita), tickMark(kHuman.Jeremy), tickMark(kHuman.Diamond))
+    elseif r == "Fishman" then return "Fishman: lai boat -> giet SeaBeast"
+    elseif r == "Skypiea" then return "Skypiea: PvP nguoi toc Skypiea"
+    elseif r == "Cyborg" then return "Cyborg: LoadFruit 1 trai"
+    elseif r == "Ghoul" then return "Ghoul: PvP giet nguoi"
+    end
+    return r
+end
+
+local function MakeUI()
+    local parent = (gethui and gethui()) or game:GetService("CoreGui")
+    local old = parent:FindFirstChild("UpgradeRaceUI"); if old then old:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "UpgradeRaceUI"; gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.Parent = parent
+
+    local main = Instance.new("Frame")
+    main.Size = UDim2.new(0, 320, 0, 256)
+    main.Position = UDim2.new(0, 18, 0, 110)
+    main.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+    main.BorderSizePixel = 0; main.Active = true; main.Parent = gui
+    Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+    local stroke = Instance.new("UIStroke", main)
+    stroke.Color = Color3.fromRGB(70, 90, 160); stroke.Thickness = 1
+
+    -- title bar (keo tha)
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(1, 0, 0, 30); bar.BackgroundColor3 = Color3.fromRGB(30, 32, 44)
+    bar.BorderSizePixel = 0; bar.Parent = main
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 8)
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1; title.Size = UDim2.new(1, -36, 1, 0)
+    title.Position = UDim2.new(0, 10, 0, 0); title.Font = Enum.Font.GothamBold
+    title.TextSize = 13; title.TextColor3 = Color3.fromRGB(235, 235, 245)
+    title.TextXAlignment = Enum.TextXAlignment.Left; title.Text = "Upgrade Race  •  Debug"
+    title.Parent = bar
+
+    local btnMin = Instance.new("TextButton")
+    btnMin.Size = UDim2.new(0, 26, 0, 22); btnMin.Position = UDim2.new(1, -30, 0, 4)
+    btnMin.BackgroundColor3 = Color3.fromRGB(55, 60, 80); btnMin.Text = "–"
+    btnMin.Font = Enum.Font.GothamBold; btnMin.TextSize = 14
+    btnMin.TextColor3 = Color3.fromRGB(255, 255, 255); btnMin.Parent = bar
+    Instance.new("UICorner", btnMin).CornerRadius = UDim.new(0, 6)
+
+    -- body
+    local body = Instance.new("Frame")
+    body.BackgroundTransparency = 1; body.Position = UDim2.new(0, 10, 0, 36)
+    body.Size = UDim2.new(1, -20, 1, -44); body.Parent = main
+    local layout = Instance.new("UIListLayout", body)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder; layout.Padding = UDim.new(0, 3)
+
+    local function row(h, color, bold, order)
+        local l = Instance.new("TextLabel")
+        l.BackgroundTransparency = 1; l.Size = UDim2.new(1, 0, 0, h)
+        l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+        l.TextSize = 12; l.TextColor3 = color or Color3.fromRGB(210, 210, 220)
+        l.TextXAlignment = Enum.TextXAlignment.Left; l.TextYAlignment = Enum.TextYAlignment.Top
+        l.TextWrapped = true; l.LayoutOrder = order; l.Text = ""; l.Parent = body
+        return l
+    end
+
+    local lStatus = row(32, Color3.fromRGB(120, 220, 140), true, 1)
+    local lInfo   = row(16, Color3.fromRGB(180, 200, 255), false, 2)
+    local lSea    = row(16, Color3.fromRGB(180, 200, 255), false, 3)
+    local lStage  = row(16, Color3.fromRGB(255, 220, 150), true, 4)
+    local lDetail = row(16, Color3.fromRGB(200, 200, 210), false, 5)
+    local lLogT   = row(14, Color3.fromRGB(120, 130, 150), true, 6); lLogT.Text = "Log:"
+    local lLog    = row(90, Color3.fromRGB(160, 165, 180), false, 7)
+
+    -- keo tha bang title bar
+    local dragging, dragStart, startPos
+    bar.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; dragStart = i.Position; startPos = main.Position
+        end
+    end)
+    game:GetService("UserInputService").InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - dragStart
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+    game:GetService("UserInputService").InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    end)
+
+    local mini = false
+    btnMin.MouseButton1Click:Connect(function()
+        mini = not mini
+        body.Visible = not mini
+        main.Size = mini and UDim2.new(0, 320, 0, 30) or UDim2.new(0, 320, 0, 256)
+    end)
+
+    -- vong cap nhat
+    task.spawn(function()
+        while gui.Parent do
+            task.wait(0.3)
+            lStatus.Text = "● " .. tostring(_G.UpgradeRaceStatus or "...")
+            lStatus.TextColor3 = _G.UpgradeRaceV3Done and Color3.fromRGB(120, 220, 140) or Color3.fromRGB(255, 235, 150)
+            local tgt = targetRace()
+            local tocStr = raceName() .. ((tgt and tgt ~= raceName()) and (" -> " .. tgt) or "")
+            lInfo.Text  = ("Toc: %s   |   Lv: %s   |   Beli: %s"):format(tocStr, fmtNum(level()), fmtNum(beli()))
+            lSea.Text   = ("Place: %s  (%s)"):format(tostring(game.PlaceId), seaName())
+            lStage.Text = ("V2 %s    Wenlock %s    V3 %s"):format(tickMark(DBG.v2), tickMark(DBG.wenlock), tickMark(DBG.v3 or _G.UpgradeRaceV3Done))
+            lDetail.Text = detailText()
+            lLog.Text   = table.concat(LOG, "\n")
+        end
+    end)
+end
+
+pcall(MakeUI)
+
 --==================  MAIN LOOP  ==================--
 local function CheckPre()
     if not hrp() then _G.KhongDatYeuCau = "Nhan vat chua load"; return false end
@@ -503,14 +835,22 @@ local function Main()
                 return
             end
 
-            if CONFIG.DoV2 and not isV2Done() then
+            -- Chon toc: reroll / mua toi khi dung getgenv().race roi moi up
+            if not ensureRace() then return end
+
+            local v2 = isV2Done(); DBG.v2 = v2
+            if CONFIG.DoV2 and not v2 then
                 doV2()
-            elseif CONFIG.DoDonSwan and not wenlockOpen() then
-                doDonSwan()
-            elseif CONFIG.DoV3 then
-                doV3()
-                if _G.UpgradeRaceV3Done then return end
+            else
+                local wl = wenlockOpen(); DBG.wenlock = wl
+                if CONFIG.DoDonSwan and not wl then
+                    doDonSwan()
+                elseif CONFIG.DoV3 then
+                    doV3()
+                    if _G.UpgradeRaceV3Done then return end
+                end
             end
+            DBG.v3 = _G.UpgradeRaceV3Done == true
         end)
         if not ok then warn("[Race] loop err:", tostring(err)) end
         if _G.UpgradeRaceV3Done then Status("HOAN TAT NANG TOC ✅"); break end
