@@ -100,12 +100,16 @@ local function topos(cf)
     tw:Play()
 end
 
--- TP: bay toi & cho gan toi (blocking) - dung cho diem co dinh
-local function TP(cf, arrive)
+local getTyrant -- forward declare (gan o phan TYRANT) - de moi noi detect boss duoc
+
+-- TP: bay toi & cho gan toi (blocking). abortFn() = true -> dung ngay (vd boss spawn)
+local function TP(cf, arrive, abortFn)
     arrive = arrive or 10
     topos(cf)
     local t0 = tick()
-    repeat task.wait() until not hrp() or (hrp().Position - cf.Position).Magnitude <= arrive or tick() - t0 > 10
+    repeat task.wait()
+    until not hrp() or (hrp().Position - cf.Position).Magnitude <= arrive or tick() - t0 > 10
+        or (abortFn and abortFn())
 end
 
 local function goToSea3() CommF("TravelZou") end -- TravelZou = Teleport Third Sea
@@ -125,22 +129,19 @@ local function EnsureTeam()
 end
 
 --==================  COMBAT: 3 LOP DANH CHONG (be tu KaitunV4)  ==================--
--- equip vu khi MAC DINH MELEE (getgenv().USESWORD = true thi dung Sword) - giong module:eq() KaitunV4
+-- equip CHI Melee (getgenv().USESWORD = true thi dung Sword). Khong dung tool khac.
 local function equipWeapon()
     local c = char(); local bp = LocalPlayer:FindFirstChild("Backpack")
     if not (c and bp and c:FindFirstChild("Humanoid")) then return end
-    local useSword = false
-    pcall(function() if getgenv().USESWORD then useSword = true end end)
+    local want = "Melee"
+    pcall(function() if getgenv().USESWORD then want = "Sword" end end)
+    -- da cam dung loai roi -> khoi equip lai (tranh nhap nhay doi qua doi lai)
+    local cur = c:FindFirstChildOfClass("Tool")
+    if cur and tostring(cur.ToolTip) == want then return end
     for _, t in ipairs(bp:GetChildren()) do
-        if t:IsA("Tool") then
-            local tip = tostring(t.ToolTip)
-            if (tip == "Melee" and not useSword) or (tip == "Sword" and useSword) then
-                pcall(function() c.Humanoid:EquipTool(t) end); return
-            end
+        if t:IsA("Tool") and tostring(t.ToolTip) == want then
+            pcall(function() c.Humanoid:EquipTool(t) end); return
         end
-    end
-    for _, t in ipairs(bp:GetChildren()) do -- fallback: bat ky tool
-        if t:IsA("Tool") then pcall(function() c.Humanoid:EquipTool(t) end); return end
     end
 end
 local function buso() if char() and not char():FindFirstChild("HasBuso") then CommF("Buso") end end
@@ -274,6 +275,9 @@ local function bringAndKill(v, untilFn)
     if not checkmob(v) then return end
     ATK.on = true
     repeat
+        -- LUON detect boss: neu Tyrant xuat hien va minh dang KHONG farm boss -> dung ngay
+        local b = getTyrant and getTyrant()
+        if b and b ~= v then break end
         equipWeapon()
         buso()
         pcall(function()
@@ -306,7 +310,7 @@ local function isSpawnMob(name)
     for _, n in ipairs(SPAWN_MOBS) do if n == name then return true end end
     return false
 end
-local function getTyrant()
+function getTyrant() -- gan vao bien forward-declare o tren
     local e = Workspace:FindFirstChild("Enemies")
     return e and e:FindFirstChild(TYRANT)
 end
@@ -316,6 +320,7 @@ end
 local _seen = {}
 task.spawn(function()
     while task.wait(0.25) do
+        DBG.tyrant = getTyrant() ~= nil -- LUON detect boss (UI + trang thai)
         local e = Workspace:FindFirstChild("Enemies")
         if e and inSea3() then
             local aliveNow = {}
@@ -359,7 +364,7 @@ local function farmStep()
             bringAndKill(target, function() return getTyrant() ~= nil end)
         else
             DBG.action = "Bay toi spawn Tyrant"
-            TP(TYRANT_SPAWN)
+            TP(TYRANT_SPAWN, 10, function() return getTyrant() ~= nil end) -- boss ra -> dung ngay
         end
     end
 end
@@ -379,14 +384,11 @@ local function summonStep()
             if root then pcall(function() root.Anchored = true end) end
 
             pcall(function()
-                for round = 1, 3 do -- dap moi binh 3 lan
-                    for _, tool in ipairs(LocalPlayer.Backpack:GetChildren()) do
-                        if tool:IsA("Tool") then
-                            char().Humanoid:EquipTool(tool); task.wait(0.1)
-                            for _, k in ipairs({ "Z", "X", "C" }) do
-                                VIM:SendKeyEvent(true, k, false, game); task.wait(0.05); VIM:SendKeyEvent(false, k, false, game)
-                            end
-                        end
+                equipWeapon() -- CHI Melee, khong dung tool khac
+                task.wait(0.1)
+                for round = 1, 3 do -- dap binh 3 lan bang Z/X/C cua Melee
+                    for _, k in ipairs({ "Z", "X", "C" }) do
+                        VIM:SendKeyEvent(true, k, false, game); task.wait(0.05); VIM:SendKeyEvent(false, k, false, game)
                     end
                 end
             end)
