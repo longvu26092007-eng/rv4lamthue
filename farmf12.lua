@@ -25,7 +25,7 @@ local CONFIG = {
     TweenSpeed = 340,
     LoopWait   = 0.3,
     Team       = "Pirates",
-    FarmHeight = 6,   -- do cao dung tren dau quai khi farm (hạ thap cho do bay cao)
+    FarmHeight = 9,   -- do cao dung tren dau quai khi farm
 }
 
 -- co bat/tat (doc getgenv neu co)
@@ -45,7 +45,7 @@ local function inSea3() return SEA_3[tostring(game.PlaceId)] == true end
 
 --==================  DEBUG / LOG  ==================--
 local killCount = 0            -- dem quai Tiki da giet (phia minh thay chet)
-local DBG = { action = "...", tyrant = false, mobs = 0, team = "?", atk = "?" }
+local DBG = { action = "...", tyrant = false, mobs = 0, team = "?", atk = "?", changefrag = "off" }
 local LOG = {}
 local function pushLog(m)
     table.insert(LOG, os.date("%H:%M:%S") .. "  " .. tostring(m))
@@ -414,35 +414,61 @@ local function farmStep()
     end
 end
 
--- summon: dap MOI binh (3 lan/luot) - LAP LAI cac be CHO DEN KHI boss spawn thi thoi
--- (binh dat ngau nhien, co luot khong co binh -> phai dap nhieu vong)
-local function summonStep()
-    while STATE.summon and inSea3() and not getTyrant() do
-        for _, cf in ipairs(TYRANT_PADS) do
-            if not (STATE.summon and inSea3()) or getTyrant() then break end
-            DBG.action = "Summon: dap binh (cho boss spawn)"
-            TP(cf * CFrame.new(0, 5, 0)); task.wait(0.3)
-
-            -- GIU Y NGUYEN player khi pha binh: huy tween + ANCHOR (skill khong lam bay)
-            local root = hrp()
-            if _activeTween then pcall(function() _activeTween:Cancel() end) end
-            if root then pcall(function() root.Anchored = true end) end
-
-            pcall(function()
-                equipWeapon() -- CHI Melee, khong dung tool khac
-                task.wait(0.1)
-                for round = 1, 3 do -- dap binh 3 lan bang Z/X/C cua Melee
-                    for _, k in ipairs({ "Z", "X", "C" }) do
-                        VIM:SendKeyEvent(true, k, false, game); task.wait(0.05); VIM:SendKeyEvent(false, k, false, game)
-                    end
-                end
-            end)
-
-            if root then pcall(function() root.Anchored = false end) end -- LUON mo anchor lai
-            task.wait(0.4)
+-- dap 1 binh: FREEZE cung (anchor + khoa CFrame moi frame) -> sai chieu xa may cung KHONG di chuyen
+local function smashPad(cf, label)
+    TP(cf * CFrame.new(0, 5, 0)); task.wait(0.3)
+    local root = hrp(); if not root then return end
+    local holdCF = root.CFrame
+    if _activeTween then pcall(function() _activeTween:Cancel() end) end
+    local holding = true
+    pcall(function() root.Anchored = true end)
+    -- vong khoa vi tri: set lai CFrame moi frame -> chieu day/teleport bao nhieu cung bi keo ve cho
+    task.spawn(function()
+        while holding and root and root.Parent do
+            pcall(function() root.CFrame = holdCF; root.AssemblyLinearVelocity = Vector3.zero end)
+            task.wait()
         end
+    end)
+    pcall(function()
+        equipWeapon() -- chi Melee
+        task.wait(0.1)
+        for r = 1, 3 do -- dap 3 lan
+            for _, k in ipairs({ "Z", "X", "C" }) do
+                VIM:SendKeyEvent(true, k, false, game); task.wait(0.05); VIM:SendKeyEvent(false, k, false, game)
+            end
+        end
+    end)
+    holding = false
+    pcall(function() root.Anchored = false end) -- LUON mo anchor lai
+    task.wait(0.3)
+end
+
+-- summon: THU 7 VONG, moi vong XAO TRON ca 7 binh (random). Het 7 vong khong ra boss
+-- -> ve farm quai + reset mat ve 1 (killCount = 75).
+local function summonStep()
+    for roundN = 1, 7 do
+        if not (STATE.summon and inSea3()) or getTyrant() then break end
+        -- xao tron thu tu 7 binh (Fisher-Yates)
+        local order = {}
+        for i = 1, #TYRANT_PADS do order[i] = i end
+        for i = #order, 2, -1 do local j = math.random(i); order[i], order[j] = order[j], order[i] end
+
+        for _, idx in ipairs(order) do
+            if not (STATE.summon and inSea3()) or getTyrant() then break end
+            DBG.action = ("Summon vong %d/7: dap binh #%d"):format(roundN, idx)
+            smashPad(TYRANT_PADS[idx])
+            if getTyrant() then break end
+        end
+        if getTyrant() then break end
     end
-    if getTyrant() then DBG.action = "Tyrant da spawn!" end
+
+    if getTyrant() then
+        DBG.action = "Tyrant da spawn!"
+    else
+        killCount = 75 -- reset mat ve 1 (1 mat = 75 kill) -> Main se quay lai farm quai
+        DBG.action = "Summon 7 vong fail -> reset mat ve 1, farm tiep"
+        Status("Summon 7 vong khong ra boss -> reset mat ve 1 (75 kill), farm lai")
+    end
 end
 
 --==================  UI STATUS / DEBUG  ==================--
@@ -454,7 +480,7 @@ local function MakeUI()
     gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; gui.Parent = parent
 
     local main = Instance.new("Frame")
-    main.Size = UDim2.new(0, 320, 0, 322); main.Position = UDim2.new(0, 18, 0, 100)
+    main.Size = UDim2.new(0, 320, 0, 330); main.Position = UDim2.new(0, 18, 0, 100)
     main.BackgroundColor3 = Color3.fromRGB(18, 18, 24); main.BorderSizePixel = 0
     main.Active = true; main.Parent = gui
     Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
@@ -510,8 +536,9 @@ local function MakeUI()
     local lKill   = row(16, Color3.fromRGB(150, 230, 150), true, 4)
     local lBoss   = row(16, Color3.fromRGB(255, 170, 170), true, 5)
     local lAtk    = row(16, Color3.fromRGB(255, 180, 255), true, 6)
-    local lLogT   = row(14, Color3.fromRGB(120, 130, 150), true, 7); lLogT.Text = "Log:"
-    local lLog    = row(74, Color3.fromRGB(160, 165, 180), false, 8)
+    local lFrag   = row(16, Color3.fromRGB(150, 220, 255), true, 7)
+    local lLogT   = row(14, Color3.fromRGB(120, 130, 150), true, 8); lLogT.Text = "Log:"
+    local lLog    = row(60, Color3.fromRGB(160, 165, 180), false, 9)
 
     -- keo tha
     local dragging, ds, sp
@@ -532,7 +559,7 @@ local function MakeUI()
     local mini = false
     btnMin.MouseButton1Click:Connect(function()
         mini = not mini; body.Visible = not mini
-        main.Size = mini and UDim2.new(0, 320, 0, 30) or UDim2.new(0, 320, 0, 322)
+        main.Size = mini and UDim2.new(0, 320, 0, 30) or UDim2.new(0, 320, 0, 330)
     end)
 
     task.spawn(function()
@@ -546,17 +573,93 @@ local function MakeUI()
             lKill.TextColor3 = ready and Color3.fromRGB(120, 230, 120) or Color3.fromRGB(230, 220, 120)
             lBoss.Text = ("Tyrant: %s    |    Mob spawn gan: %d"):format(DBG.tyrant and "✅ co" or "❌ chua", DBG.mobs)
             lAtk.Text  = "Attack: " .. tostring(DBG.atk)
+            lFrag.Text = "ChangeFrag: " .. tostring(DBG.changefrag)
             lLog.Text  = table.concat(LOG, "\n")
         end
     end)
 end
 pcall(MakeUI)
 
+--==================  CHANGE FRAG / REROLL RACE (getgenv().race + getgenv().fchange)  ==================--
+-- getgenv().race  = "rabbit/shark/angel/human/ghoul/cyborg" hoac "off" (off = KHONG reroll, bo qua race)
+-- getgenv().fchange = 20000 -> reroll ra dung race + frag >= 20000 -> ghi file <Player>.txt = "Completed-changefrag"
+--                     (race = off -> khoi check race, chi can frag >= 20000)
+local CF_RACE_MAP = {
+    rabbit = "Mink", mink = "Mink", shark = "Fishman", fishman = "Fishman",
+    angel = "Skypiea", skypiea = "Skypiea", human = "Human", ghoul = "Ghoul", cyborg = "Cyborg",
+}
+local CF_REROLLABLE = { Human = true, Mink = true, Fishman = true, Skypiea = true }
+
+local function fragOf()
+    local d = LocalPlayer:FindFirstChild("Data")
+    return (d and d:FindFirstChild("Fragments") and d.Fragments.Value) or 0
+end
+local function raceOf()
+    local d = LocalPlayer:FindFirstChild("Data")
+    return (d and d:FindFirstChild("Race") and tostring(d.Race.Value)) or "?"
+end
+
+local function ChangeFrag()
+    local fchange, raceCfg
+    pcall(function() fchange = tonumber(getgenv().fchange) end)
+    pcall(function() raceCfg = getgenv().race and tostring(getgenv().race):lower() or nil end)
+    if not fchange then DBG.changefrag = "off"; return end -- khong bat fchange -> bo qua
+
+    local target = (raceCfg and raceCfg ~= "off") and CF_RACE_MAP[raceCfg] or nil
+    local pf = LocalPlayer.Name .. ".txt"
+
+    -- da xong tu truoc -> bo qua
+    if isfile and pcall(isfile, pf) and isfile(pf) then
+        local ok, data = pcall(readfile, pf)
+        if ok and tostring(data):find("Completed%-changefrag") then DBG.changefrag = "Completed (file)"; return end
+    end
+
+    task.spawn(function()
+        local lastAct = 0
+        while true do
+            task.wait(0.5)
+            local frag = fragOf()
+            if target and raceOf() ~= target then
+                -- BUOC 1: chua dung race -> reroll/mua
+                DBG.changefrag = ("doi race -> %s (frag %d)"):format(target, frag)
+                if CF_REROLLABLE[target] then
+                    if frag >= 2500 and tick() - lastAct >= 3 then
+                        pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "1") end)
+                        pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "2") end)
+                        lastAct = tick(); task.wait(1.5)
+                    elseif frag < 2500 then
+                        DBG.changefrag = ("thieu frag de reroll (%d<2500)"):format(frag)
+                    end
+                elseif target == "Ghoul" and tick() - lastAct >= 3 then
+                    pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("Ectoplasm", "BuyCheck", 4) end)
+                    task.wait(0.5)
+                    pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("Ectoplasm", "Change", 4) end)
+                    lastAct = tick(); task.wait(1.5)
+                elseif target == "Cyborg" and tick() - lastAct >= 3 then
+                    pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("CyborgTrainer", "Buy") end)
+                    lastAct = tick(); task.wait(1.5)
+                end
+            else
+                -- BUOC 2: race ok (hoac off) -> cho frag >= fchange
+                if frag >= fchange then
+                    if writefile then pcall(function() writefile(pf, "Completed-changefrag") end) end
+                    DBG.changefrag = ("DONE! frag %d | race %s"):format(frag, raceOf())
+                    Status("ChangeFrag DONE: " .. raceOf() .. " | frag " .. frag .. " -> ghi " .. pf)
+                    break
+                else
+                    DBG.changefrag = ("cho frag: %d/%d | race %s"):format(frag, fchange, raceOf())
+                end
+            end
+        end
+    end)
+end
+
 --==================  MAIN LOOP  ==================--
 local _hadBoss = false
 local function Main()
     print("[Frag] Place:", game.PlaceId, "| Farm:", STATE.farm, "| Summon:", STATE.summon, "| Need:", SUMMON_NEED)
     EnsureTeam()
+    ChangeFrag() -- reroll race + cho frag >= fchange -> ghi file (neu getgenv().fchange duoc set)
     while task.wait(CONFIG.LoopWait) do
         _noclip = inSea3() and (STATE.farm or STATE.summon) == true
         local ok, err = pcall(function()
