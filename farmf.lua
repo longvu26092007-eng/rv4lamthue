@@ -25,6 +25,7 @@ local CONFIG = {
     TweenSpeed = 340,
     LoopWait   = 0.3,
     Team       = "Pirates",
+    FarmHeight = 6,   -- do cao dung tren dau quai khi farm (hạ thap cho do bay cao)
 }
 
 -- co bat/tat (doc getgenv neu co)
@@ -35,6 +36,7 @@ pcall(function()
     if getgenv().SummonTyrant ~= nil then STATE.summon = getgenv().SummonTyrant end
     if getgenv().SummonNeed then SUMMON_NEED = tonumber(getgenv().SummonNeed) or 300 end
     if getgenv().Team then CONFIG.Team = getgenv().Team end
+    if getgenv().FarmHeight then CONFIG.FarmHeight = tonumber(getgenv().FarmHeight) or CONFIG.FarmHeight end
 end)
 
 -- Sea 3 (Third Sea) - noi co Tyrant
@@ -268,7 +270,7 @@ local function bringAndKill(v, untilFn)
             if v:FindFirstChild("Head") then v.Head.CanCollide = false end
             if sethiddenproperty then sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge) end
         end)
-        topos(v.HumanoidRootPart.CFrame * CFrame.new(0, 20, 0)) -- bay len dau, non-blocking (muot)
+        topos(v.HumanoidRootPart.CFrame * CFrame.new(0, CONFIG.FarmHeight, 0)) -- dung sat dau quai (FarmHeight)
         task.wait(0.1)
     until not checkmob(v) or (untilFn and untilFn())
     ATK.on = false
