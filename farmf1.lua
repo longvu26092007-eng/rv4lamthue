@@ -22,7 +22,7 @@ local LocalPlayer       = Players.LocalPlayer
 
 --==================  CONFIG  ==================--
 local CONFIG = {
-    TweenSpeed = 300,
+    TweenSpeed = 340,
     LoopWait   = 0.3,
     Team       = "Pirates",
 }
@@ -60,12 +60,49 @@ end
 local function char() return LocalPlayer.Character end
 local function hrp() local c = char(); return c and c:FindFirstChild("HumanoidRootPart") end
 
-local function TP(cf)
+-- ===== BAY MUOT (tham khao KaitunV4 module:topos) =====
+-- noclip: BodyClip (BodyVelocity velocity=0) + CanCollide=false -> chong physics keo (het giat)
+local _noclip = false
+task.spawn(function()
+    while task.wait() do
+        local c = char()
+        local h = c and c:FindFirstChild("Humanoid")
+        local root = c and c:FindFirstChild("HumanoidRootPart")
+        if _noclip and h and root and not h.Sit and not root.Anchored then
+            if not root:FindFirstChild("BodyClip") then
+                local bv = Instance.new("BodyVelocity")
+                bv.Name = "BodyClip"; bv.MaxForce = Vector3.new(1e5, 1e5, 1e5); bv.Velocity = Vector3.zero
+                bv.Parent = root
+            end
+            for _, p in ipairs(c:GetDescendants()) do
+                if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+            end
+        elseif root then
+            local bc = root:FindFirstChild("BodyClip"); if bc then bc:Destroy() end
+        end
+    end
+end)
+
+-- topos: huy tween cu truoc khi tao moi + toc do co dinh + non-blocking (het giat)
+local _activeTween
+local function topos(cf)
     local root = hrp(); if not root then return end
-    local h = char():FindFirstChild("Humanoid"); if h then h.Sit = false end
-    local dist = (cf.Position - root.Position).Magnitude
-    local tw = TweenService:Create(root, TweenInfo.new(math.max(dist / CONFIG.TweenSpeed, 0.1), Enum.EasingStyle.Linear), { CFrame = cf })
-    tw:Play(); tw.Completed:Wait()
+    local h = char() and char():FindFirstChild("Humanoid"); if h then h.Sit = false end
+    if _activeTween then pcall(function() _activeTween:Cancel(); _activeTween:Destroy() end); _activeTween = nil end
+    local dist = (root.Position - cf.Position).Magnitude
+    local dur = math.clamp(dist / CONFIG.TweenSpeed, 0.05, 600)
+    local tw = TweenService:Create(root, TweenInfo.new(dur, Enum.EasingStyle.Linear, Enum.EasingDirection.Out), { CFrame = cf })
+    _activeTween = tw
+    tw.Completed:Once(function() if _activeTween == tw then _activeTween = nil end; pcall(function() tw:Destroy() end) end)
+    tw:Play()
+end
+
+-- TP: bay toi & cho gan toi (blocking) - dung cho diem co dinh
+local function TP(cf, arrive)
+    arrive = arrive or 10
+    topos(cf)
+    local t0 = tick()
+    repeat task.wait() until not hrp() or (hrp().Position - cf.Position).Magnitude <= arrive or tick() - t0 > 10
 end
 
 local function goToSea3() CommF("TravelZou") end -- TravelZou = Teleport Third Sea
@@ -85,16 +122,28 @@ local function EnsureTeam()
 end
 
 --==================  COMBAT: 3 LOP DANH CHONG (be tu KaitunV4)  ==================--
-local function equipFirstWeapon()
-    local c = char(); if not c then return end
-    for _, v in ipairs(LocalPlayer.Backpack:GetChildren()) do
-        if v:IsA("Tool") and tostring(v.ToolTip) == "Melee" then c.Humanoid:EquipTool(v); return end
+-- equip vu khi MAC DINH MELEE (getgenv().USESWORD = true thi dung Sword) - giong module:eq() KaitunV4
+local function equipWeapon()
+    local c = char(); local bp = LocalPlayer:FindFirstChild("Backpack")
+    if not (c and bp and c:FindFirstChild("Humanoid")) then return end
+    local useSword = false
+    pcall(function() if getgenv().USESWORD then useSword = true end end)
+    for _, t in ipairs(bp:GetChildren()) do
+        if t:IsA("Tool") then
+            local tip = tostring(t.ToolTip)
+            if (tip == "Melee" and not useSword) or (tip == "Sword" and useSword) then
+                pcall(function() c.Humanoid:EquipTool(t) end); return
+            end
+        end
     end
-    for _, v in ipairs(LocalPlayer.Backpack:GetChildren()) do
-        if v:IsA("Tool") then c.Humanoid:EquipTool(v); return end
+    for _, t in ipairs(bp:GetChildren()) do -- fallback: bat ky tool
+        if t:IsA("Tool") then pcall(function() c.Humanoid:EquipTool(t) end); return end
     end
 end
 local function buso() if char() and not char():FindFirstChild("HasBuso") then CommF("Buso") end end
+local function checkmob(v) -- giong checkmob_ KaitunV4
+    return v and v:FindFirstChild("HumanoidRootPart") and v:FindFirstChild("Humanoid") and v.Humanoid.Health > 0
+end
 
 local ATK = { on = false }
 local ATK_RANGE = 60
@@ -216,21 +265,26 @@ task.spawn(function()
 end)
 
 -- bring + giet 1 muc tieu bang 3 lop (khong spam chieu - day la quai)
+-- Farm 1 muc tieu theo dung logic training KaitunV4:
+--   eq (Melee) + haki + bat dong hoa (WalkSpeed/JumpPower 0, ChangeState Physics, SimRadius huge) + topos len dau +20
 local function bringAndKill(v, untilFn)
-    if not (v and v:FindFirstChild("Humanoid") and v:FindFirstChild("HumanoidRootPart")) then return end
-    equipFirstWeapon()
+    if not checkmob(v) then return end
     ATK.on = true
     repeat
+        equipWeapon()
         buso()
         pcall(function()
-            v.HumanoidRootPart.CanCollide = false
-            v.Humanoid.WalkSpeed = 0
-            v.HumanoidRootPart.Size = Vector3.new(50, 50, 50)
+            local hum, root = v.Humanoid, v.HumanoidRootPart
+            root.CanCollide = false
+            hum.WalkSpeed = 0
+            hum.JumpPower = 0
+            hum:ChangeState(14)                                  -- Physics: ngung di chuyen
             if v:FindFirstChild("Head") then v.Head.CanCollide = false end
+            if sethiddenproperty then sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge) end
         end)
-        TP(v.HumanoidRootPart.CFrame * CFrame.new(0, 40, 0))
-        task.wait(0.2)
-    until not v.Parent or v.Humanoid.Health <= 0 or (untilFn and untilFn())
+        topos(v.HumanoidRootPart.CFrame * CFrame.new(0, 20, 0)) -- bay len dau, non-blocking (muot)
+        task.wait(0.1)
+    until not checkmob(v) or (untilFn and untilFn())
     ATK.on = false
 end
 
@@ -288,7 +342,13 @@ local function summonStep()
     for _, cf in ipairs(TYRANT_PADS) do
         if not (STATE.summon and inSea3()) or getTyrant() then break end
         DBG.action = "Summon: dap be"
-        TP(cf * CFrame.new(0, 5, 0)); task.wait(0.5)
+        TP(cf * CFrame.new(0, 5, 0)); task.wait(0.3)
+
+        -- GIU Y NGUYEN player khi pha binh: huy tween + ANCHOR (skill khong lam bay)
+        local root = hrp()
+        if _activeTween then pcall(function() _activeTween:Cancel() end) end
+        if root then pcall(function() root.Anchored = true end) end
+
         pcall(function()
             for _, tool in ipairs(LocalPlayer.Backpack:GetChildren()) do
                 if tool:IsA("Tool") then
@@ -299,7 +359,10 @@ local function summonStep()
                 end
             end
         end)
-        task.wait(2)
+
+        -- LUON mo anchor lai (du skill loi)
+        if root then pcall(function() root.Anchored = false end) end
+        task.wait(1.5)
     end
 end
 
@@ -408,6 +471,7 @@ local function Main()
     print("[Frag] Place:", game.PlaceId, "| Farm:", STATE.farm, "| Summon:", STATE.summon)
     EnsureTeam()
     while task.wait(CONFIG.LoopWait) do
+        _noclip = inSea3() and (STATE.farm or STATE.summon) == true
         local ok, err = pcall(function()
             if not hrp() then DBG.action = "Cho nhan vat load"; return end
             if not inSea3() then
@@ -424,7 +488,10 @@ local function Main()
                 DBG.action = "Tat ca OFF (bat Farm/Summon tren UI)"
             end
         end)
-        if not ok then warn("[Frag] loop err:", tostring(err)); ATK.on = false end
+        if not ok then
+            warn("[Frag] loop err:", tostring(err)); ATK.on = false
+            local r = hrp(); if r then pcall(function() r.Anchored = false end) end -- mo anchor neu ket
+        end
     end
 end
 
