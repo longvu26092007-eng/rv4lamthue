@@ -178,10 +178,24 @@ end
 
 local ATK = { on = false }
 local ATK_RANGE = 60
-local _Modules       = ReplicatedStorage:FindFirstChild("Modules")
-local _Net           = _Modules and _Modules:FindFirstChild("Net")
-local RegisterAttack = _Net and (_Net:FindFirstChild("RE/RegisterAttack") or _Net:WaitForChild("RE/RegisterAttack", 5))
-local RegisterHit    = _Net and (_Net:FindFirstChild("RE/RegisterHit") or _Net:WaitForChild("RE/RegisterHit", 5))
+-- Resolve remote combat LAZY (retry moi lan goi toi khi co) - giong KaitunV4 resolve trong AttackNoCoolDown.
+-- (Truoc day cache nil luc load -> "THIEU remote" mai mai.)
+local _Net, RegisterAttack, RegisterHit, _seedRF
+local function resolveCombat()
+    if RegisterAttack and RegisterHit then return true end
+    local mods = ReplicatedStorage:FindFirstChild("Modules")
+    _Net = mods and mods:FindFirstChild("Net")
+    if _Net then
+        RegisterAttack = _Net:FindFirstChild("RE/RegisterAttack")
+        RegisterHit    = _Net:FindFirstChild("RE/RegisterHit")
+        _seedRF        = _Net:FindFirstChild("seed")
+    end
+    -- fallback: tim sau toan ReplicatedStorage neu path Modules.Net khong dung
+    if not RegisterAttack then RegisterAttack = ReplicatedStorage:FindFirstChild("RE/RegisterAttack", true) end
+    if not RegisterHit    then RegisterHit    = ReplicatedStorage:FindFirstChild("RE/RegisterHit", true) end
+    if not _seedRF        then _seedRF        = ReplicatedStorage:FindFirstChild("seed", true) end
+    return (RegisterAttack ~= nil) and (RegisterHit ~= nil)
+end
 
 -- ===== DANH = copy HitRegistrationModule.Execute cua Banana (ban moi, co MA HOA) =====
 -- Tim remote ma hoa (RemoteEvent co attribute Id)
@@ -206,8 +220,8 @@ local _cloneref = cloneref or function(x) return x end
 local function doAttack()
     local c = char(); local root = hrp(); if not (c and root) then DBG.atk = "no char"; return end
     local tool = c:FindFirstChildOfClass("Tool")
-    if not tool then DBG.atk = "CHUA CAM VU KHI"; return end           -- nhan moi tool dang cam (khong ep WeaponType)
-    if not (RegisterAttack and RegisterHit and _Net) then DBG.atk = "THIEU remote RegisterAttack/Hit"; return end
+    if not tool then DBG.atk = "CHUA CAM VU KHI"; return end           -- nhan moi tool dang cam
+    if not resolveCombat() then DBG.atk = "dang tim Modules.Net..."; return end -- retry toi khi co remote
 
     -- gom muc tieu (Enemies, khong PvP) trong tam, lay MOI BasePart cua tung con
     local hitTargets = {}
@@ -227,7 +241,7 @@ local function doAttack()
 
     local targetHead = hitTargets[1][1]:FindFirstChild("Head") or hitTargets[1][2]
     local seed
-    pcall(function() if _Net:FindFirstChild("seed") then seed = _Net.seed:InvokeServer() end end)
+    pcall(function() if _seedRF then seed = _seedRF:InvokeServer() end end)
 
     RegisterAttack:FireServer()                         -- KHONG arg (banana)
     RegisterHit:FireServer(targetHead, hitTargets, {})  -- 3 arg (banana)
@@ -240,7 +254,7 @@ local function doAttack()
         local finalId = bit32.bxor(AttackRemoteId + 909090, seed * 2)
         _cloneref(AttackRemoteTarget):FireServer(encoded, finalId, targetHead, hitTargets)
     end
-    DBG.atk = ("DANH ok | tool:%s tgt:%d seed:%s enc:%s"):format(tool.Name, #hitTargets, seed and "ok" or "X", AttackRemoteTarget and "ok" or "X")
+    DBG.atk = ("DANH | tool:%s tgt:%d seed:%s enc:%s"):format(tool.Name, #hitTargets, seed and "ok" or "X", AttackRemoteTarget and "ok" or "X")
 end
 
 task.spawn(function()
@@ -249,9 +263,58 @@ task.spawn(function()
     end
 end)
 
+-- ===== GOM QUAI (copy KaitunV4 TweenObject + GetMobPosition + BringMob) =====
+-- Keo cac quai CUNG TEN ve vi tri trung binh cua chung + bat dong -> AOE giet nhanh.
+local function GetMobPosition(name)
+    local pos, count = Vector3.zero, 0
+    local e = Workspace:FindFirstChild("Enemies"); if not e then return nil end
+    for _, v in ipairs(e:GetChildren()) do
+        if v.Name == name and v:FindFirstChild("HumanoidRootPart") then
+            pos = pos + v.HumanoidRootPart.Position; count = count + 1
+        end
+    end
+    if count > 0 then return pos / count end
+    return nil
+end
+local function TweenObject(obj, posCF, speed)
+    speed = speed or 350
+    if not (obj and obj.Parent) then return end
+    local dist = (posCF.Position - obj.Position).Magnitude
+    local dur = math.clamp(dist / speed, 0.03, 3)
+    local tw = TweenService:Create(obj, TweenInfo.new(dur, Enum.EasingStyle.Linear), { CFrame = posCF })
+    tw.Completed:Once(function() pcall(function() tw:Destroy() end) end)
+    tw:Play()
+end
+local function BringMob()
+    local myHrp = hrp(); if not myHrp then return end
+    local enemies = Workspace:FindFirstChild("Enemies"); if not enemies then return end
+    local totalpos = {}
+    for _, v in ipairs(enemies:GetChildren()) do
+        if totalpos[v.Name] == nil then totalpos[v.Name] = GetMobPosition(v.Name) or false end
+    end
+    for _, v in ipairs(enemies:GetChildren()) do
+        local hum = v:FindFirstChildOfClass("Humanoid")
+        local vh  = v:FindFirstChild("HumanoidRootPart")
+        if hum and hum.Health > 0 and vh and (vh.Position - myHrp.Position).Magnitude <= 350 then
+            local f = totalpos[v.Name]
+            if f then
+                local dest = CFrame.new(f.X, f.Y, f.Z)
+                local d = (vh.Position - dest.Position).Magnitude
+                if d > 3 and d <= 280 then
+                    TweenObject(vh, dest, 300)
+                    vh.CanCollide = false
+                    hum.WalkSpeed = 0
+                    hum.JumpPower = 0
+                    hum:ChangeState(14)
+                    if sethiddenproperty then sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge) end
+                end
+            end
+        end
+    end
+end
+
 -- bring + giet 1 muc tieu (khong spam chieu - day la quai)
--- Farm 1 muc tieu theo dung logic training KaitunV4:
---   eq (Melee) + haki + bat dong hoa (WalkSpeed/JumpPower 0, ChangeState Physics, SimRadius huge) + topos len dau +20
+-- Logic training KaitunV4: eq(Melee) + haki + BringMob(gom) + topos len dau + AttackNoCoolDown (loop nen)
 local function bringAndKill(v, untilFn)
     if not checkmob(v) then return end
     ATK.on = true
@@ -261,6 +324,7 @@ local function bringAndKill(v, untilFn)
         if b and b ~= v then break end
         equipWeapon()
         buso()
+        BringMob() -- gom cac quai cung ten lai 1 cho de AOE
         pcall(function()
             local hum, root = v.Humanoid, v.HumanoidRootPart
             root.CanCollide = false
