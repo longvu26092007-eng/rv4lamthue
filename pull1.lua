@@ -44,12 +44,14 @@ local function getRemotes()
     return ReplicatedStorage:FindFirstChild("Remotes")
 end
 
--- Trang thai (UI doc qua _G.AutoStatus) + log 8 dong gan nhat
+-- Trang thai (UI doc qua _G.AutoStatus) + log 14 dong gan nhat.
+-- Bang Debug UI (cuoi file) doc truc tiep LOG + cac bien state de hien thi tren man hinh.
 local LOG = {}
+_G.AutoLog = LOG  -- cho phep UI / script khac doc lich su log
 local function SetStatus(msg)
     _G.AutoStatus = msg
     table.insert(LOG, os.date("%H:%M:%S") .. "  " .. tostring(msg))
-    while #LOG > 8 do table.remove(LOG, 1) end
+    while #LOG > 14 do table.remove(LOG, 1) end
     print("[Auto] " .. tostring(msg))
 end
 
@@ -513,9 +515,335 @@ local function RunPullLever()
     end
 end
 
+--==================  UI DEBUG STATUS  ==================--
+-- Bang debug noi tren man hinh: status hien tai, cac co trang thai (place / team /
+-- nhan vat / quest / dao / gio / lever), ly do khong dat + log gan nhat.
+-- Doc truc tiep tu LOG va cac bien state (ExSeb / PullLeverDone) nen luon dong bo.
+local UIRef = {}  -- giu tham chieu cac label de update moi tick
+
+local function BuildDebugUI()
+    -- chon noi dat GUI: uu tien gethui()/CoreGui (song qua reset character), fallback PlayerGui
+    local host
+    if type(gethui) == "function" then
+        local ok, g = pcall(gethui)
+        if ok and g then host = g end
+    end
+    if not host then
+        local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+        if ok and cg then host = cg end
+    end
+    host = host or LocalPlayer:WaitForChild("PlayerGui")
+
+    -- xoa ban cu (tranh trung khi script chay lai sau teleport)
+    local old = host:FindFirstChild("AutoDebugUI")
+    if old then old:Destroy() end
+
+    -- helper tao Instance gon
+    local function mk(class, props)
+        local inst   = Instance.new(class)
+        local parent = props.Parent
+        props.Parent = nil
+        for k, v in pairs(props) do inst[k] = v end
+        inst.Parent  = parent
+        return inst
+    end
+
+    local W, H = 340, 360
+
+    local gui = mk("ScreenGui", {
+        Name           = "AutoDebugUI",
+        ResetOnSpawn   = false,
+        IgnoreGuiInset = true,
+        DisplayOrder   = 9999,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        Parent         = host,
+    })
+
+    local root = mk("Frame", {
+        Name             = "Root",
+        Size             = UDim2.fromOffset(W, H),
+        Position         = UDim2.fromOffset(20, 90),
+        BackgroundColor3 = Color3.fromRGB(18, 20, 26),
+        BorderSizePixel  = 0,
+        Active           = true,
+        Parent           = gui,
+    })
+    mk("UICorner", { CornerRadius = UDim.new(0, 10), Parent = root })
+    mk("UIStroke", { Color = Color3.fromRGB(55, 62, 80), Thickness = 1, Parent = root })
+
+    -- ===== Title bar =====
+    local bar = mk("Frame", {
+        Name             = "Bar",
+        Size             = UDim2.new(1, 0, 0, 30),
+        BackgroundColor3 = Color3.fromRGB(30, 34, 44),
+        BorderSizePixel  = 0,
+        Parent           = root,
+    })
+    mk("UICorner", { CornerRadius = UDim.new(0, 10), Parent = bar })
+    mk("Frame", {  -- che goc bo tron phia duoi bar cho phang
+        Size             = UDim2.new(1, 0, 0, 10),
+        Position         = UDim2.new(0, 0, 1, -10),
+        BackgroundColor3 = Color3.fromRGB(30, 34, 44),
+        BorderSizePixel  = 0,
+        Parent           = bar,
+    })
+    mk("TextLabel", {
+        Size                 = UDim2.new(1, -86, 1, 0),
+        Position             = UDim2.fromOffset(12, 0),
+        BackgroundTransparency = 1,
+        Font                 = Enum.Font.GothamBold,
+        Text                 = "AUTO PULL LEVER · DEBUG",
+        TextColor3           = Color3.fromRGB(235, 238, 245),
+        TextSize             = 13,
+        TextXAlignment       = Enum.TextXAlignment.Left,
+        Parent               = bar,
+    })
+    UIRef.dot = mk("TextLabel", {  -- heartbeat: nhap nhay bao UI con song
+        Size                 = UDim2.fromOffset(16, 30),
+        Position             = UDim2.new(1, -76, 0, 0),
+        BackgroundTransparency = 1,
+        Font                 = Enum.Font.GothamBold,
+        Text                 = "●",
+        TextColor3           = Color3.fromRGB(90, 210, 120),
+        TextSize             = 12,
+        Parent               = bar,
+    })
+    local minBtn = mk("TextButton", {
+        Size                 = UDim2.fromOffset(28, 30),
+        Position             = UDim2.new(1, -58, 0, 0),
+        BackgroundTransparency = 1,
+        Font                 = Enum.Font.GothamBold,
+        Text                 = "—",
+        TextColor3           = Color3.fromRGB(200, 205, 215),
+        TextSize             = 15,
+        Parent               = bar,
+    })
+    local closeBtn = mk("TextButton", {
+        Size                 = UDim2.fromOffset(28, 30),
+        Position             = UDim2.new(1, -28, 0, 0),
+        BackgroundTransparency = 1,
+        Font                 = Enum.Font.GothamBold,
+        Text                 = "✕",
+        TextColor3           = Color3.fromRGB(240, 120, 120),
+        TextSize             = 14,
+        Parent               = bar,
+    })
+
+    -- ===== Body =====
+    local body = mk("Frame", {
+        Name                 = "Body",
+        Size                 = UDim2.new(1, 0, 1, -30),
+        Position             = UDim2.fromOffset(0, 30),
+        BackgroundTransparency = 1,
+        Parent               = root,
+    })
+    mk("UIPadding", {
+        PaddingLeft = UDim.new(0, 10), PaddingRight  = UDim.new(0, 10),
+        PaddingTop  = UDim.new(0, 8),  PaddingBottom = UDim.new(0, 8),
+        Parent      = body,
+    })
+
+    -- status hien tai
+    UIRef.status = mk("TextLabel", {
+        Position         = UDim2.fromOffset(0, 0),
+        Size             = UDim2.new(1, 0, 0, 34),
+        BackgroundColor3 = Color3.fromRGB(26, 29, 38),
+        BorderSizePixel  = 0,
+        Font             = Enum.Font.GothamMedium,
+        Text             = "▶ ...",
+        TextColor3       = Color3.fromRGB(120, 200, 255),
+        TextSize         = 12,
+        TextWrapped      = true,
+        TextXAlignment   = Enum.TextXAlignment.Left,
+        Parent           = body,
+    })
+    mk("UICorner",  { CornerRadius = UDim.new(0, 6), Parent = UIRef.status })
+    mk("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = UIRef.status })
+
+    -- bang co trang thai (monospace cho thang cot)
+    UIRef.info = mk("TextLabel", {
+        Position             = UDim2.fromOffset(0, 42),
+        Size                 = UDim2.new(1, 0, 0, 124),
+        BackgroundTransparency = 1,
+        RichText             = true,
+        Font                 = Enum.Font.Code,
+        Text                 = "",
+        TextColor3           = Color3.fromRGB(205, 210, 220),
+        TextSize             = 12,
+        TextXAlignment       = Enum.TextXAlignment.Left,
+        TextYAlignment       = Enum.TextYAlignment.Top,
+        Parent               = body,
+    })
+
+    -- dong ket luan (ly do khong dat / dang chay / hoan thanh)
+    UIRef.reason = mk("TextLabel", {
+        Position         = UDim2.fromOffset(0, 170),
+        Size             = UDim2.new(1, 0, 0, 30),
+        BackgroundColor3 = Color3.fromRGB(46, 26, 26),
+        BorderSizePixel  = 0,
+        Font             = Enum.Font.GothamMedium,
+        Text             = "",
+        TextColor3       = Color3.fromRGB(255, 140, 140),
+        TextSize         = 11,
+        TextWrapped      = true,
+        TextXAlignment   = Enum.TextXAlignment.Left,
+        Parent           = body,
+    })
+    mk("UICorner",  { CornerRadius = UDim.new(0, 6), Parent = UIRef.reason })
+    mk("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = UIRef.reason })
+
+    -- header log
+    mk("TextLabel", {
+        Position             = UDim2.fromOffset(0, 206),
+        Size                 = UDim2.new(1, 0, 0, 14),
+        BackgroundTransparency = 1,
+        Font                 = Enum.Font.GothamBold,
+        Text                 = "LOG",
+        TextColor3           = Color3.fromRGB(120, 128, 145),
+        TextSize             = 11,
+        TextXAlignment       = Enum.TextXAlignment.Left,
+        Parent               = body,
+    })
+
+    -- khung log cuon
+    local logBox = mk("ScrollingFrame", {
+        Position             = UDim2.fromOffset(0, 224),
+        Size                 = UDim2.new(1, 0, 1, -224),
+        BackgroundColor3     = Color3.fromRGB(13, 15, 20),
+        BorderSizePixel      = 0,
+        ScrollBarThickness   = 4,
+        ScrollBarImageColor3 = Color3.fromRGB(70, 78, 95),
+        CanvasSize           = UDim2.new(),
+        AutomaticCanvasSize  = Enum.AutomaticSize.Y,
+        Parent               = body,
+    })
+    mk("UICorner",  { CornerRadius = UDim.new(0, 6), Parent = logBox })
+    mk("UIPadding", {
+        PaddingLeft = UDim.new(0, 8), PaddingRight  = UDim.new(0, 8),
+        PaddingTop  = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6),
+        Parent      = logBox,
+    })
+    UIRef.log = mk("TextLabel", {
+        Size                 = UDim2.new(1, 0, 0, 0),
+        AutomaticSize        = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 1,
+        Font                 = Enum.Font.Code,
+        Text                 = "",
+        TextColor3           = Color3.fromRGB(150, 220, 165),
+        TextSize             = 11,
+        TextWrapped          = true,
+        TextXAlignment       = Enum.TextXAlignment.Left,
+        TextYAlignment       = Enum.TextYAlignment.Top,
+        Parent               = logBox,
+    })
+
+    -- ===== Keo tha (drag) =====
+    local UIS = game:GetService("UserInputService")
+    local dragging, dragStart, startPos
+    bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = input.Position
+            startPos  = root.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                                      startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+
+    -- ===== Thu nho / dong =====
+    local minimized = false
+    minBtn.MouseButton1Click:Connect(function()
+        minimized    = not minimized
+        body.Visible = not minimized
+        root.Size    = minimized and UDim2.fromOffset(W, 30) or UDim2.fromOffset(W, H)
+        minBtn.Text  = minimized and "+" or "—"
+    end)
+    closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+    -- ===== Vong update =====
+    local function chip(label, ok, okText, noText)
+        local col = ok and "5FD17A" or "E06666"
+        local val = ok and tostring(okText or "co") or tostring(noText or "khong")
+        return string.format('%s : <font color="#%s">%s</font>', label, col, val)
+    end
+
+    local beat = false
+    local function refresh()
+        local char      = LocalPlayer.Character
+        local hrp       = char and char:FindFirstChild("HumanoidRootPart")
+        local hour      = tonumber(tostring(Lighting.TimeOfDay):match("^(%d+)"))
+        local night     = MoonCamByHour(hour) ~= nil
+        local leverDone = PullLeverDone or _G.AutoPullLeverDone == true
+        local team      = LocalPlayer.Team and LocalPlayer.Team.Name or nil
+        local mirage    = getMystic() ~= nil
+
+        UIRef.status.Text = "▶ " .. tostring(_G.AutoStatus or "Dang khoi dong...")
+
+        UIRef.info.Text = table.concat({
+            string.format('Place : <b>%s</b>  Job : <b>%s</b>',
+                tostring(MyPlaceId), (tostring(game.JobId):sub(1, 8))),
+            chip("Sea 3      ", THIRD_SEA_PLACES[game.PlaceId] == true, "dang o", "chua toi"),
+            chip("Team       ", team ~= nil, team, "chua chon"),
+            chip("Nhan vat   ", hrp ~= nil, "da load", "chua load"),
+            chip("Quest V4   ", ExSeb == true, "xong - len dao", "dang lam"),
+            chip("Mirage dao ", mirage, "co o server", "chua co"),
+            chip("Ban dem    ", night, "gio " .. tostring(hour), "gio " .. tostring(hour) .. " (ngay)"),
+            chip("Pull Lever ", leverDone, "HOAN THANH", "chua xong"),
+        }, "\n")
+
+        -- dong ket luan: ly do khong dat (do) / hoan thanh (xanh la) / dang chay (xanh duong)
+        if _G.KhongDatYeuCau then
+            UIRef.reason.BackgroundColor3 = Color3.fromRGB(46, 26, 26)
+            UIRef.reason.TextColor3       = Color3.fromRGB(255, 140, 140)
+            UIRef.reason.Text             = "⚠ " .. tostring(_G.KhongDatYeuCau)
+        elseif leverDone then
+            UIRef.reason.BackgroundColor3 = Color3.fromRGB(24, 44, 30)
+            UIRef.reason.TextColor3       = Color3.fromRGB(150, 240, 170)
+            UIRef.reason.Text             = "✓ Hoan thanh"
+                .. (_G.AutoPullFileSaved and (" · da ghi " .. tostring(_G.AutoPullFileSaved)) or "")
+        else
+            UIRef.reason.BackgroundColor3 = Color3.fromRGB(24, 32, 44)
+            UIRef.reason.TextColor3       = Color3.fromRGB(150, 200, 240)
+            UIRef.reason.Text             = "● Dang chay..."
+        end
+
+        UIRef.log.Text = table.concat(LOG, "\n")
+        -- tu cuon xuong dong moi nhat
+        local extra = UIRef.log.AbsoluteSize.Y - logBox.AbsoluteSize.Y
+        if extra > 0 then logBox.CanvasPosition = Vector2.new(0, extra) end
+
+        -- heartbeat nhap nhay
+        beat = not beat
+        UIRef.dot.TextColor3 = beat and Color3.fromRGB(90, 210, 120) or Color3.fromRGB(40, 90, 55)
+    end
+
+    task.spawn(function()
+        while gui.Parent do
+            pcall(refresh)
+            task.wait(0.3)
+        end
+    end)
+
+    _G.AutoDebugUI = gui
+    return gui
+end
+
 --==================  ENTRY  ==================--
 local function Main()
     print("[Auto] PlaceId cua ban (game.PlaceId) =", MyPlaceId, "| JobId =", game.JobId)
+
+    -- B0: dung bang Debug UI truoc tien (luon hien, du dieu kien dat hay khong)
+    pcall(BuildDebugUI)
 
     -- B1: CHON PHE TRUOC. Acc ket man ChooseTeam se KHONG di chuyen / travel duoc,
     --     nen phai join team xong roi moi detect + travel sea.
