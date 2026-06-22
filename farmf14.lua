@@ -310,11 +310,14 @@ local function bringAndKill(v, untilFn)
         -- LUON detect boss: neu Tyrant xuat hien va minh dang KHONG farm boss -> dung ngay
         local b = getTyrant and getTyrant()
         if b and b ~= v then break end
+        if not checkmob(v) then break end -- quai chet/bien mat -> thoat NGAY (tranh index nil HRP)
+        local root = v:FindFirstChild("HumanoidRootPart")
+        local hum  = v:FindFirstChild("Humanoid")
+        if not (root and hum) then break end
         equipWeapon()
         buso()
         BringMob() -- gom cac quai cung ten lai 1 cho de AOE
         pcall(function()
-            local hum, root = v.Humanoid, v.HumanoidRootPart
             root.CanCollide = false
             hum.WalkSpeed = 0
             hum.JumpPower = 0
@@ -322,7 +325,9 @@ local function bringAndKill(v, untilFn)
             if v:FindFirstChild("Head") then v.Head.CanCollide = false end
             if sethiddenproperty then sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge) end
         end)
-        topos(v.HumanoidRootPart.CFrame * CFrame.new(0, CONFIG.FarmHeight, 0)) -- dung sat dau quai (FarmHeight)
+        if root.Parent then -- HRP con ton tai moi tween (quai co the chet giua chung)
+            topos(root.CFrame * CFrame.new(0, CONFIG.FarmHeight, 0)) -- dung sat dau quai (FarmHeight)
+        end
         task.wait(0.1)
     until not checkmob(v) or (untilFn and untilFn())
     ATK.on = false
