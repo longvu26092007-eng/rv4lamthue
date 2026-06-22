@@ -33,7 +33,7 @@ local CONFIG = {
     MirageApiUrl   = "http://fi11.bot-hosting.net:20758/api/name=mirage", -- API lay server co dao
     TweenSpeed     = 320,    -- toc do bay (studs/s)
     LoopWait       = 0.5,    -- nhip vong lap chinh
-    RequireRaceV3  = true,   -- bat buoc co RaceEnergy (Race V3) moi chay
+    RequireRaceV3  = true,   -- bat buoc co RaceAbility (da mo Race V3) moi chay
     MaxPlayer      = 12,     -- chi hop vao server con cho (player < MaxPlayer)
     AllowCrossPlace = false, -- true = cho phep hop sang placeid khac game hien tai
     Team           = "Pirates", -- phe mac dinh khi acc chua chon (Pirates / Marines)
@@ -42,6 +42,15 @@ local CONFIG = {
 --==================  TIEN ICH CHUNG  ==================--
 local function getRemotes()
     return ReplicatedStorage:FindFirstChild("Remotes")
+end
+
+-- Trang thai (UI doc qua _G.AutoStatus) + log 8 dong gan nhat
+local LOG = {}
+local function SetStatus(msg)
+    _G.AutoStatus = msg
+    table.insert(LOG, os.date("%H:%M:%S") .. "  " .. tostring(msg))
+    while #LOG > 8 do table.remove(LOG, 1) end
+    print("[Auto] " .. tostring(msg))
 end
 
 -- PlaceId cua chinh minh (nguon su that, khong hard-code)
@@ -92,7 +101,7 @@ local function EnsureSea3()
     if THIRD_SEA_PLACES[game.PlaceId] then return false end -- da o Sea 3
     if _sea3Started then return true end
     _sea3Started = true
-    print("[Auto] Chua o Sea 3 (place " .. tostring(game.PlaceId) .. ") -> tu travel len Sea 3...")
+    SetStatus("Chua o Sea 3 (place " .. tostring(game.PlaceId) .. ") -> travel len Sea 3")
     -- boc thread con: InvokeServer co the yield -> tranh treo luc load neu server cham
     task.spawn(function()
         local R = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
@@ -185,7 +194,7 @@ local function EnsureTeam()
     pcall(function() if getgenv().Team then team = getgenv().Team end end)
     if team ~= "Pirates" and team ~= "Marines" then team = "Pirates" end
 
-    print("[Auto] Chua co phe -> join team:", team)
+    SetStatus("Chua co phe -> dang chon team: " .. team)
     local attempts = 0
     while not LocalPlayer.Team and attempts < 40 do
         attempts = attempts + 1
@@ -213,9 +222,9 @@ local function EnsureTeam()
         task.wait(0.8)
     end
     if LocalPlayer.Team then
-        print("[Auto] Da vao team:", tostring(LocalPlayer.Team and LocalPlayer.Team.Name))
+        SetStatus("Da vao team: " .. tostring(LocalPlayer.Team and LocalPlayer.Team.Name))
     else
-        warn("[Auto] Join team that bai sau " .. attempts .. " lan thu")
+        SetStatus("Join team that bai sau " .. attempts .. " lan thu")
     end
 end
 
@@ -245,11 +254,13 @@ local function CheckDieuKien()
         return false
     end
 
-    -- 4. Da mo Race V3 (co RaceEnergy) -> moi keo can gat duoc
+    -- 4. Da mo Race V3 (co RaceAbility - nhan T) -> moi keo can gat duoc
+    --    LUU Y: RaceEnergy la cua RACE V4 (vach nang luong bien hinh), KHONG dung check V3.
+    --    V3 = RaceAbility (nhan T dung skill toc). Check nham RaceEnergy se loai sai acc V3.
     if CONFIG.RequireRaceV3 then
-        local energy = char:FindFirstChild("RaceEnergy")
-        if not energy then
-            _G.KhongDatYeuCau = "Chua mo Race V3 (khong tim thay RaceEnergy)"
+        local ability = char:FindFirstChild("RaceAbility")
+        if not ability then
+            _G.KhongDatYeuCau = "Chua mo Race V3 (khong tim thay RaceAbility)"
             return false
         end
     end
@@ -417,6 +428,7 @@ local function PullLeverOnce()
     -- bay len dinh dao (WorldPivot + 500); con xa thi TP toi
     local pointer = mystic:GetPivot() * CFrame.new(0, 500, 0)
     if (pointer.Position - hrp.Position).Magnitude > 25 then
+        SetStatus("Co Mirage -> bay len dinh dao")
         TP(pointer)
         return
     end
@@ -428,9 +440,10 @@ local function PullLeverOnce()
     local hour  = tonumber(tostring(Lighting.TimeOfDay):match("^(%d+)"))
     local camCF = MoonCamByHour(hour)
     if not camCF then
-        print("[Auto] Chua phai ban dem (gio=" .. tostring(hour) .. ") -> doi trang len...")
+        SetStatus("Doi ban dem de keo lever (gio=" .. tostring(hour) .. ")")
         return
     end
+    SetStatus("Ngam trang + nhan T keo lever")
 
     -- ngam trang: ep trang to + khoa camera (set 2 lan nhu func.txt)
     pcall(function()
@@ -449,6 +462,7 @@ local function PullLeverOnce()
     wait(17)
 
     -- cham tung "Part" noi len bang TP + Space den khi tang hinh, roi check temple door
+    SetStatus("Cham cac Part cua den (sau khi keo T)")
     for _, v in ipairs(mystic:GetChildren()) do
         if v.ClassName == "MeshPart" and v.Name == "Part" and v.Transparency == 0 then
             repeat
@@ -463,7 +477,7 @@ local function PullLeverOnce()
             if CommF("CheckTempleDoor") == true then
                 PullLeverDone = true
                 SavePullFile()
-                print("[Auto] PULL LEVER HOAN THANH ✅ (CheckTempleDoor = true)")
+                SetStatus("PULL LEVER HOAN THANH ✅ (CheckTempleDoor)")
             end
         end
     end
@@ -476,16 +490,18 @@ local function RunPullLever()
         local ok, err = pcall(function()
             if PullLeverDone or IsLeverDone() then
                 SavePullFile()
-                print("[Auto] PULL LEVER HOAN THANH ✅")
+                SetStatus("PULL LEVER HOAN THANH ✅")
                 _G.AutoPullLeverDone = true
                 return
             end
 
             if not ExSeb then
                 -- chua qua quest -> chay RaceV4Progress (Begin/Teleport/Continue)
+                SetStatus("Lam quest Race V4 (RaceV4Progress)")
                 RaceV4Progress()
             elseif not getMystic() then
                 -- da qua quest nhung server khong co Mirage -> hop bang API
+                SetStatus("Khong co Mirage -> hop server tim dao (API)")
                 HopToMirageServer()
             else
                 -- da co Mirage -> keo lever theo dung func.txt
@@ -501,13 +517,15 @@ end
 local function Main()
     print("[Auto] PlaceId cua ban (game.PlaceId) =", MyPlaceId, "| JobId =", game.JobId)
 
-    -- Chua o Sea 3 -> tu travel len Sea 3 roi dung (script se chay lai sau khi teleport)
+    -- B1: CHON PHE TRUOC. Acc ket man ChooseTeam se KHONG di chuyen / travel duoc,
+    --     nen phai join team xong roi moi detect + travel sea.
+    EnsureTeam()
+
+    -- B2: Chua o Sea 3 -> tu travel len Sea 3 roi dung (script chay lai sau khi teleport)
     if EnsureSea3() then
         print("[Auto] Dang travel len Sea 3... (cho teleport, script chay lai o sea moi)")
         return
     end
-
-    EnsureTeam() -- join team (chon phe) truoc neu acc chua co
     if CheckDieuKien() then
         RunPullLever()
     else
