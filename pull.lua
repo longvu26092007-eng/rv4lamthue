@@ -170,7 +170,10 @@ local function getMystic()
 end
 
 -- JOIN TEAM: tham gia phe (Pirates/Marines). Acc moi bi ket man chon phe
--- se khong di chuyen / lam quest duoc cho den khi chon. (Banana: SetTeam)
+-- se khong di chuyen / lam quest duoc cho den khi chon.
+-- FIX: join BEN — retry CA 2 cach (remote SetTeam + fallback bam UI ChooseTeam) toi khi
+-- co team that. Truoc day chi goi remote 1 lan nen "luc duoc luc khong" (remote chua san /
+-- UI chua load kip). Method chuan tu KaitunV4.
 local function EnsureTeam()
     -- doi game load xong
     local t0 = tick()
@@ -182,12 +185,38 @@ local function EnsureTeam()
     pcall(function() if getgenv().Team then team = getgenv().Team end end)
     if team ~= "Pirates" and team ~= "Marines" then team = "Pirates" end
 
-    print("[Auto] Chua co phe -> SetTeam:", team)
-    CommF("SetTeam", team)
+    print("[Auto] Chua co phe -> join team:", team)
+    local attempts = 0
+    while not LocalPlayer.Team and attempts < 40 do
+        attempts = attempts + 1
 
-    -- cho game gan team / hoi sinh (toi da 8s)
-    local t1 = tick()
-    repeat task.wait() until LocalPlayer.Team or tick() - t1 > 8
+        -- Cach 1: goi thang remote SetTeam
+        CommF("SetTeam", team)
+        task.wait(0.4)
+        if LocalPlayer.Team then break end
+
+        -- Cach 2: fallback bam UI ChooseTeam (getgc) khi remote khong an
+        pcall(function()
+            local chooseGui = LocalPlayer.PlayerGui:FindFirstChild("ChooseTeam", true)
+            local uiCtrl    = LocalPlayer.PlayerGui:FindFirstChild("UIController", true)
+            if chooseGui and chooseGui.Visible and uiCtrl and getgc then
+                for _, fn in pairs(getgc(true)) do
+                    if type(fn) == "function" and getfenv(fn).script == uiCtrl then
+                        local consts = getconstants and getconstants(fn)
+                        if consts and #consts == 1 and (consts[1] == "Pirates" or consts[1] == "Marines") then
+                            if consts[1] == team then pcall(fn, team) end
+                        end
+                    end
+                end
+            end
+        end)
+        task.wait(0.8)
+    end
+    if LocalPlayer.Team then
+        print("[Auto] Da vao team:", tostring(LocalPlayer.Team and LocalPlayer.Team.Name))
+    else
+        warn("[Auto] Join team that bai sau " .. attempts .. " lan thu")
+    end
 end
 
 --==================  BUOC 1: CHECK DIEU KIEN  ==================--
