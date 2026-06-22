@@ -37,6 +37,9 @@ local CONFIG = {
     MaxPlayer      = 12,     -- chi hop vao server con cho (player < MaxPlayer)
     AllowCrossPlace = false, -- true = cho phep hop sang placeid khac game hien tai
     Team           = "Pirates", -- phe mac dinh khi acc chua chon (Pirates / Marines)
+    SkipRaceV4Progress = true,  -- true = BO QUA buoc lam quest RaceV4Progress (set ExSeb=true luon):
+                                -- chi hop server co dao Mirage roi keo lever (KHONG lam quest V4).
+                                -- Doi false neu acc CHUA xong quest trial va can script lam ho.
 }
 
 --==================  TIEN ICH CHUNG  ==================--
@@ -360,6 +363,7 @@ local PullLeverDone = false  -- da keo xong lever
 -- func.txt:7307-7354  (CommF_ "RaceV4Progress": Check/Begin/Teleport/Continue)
 local function RaceV4Progress()
     local stage = CommF("RaceV4Progress", "Check")
+    _G.AutoV4Stage = stage  -- de UI / debug doc duoc dang o stage nao (nil = remote loi)
     if stage == 1 then
         CommF("RaceV4Progress", "Check")
         CommF("RaceV4Progress", "Begin")
@@ -387,6 +391,12 @@ local function RaceV4Progress()
 
     elseif stage == 4 then
         ExSeb = true
+
+    else
+        -- stage nil/la (remote loi hoac acc khong o trang thai trial 1-4).
+        -- KHONG ket thuc lang le -> bao ra UI de biet dang ket o dau.
+        SetStatus("RaceV4Progress Check tra ve: " .. tostring(stage)
+            .. " (khong phai 1-4) -> dang ket. Bat CONFIG.SkipRaceV4Progress neu acc da xong quest.")
     end
 end
 
@@ -497,9 +507,15 @@ local function RunPullLever()
                 return
             end
 
+            if CONFIG.SkipRaceV4Progress and not ExSeb then
+                -- bo qua quest: coi nhu da xong -> di thang den buoc hop dao + keo lever
+                ExSeb = true
+                SetStatus("Bo qua RaceV4Progress (SkipRaceV4Progress=true)")
+            end
+
             if not ExSeb then
                 -- chua qua quest -> chay RaceV4Progress (Begin/Teleport/Continue)
-                SetStatus("Lam quest Race V4 (RaceV4Progress)")
+                SetStatus("Lam quest Race V4 (RaceV4Progress) - stage=" .. tostring(_G.AutoV4Stage))
                 RaceV4Progress()
             elseif not getMystic() then
                 -- da qua quest nhung server khong co Mirage -> hop bang API
@@ -795,7 +811,8 @@ local function BuildDebugUI()
             chip("Sea 3      ", THIRD_SEA_PLACES[game.PlaceId] == true, "dang o", "chua toi"),
             chip("Team       ", team ~= nil, team, "chua chon"),
             chip("Nhan vat   ", hrp ~= nil, "da load", "chua load"),
-            chip("Quest V4   ", ExSeb == true, "xong - len dao", "dang lam"),
+            chip("Quest V4   ", ExSeb == true, "xong - len dao",
+                "dang lam (stage=" .. tostring(_G.AutoV4Stage) .. ")"),
             chip("Mirage dao ", mirage, "co o server", "chua co"),
             chip("Ban dem    ", night, "gio " .. tostring(hour), "gio " .. tostring(hour) .. " (ngay)"),
             chip("Pull Lever ", leverDone, "HOAN THANH", "chua xong"),
