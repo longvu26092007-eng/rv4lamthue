@@ -155,7 +155,7 @@ local function EnsureTeam()
     end)
 end
 
---==================  COMBAT (1 method HitRegistration cua Banana - co ma hoa)  ==================--
+--==================  COMBAT (AttackNoCoolDown KaitunV4 - RegisterAttack/RegisterHit)  ==================--
 -- equip CHI Melee (getgenv().USESWORD = true thi dung Sword). Khong dung tool khac.
 local function equipWeapon()
     local c = char(); local bp = LocalPlayer:FindFirstChild("Backpack")
@@ -180,81 +180,69 @@ local ATK = { on = false }
 local ATK_RANGE = 60
 -- Resolve remote combat LAZY (retry moi lan goi toi khi co) - giong KaitunV4 resolve trong AttackNoCoolDown.
 -- (Truoc day cache nil luc load -> "THIEU remote" mai mai.)
-local _Net, RegisterAttack, RegisterHit, _seedRF
+local _Net, RegisterAttack, RegisterHit
 local function resolveCombat()
     if RegisterAttack and RegisterHit then return true end
     local mods = ReplicatedStorage:FindFirstChild("Modules")
     _Net = mods and mods:FindFirstChild("Net")
     if _Net then
-        RegisterAttack = _Net:FindFirstChild("RE/RegisterAttack")
-        RegisterHit    = _Net:FindFirstChild("RE/RegisterHit")
-        _seedRF        = _Net:FindFirstChild("seed")
+        RegisterAttack = RegisterAttack or _Net:FindFirstChild("RE/RegisterAttack")
+        RegisterHit    = RegisterHit    or _Net:FindFirstChild("RE/RegisterHit")
     end
     -- fallback: tim sau toan ReplicatedStorage neu path Modules.Net khong dung
     if not RegisterAttack then RegisterAttack = ReplicatedStorage:FindFirstChild("RE/RegisterAttack", true) end
     if not RegisterHit    then RegisterHit    = ReplicatedStorage:FindFirstChild("RE/RegisterHit", true) end
-    if not _seedRF        then _seedRF        = ReplicatedStorage:FindFirstChild("seed", true) end
     return (RegisterAttack ~= nil) and (RegisterHit ~= nil)
 end
 
--- ===== DANH = copy HitRegistrationModule.Execute cua Banana (ban moi, co MA HOA) =====
--- Tim remote ma hoa (RemoteEvent co attribute Id)
-local AttackRemoteTarget, AttackRemoteId
-for _, name in ipairs({ "Util", "Common", "Remotes", "Assets", "FX" }) do
-    local folder = ReplicatedStorage:FindFirstChild(name)
-    if folder then
-        for _, child in ipairs(folder:GetChildren()) do
-            if child:IsA("RemoteEvent") and child:GetAttribute("Id") then
-                AttackRemoteTarget, AttackRemoteId = child, child:GetAttribute("Id")
-            end
-        end
-        folder.ChildAdded:Connect(function(child)
-            if child:IsA("RemoteEvent") and child:GetAttribute("Id") then
-                AttackRemoteTarget, AttackRemoteId = child, child:GetAttribute("Id")
-            end
-        end)
-    end
-end
-local _cloneref = cloneref or function(x) return x end
-
+-- ===== DANH = AttackNoCoolDown KaitunV4 (3.txt:2176) - method da chay on =====
+-- Tool co LeftClickRemote (sung / 1 so kiem) -> ban truc tiep huong + dem don.
+-- Con lai (Melee / Blox Fruit) -> RegisterAttack(seed nho) + RegisterHit(mainTarget, {{enemy,head}, ...}).
 local function doAttack()
     local c = char(); local root = hrp(); if not (c and root) then DBG.atk = "no char"; return end
     local tool = c:FindFirstChildOfClass("Tool")
     if not tool then DBG.atk = "CHUA CAM VU KHI"; return end           -- nhan moi tool dang cam
-    if not resolveCombat() then DBG.atk = "dang tim Modules.Net..."; return end -- retry toi khi co remote
+    local enemies = Workspace:FindFirstChild("Enemies"); if not enemies then DBG.atk = "ko co Enemies"; return end
+    local myPos = root.Position
 
-    -- gom muc tieu (Enemies, khong PvP) trong tam, lay MOI BasePart cua tung con
-    local hitTargets = {}
-    local folder = Workspace:FindFirstChild("Enemies")
-    if folder then
-        for _, target in ipairs(folder:GetChildren()) do
-            local hum = target:FindFirstChild("Humanoid")
-            local rp  = target:FindFirstChild("HumanoidRootPart")
-            if hum and rp and hum.Health > 0 and target ~= c and (rp.Position - root.Position).Magnitude <= ATK_RANGE then
-                for _, child in ipairs(target:GetChildren()) do
-                    if child:IsA("BasePart") then hitTargets[#hitTargets + 1] = { target, child } end
-                end
+    -- ----- Vu khi co LeftClickRemote: ban tung con theo huong (sung/kiem) -----
+    local lcr = tool:FindFirstChild("LeftClickRemote")
+    if lcr then
+        local n = 0
+        for _, enemy in ipairs(enemies:GetChildren()) do
+            local ehrp = enemy:FindFirstChild("HumanoidRootPart")
+            local hum  = enemy:FindFirstChild("Humanoid")
+            if ehrp and hum and hum.Health > 0 and not enemy:GetAttribute("IsBoat")
+                and (ehrp.Position - myPos).Magnitude <= ATK_RANGE then
+                n = n + 1
+                local dir = (ehrp.Position - myPos).Unit
+                pcall(function() lcr:FireServer(dir, n) end)
+            end
+        end
+        DBG.atk = n > 0 and ("DANH(LCR) | tool:%s tgt:%d"):format(tool.Name, n) or "ko co muc tieu <=60"
+        return
+    end
+
+    -- ----- Melee / Blox Fruit: RegisterAttack + RegisterHit -----
+    if not resolveCombat() then DBG.atk = "dang tim Modules.Net..."; return end
+    local targets, mainTarget = {}, nil
+    for _, enemy in ipairs(enemies:GetChildren()) do
+        if not enemy:GetAttribute("IsBoat") then
+            local hum  = enemy:FindFirstChild("Humanoid")
+            local head = enemy:FindFirstChild("Head")
+            if hum and head and hum.Health > 0 and (head.Position - myPos).Magnitude <= ATK_RANGE then
+                targets[#targets + 1] = { enemy, head } -- 1 entry / con: {model, Head}
+                mainTarget = head
             end
         end
     end
-    if #hitTargets == 0 then DBG.atk = "ko co muc tieu <=60"; return end
+    if not mainTarget then DBG.atk = "ko co muc tieu <=60"; return end
 
-    local targetHead = hitTargets[1][1]:FindFirstChild("Head") or hitTargets[1][2]
-    local seed
-    pcall(function() if _seedRF then seed = _seedRF:InvokeServer() end end)
-
-    RegisterAttack:FireServer()                         -- KHONG arg (banana)
-    RegisterHit:FireServer(targetHead, hitTargets, {})  -- 3 arg (banana)
-
-    if AttackRemoteTarget and seed then                 -- ban ma hoa (cai nay moi an damage)
-        local key = math.floor(Workspace:GetServerTimeNow() / 10 % 10) + 1
-        local encoded = string.gsub("RE/RegisterHit", ".", function(ch)
-            return string.char(bit32.bxor(string.byte(ch), key))
-        end)
-        local finalId = bit32.bxor(AttackRemoteId + 909090, seed * 2)
-        _cloneref(AttackRemoteTarget):FireServer(encoded, finalId, targetHead, hitTargets)
-    end
-    DBG.atk = ("DANH | tool:%s tgt:%d seed:%s enc:%s"):format(tool.Name, #hitTargets, seed and "ok" or "X", AttackRemoteTarget and "ok" or "X")
+    pcall(function()
+        RegisterAttack:FireServer(0.0000000000001)      -- seed nho (KaitunV4) - bat buoc, ko phai bo trong
+        RegisterHit:FireServer(mainTarget, targets)     -- DUNG 2 arg: (mainTarget, targets)
+    end)
+    DBG.atk = ("DANH | tool:%s tgt:%d"):format(tool.Name, #targets)
 end
 
 task.spawn(function()
