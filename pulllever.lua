@@ -53,6 +53,11 @@ local THIRD_SEA_PLACES = {
     [7449423635]      = true,
     [100117331123089] = true,
 }
+-- PlaceId Sea 2 (New World) - de biet dang o Sea 2 thi TravelZou len thang Sea 3
+local SEA2_PLACES = {
+    [4442272183]     = true,
+    [79091703265657] = true,
+}
 
 local httpGet -- forward declare (dinh nghia o phan API ben duoi)
 
@@ -75,6 +80,34 @@ local function IsMiragePlace()
     end
     _placeOkCache = false
     return false
+end
+
+-- TU TRAVEL LEN SEA 3 (Sea1/khac -> Sea2 -> Sea3). Method chuan tu KaitunV4:
+--   TravelZou       = Sea2 -> Sea3
+--   TravelDressrosa = Sea1/khac -> Sea2 (vong sau script chay lai se len tiep Sea3)
+-- Tra ve true neu DANG di chuyen (chua o Sea3) -> Main nen return cho;
+-- false neu da o Sea3 -> chay tiep binh thuong.
+local _sea3Started = false
+local function EnsureSea3()
+    if THIRD_SEA_PLACES[game.PlaceId] then return false end -- da o Sea 3
+    if _sea3Started then return true end
+    _sea3Started = true
+    print("[Auto] Chua o Sea 3 (place " .. tostring(game.PlaceId) .. ") -> tu travel len Sea 3...")
+    -- boc thread con: InvokeServer co the yield -> tranh treo luc load neu server cham
+    task.spawn(function()
+        local R = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
+        while not THIRD_SEA_PLACES[game.PlaceId] do
+            pcall(function()
+                if SEA2_PLACES[game.PlaceId] then
+                    R:InvokeServer("TravelZou")        -- Sea2 -> Sea3
+                else
+                    R:InvokeServer("TravelDressrosa")  -- Sea1/khac -> Sea2
+                end
+            end)
+            task.wait(5)
+        end
+    end)
+    return true
 end
 
 -- TP an toan bang tween (tranh kick anti-cheat khi giật CFrame xa)
@@ -438,6 +471,13 @@ end
 --==================  ENTRY  ==================--
 local function Main()
     print("[Auto] PlaceId cua ban (game.PlaceId) =", MyPlaceId, "| JobId =", game.JobId)
+
+    -- Chua o Sea 3 -> tu travel len Sea 3 roi dung (script se chay lai sau khi teleport)
+    if EnsureSea3() then
+        print("[Auto] Dang travel len Sea 3... (cho teleport, script chay lai o sea moi)")
+        return
+    end
+
     EnsureTeam() -- join team (chon phe) truoc neu acc chua co
     if CheckDieuKien() then
         RunPullLever()
