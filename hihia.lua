@@ -497,39 +497,10 @@ spawn(function()
 end)
 
 -- ============================================================
--- [MAIN2-6 BACKGROUND JOIN] Vòng NỀN riêng: Main index 2..6 join server Main1 khi Main1 in_trail.
--- TÁCH KHỎI VÒNG CHÍNH vì vòng chính hay KẸT lâu trong doTrainGrind (train song song, V4 hover)
--- → khối join nằm trong vòng chính KHÔNG chạy kịp lúc Main1 chuyển in_trail. Vòng nền 1s/lần đọc
--- _G.srvCurMain / _G.srvCurMainJobid (warmer giữ tươi ~0.7s) nên join được dù vòng chính đang kẹt.
--- Teleport sẽ tự ngắt train (char reload) → đúng ý "Main1 in_trail thì Main2-6 nhảy vào".
+-- [MAIN2-6 BACKGROUND JOIN] ĐÃ GỠ BỎ theo yêu cầu (dự định khác cho Main2-6).
+-- Trước đây: vòng nền 1s/lần để Main index 2..6 tự teleport vào server Main1 khi Main1 in_trail.
+-- Đã xóa hẳn — Main2-6 KHÔNG còn tự join server Main1 nữa.
 -- ============================================================
-spawn(function()
-    while true do
-        wait(1)
-        pcall(function()
-            if not (isaccmain[myName] and myMainIndex and myMainIndex >= 2 and myMainIndex <= 6) then return end
-            if teleporting then return end                       -- đang teleport rồi → khỏi gọi chồng
-            local curName = _G.srvCurMain
-            if not curName or curName == myName then
-                _G.lastMain1Join = nil                           -- mình là stt1 / chưa có current → reset
-                return
-            end
-            if getMainStatus(curName) ~= "in_trail" then
-                _G.lastMain1Join = nil                           -- Main1 hết in_trail → reset throttle
-                return
-            end
-            local curJob = _G.srvCurMainJobid or (mainJobCache[curName] and mainJobCache[curName].jobid)
-            if not curJob or curJob == "" or curJob == game.JobId then return end  -- chưa có jobid / đã cùng server
-            if _G.lastMain1Join and (tick() - _G.lastMain1Join) <= 1.5 then return end
-            _G.lastMain1Join = tick()
-            pcall(function()
-                game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser")
-                    :InvokeServer("teleport", curJob)
-            end)
-            DBG(("[MAIN%d] Join server Main1 (%s) — in_trail"):format(myMainIndex, curName), "ok")
-        end)
-    end
-end)
 
 
 -- Trước đây chỉ gọi 1 lần nên "lúc được lúc không" (remote chưa sẵn / UI chưa load kịp).
@@ -597,6 +568,112 @@ local function safeInvoke(timeout, ...)
     if not done or not packed then return false end
     return table.unpack(packed, 1, packed.n)
 end
+
+-- ============================================================
+-- [HOP SERVER] PORT BÁM SÁT "Hop Sever.txt" (DRACO HUNTER V17.3) — bản bạn xài ổn.
+--   • GetServers: __ServerBrowser:WaitForChild(...):InvokeServer(trang) lặp 1→100, cache 60s.
+--   • HopServer:  dict→mảng (bỏ JobId hiện tại) → lọc Players<=MaxPlayers → NỚI LỎNG dần → random
+--                 → teleport bằng __ServerBrowser:InvokeServer('teleport', JobId).
+--   • TeleportInitFailed: GameFull / fail → tự HopServer lại.
+-- KHÁC reference (để khớp script này, KHÔNG đổi logic hop):
+--   • dùng DBG thay print/warn → bạn thấy tín hiệu hop ngay trong panel debug.
+--   • error-handler chỉ retry khi cờ _G.trainHopArmedT <15s → KHÔNG cướp teleport ally/join-main/fullmoon.
+-- ============================================================
+local HOP_CONFIG = {
+    MaxPlayers    = 6,     -- chỉ hop vào server có <= N người (đặt nil để bỏ qua). 6 = "6 người trở xuống".
+    CacheDuration = 60,    -- giây cache danh sách server
+    MaxPages      = 100,   -- số trang tối đa khi lấy danh sách server
+    RetryDelay    = 2,     -- giây chờ trước khi thử lại khi teleport lỗi
+}
+
+local function _ifTableHaveIndex(j)
+    for _ in pairs(j) do return true end
+    return false
+end
+
+local _hopLastPull, _hopCachedServers
+local function GetServers()
+    if _hopLastPull and _hopCachedServers and (tick() - _hopLastPull) < HOP_CONFIG.CacheDuration then
+        return _hopCachedServers
+    end
+    for i = 1, HOP_CONFIG.MaxPages do
+        local ok, data = pcall(function()
+            return game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer(i)
+        end)
+        if ok and data and _ifTableHaveIndex(data) then
+            _hopLastPull = tick()
+            _hopCachedServers = data
+            return data
+        end
+    end
+    DBG("[HOP] Không lấy được danh sách server!", "err")
+    return nil
+end
+
+-- HopServer(reason): lấy server <=MaxPlayers người (khác server hiện tại) rồi teleport bằng __ServerBrowser.
+function HopServer(Reason, MaxPlayers)
+    MaxPlayers = MaxPlayers or HOP_CONFIG.MaxPlayers
+
+    local Servers = GetServers()
+    if not Servers then
+        DBG("[HOP] Không có dữ liệu server → hop random bằng TeleportService", "err")
+        pcall(function() TeleportService:Teleport(game.PlaceId, game.Players.LocalPlayer) end)
+        return false
+    end
+
+    -- dictionary → mảng, loại bỏ server hiện tại (game.JobId)
+    local ArrayServers = {}
+    for id, v in pairs(Servers) do
+        if id ~= game.JobId and type(v) == "table" then
+            table.insert(ArrayServers, { JobId = id, Players = v.Count or 0 })
+        end
+    end
+    DBG(("[HOP] Nhận được %d server"):format(#ArrayServers), "ok")
+    if #ArrayServers == 0 then
+        DBG("[HOP] Danh sách server rỗng → hop random", "err")
+        pcall(function() TeleportService:Teleport(game.PlaceId, game.Players.LocalPlayer) end)
+        return false
+    end
+
+    -- Lọc: giữ server có Players <= MaxPlayers (ít người). Không có → NỚI LỎNG: dùng toàn bộ.
+    local Filtered = {}
+    for _, s in ipairs(ArrayServers) do
+        if (not MaxPlayers) or s.Players <= MaxPlayers then
+            table.insert(Filtered, s)
+        end
+    end
+    DBG(("[HOP] Sau lọc (<=%s người): %d server"):format(tostring(MaxPlayers), #Filtered), "ok")
+    if #Filtered == 0 then
+        DBG("[HOP] Không có server ít người → dùng toàn bộ danh sách", "err")
+        Filtered = ArrayServers
+    end
+
+    -- random để các tài khoản không dồn cùng 1 server
+    local ServerData = Filtered[math.random(1, #Filtered)]
+    _G.trainHopArmedT = tick()   -- cờ: vừa hop (cho TeleportInitFailed retry đúng ngữ cảnh hop)
+    DBG(("[HOP] %s → teleport %s (Players=%d)"):format(tostring(Reason), tostring(ServerData.JobId), ServerData.Players), "ok")
+    local ok = pcall(function()
+        game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", ServerData.JobId)
+    end)
+    return ok
+end
+
+-- ERROR HANDLING (port từ reference) — server đầy / teleport lỗi → tự HopServer lại.
+-- CHỈ áp khi cờ _G.trainHopArmedT <15s → KHÔNG đụng teleport ally / join-main / fullmoon.
+pcall(function()
+    TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, message)
+        if player ~= game.Players.LocalPlayer then return end
+        if not (_G.trainHopArmedT and (tick() - _G.trainHopArmedT) < 15) then return end
+        _G.trainHopArmedT = nil
+        if teleportResult == Enum.TeleportResult.GameFull then
+            DBG("[HOP] Server đầy → thử hop lại", "err")
+            task.delay(HOP_CONFIG.RetryDelay, function() HopServer("Retry - Server đầy") end)
+        else
+            DBG("[HOP] Teleport thất bại (" .. tostring(teleportResult) .. ") → thử server khác", "err")
+            task.delay(3, function() HopServer("Retry - Teleport fail") end)
+        end
+    end)
+end)
 -- ============================================================
 -- [MODULE] Bản module_bf NHÚNG THẲNG (không tải GitHub) — đã FIX:
 --   • topos: HỦY tween cũ trước khi tạo mới (hết chồng tween + memory leak + giật),
@@ -1034,6 +1111,35 @@ function isSamePlace(serverEntry)
     return serverEntry ~= nil and tonumber(serverEntry.placeid) == game.PlaceId
 end
 
+-- Hop sang 1 server ĐANG full moon (dùng API fi11). Trả true nếu đã gửi lệnh teleport.
+-- Dùng cho: (a) Main2-4 đứng waiting muốn LUÔN ở server full moon (gọi từ nhánh waiting),
+-- giữ NGUYÊN tiêu chí như khối hop fullmoon lúc tới lượt: cùng PlaceId + ≤8 người + chưa ghé 1h.
+function hopFullmoonServer(reason)
+    local hopped = false
+    pcall(function()
+        local cachedJobs = {}
+        local okCache, cacheData = pcall(function() return game.HttpService:JSONDecode(readfile("cache_v4.json")) end)
+        if okCache and cacheData then cachedJobs = cacheData end
+        local thua = Net.getJSON("http://fi11.bot-hosting.net:20758/api/name=fullmoon", 5)
+        -- API trả {success, count, data:[{jobid, placeid, player}], updated_at}
+        if thua and thua["success"] and type(thua["data"]) == "table" then
+            for _, v in pairs(thua["data"]) do
+                local jobid = v["jobid"]
+                if jobid and jobid ~= game.JobId and v.player <= 8 and isSamePlace(v) then
+                    local lastVisit = cachedJobs[jobid]
+                    if not lastVisit or (math.floor(tick()) - lastVisit) > 3600 then
+                        status(tostring(reason) .. " Hop fullmoon server")
+                        game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", jobid)
+                        hopped = true
+                        break
+                    end
+                end
+            end
+        end
+    end)
+    return hopped
+end
+
 if module then module:noclip([[return true]]) end
 
 function getmob1(pos)
@@ -1430,56 +1536,21 @@ function doTrainGrind(tag, AB, reassertFn)
         end)
     end
     pressV4()
-    -- ===== TIMEOUT TRAIN (CHỈ MAIN): 1 phút kill ≤10 quái → server kém/stuck → HOP SERVER =====
-    -- Đếm số quái xong trong cửa sổ 60s, BỀN qua các nhịp gọi doTrainGrind (lưu _G). Train bị ngắt
-    -- >5s (đi trial / đổi việc) → reset cửa sổ. Đủ 60s: >10 kill → reset đếm phút mới; ≤10 → hop.
-    local function hopBadTrainServer(reason)
-        status(tag .. " ⏱ Timeout train (" .. tostring(reason) .. ") → hop server")
-        DBG(tag .. " timeout train → hop: " .. tostring(reason), "err")
-        local cachedJobs = {}
-        pcall(function()
-            local d = game.HttpService:JSONDecode(readfile("cache_v4.json"))
-            if type(d) == "table" then cachedJobs = d end
-        end)
-        local hopped = false
-        pcall(function()
-            -- __ServerBrowser chỉ trả server CÙNG PlaceId (browser của chính game này) → khỏi lo lệch sea.
-            local SB = game:GetService("ReplicatedStorage"):FindFirstChild("__ServerBrowser")
-            if not SB then return end
-            for page = 1, 10 do
-                local ok, data = pcall(function() return SB:InvokeServer(page) end)
-                if ok and type(data) == "table" then
-                    local arr = {}
-                    for id, info in pairs(data) do
-                        -- bỏ server hiện tại + chỉ server <8 người (còn chỗ) + chưa ghé trong 1h (tránh bounce lại)
-                        if id ~= game.JobId and type(info) == "table" and (info.Count or 0) < 8 then
-                            local last = cachedJobs[id]
-                            if not last or (math.floor(tick()) - last) > 3600 then
-                                table.insert(arr, id)
-                            end
-                        end
-                    end
-                    if #arr > 0 then
-                        SB:InvokeServer("teleport", arr[math.random(1, #arr)])
-                        hopped = true
-                        return
-                    end
-                end
-            end
-        end)
-        if not hopped then
-            pcall(function() TeleportService:Teleport(game.PlaceId, game.Players.LocalPlayer) end)  -- fallback: rejoin random
-        end
-    end
+    -- ===== TIMEOUT TRAIN (CHỈ MAIN): 5 phút kill ≤10 quái → server kém / có người tranh quái → HOP =====
+    -- Đếm số quái xong trong cửa sổ 300s (5'), BỀN qua các nhịp gọi doTrainGrind (lưu _G). Train bị
+    -- ngắt >5s (đi trial / đổi việc) → reset cửa sổ. Đủ 5': >10 kill → reset đếm mới; ≤10 → hop.
+    -- Dùng HopServer (port chuẩn từ Hop Sever.txt) → tìm server chắc + tránh server vừa rời + retry khi lỗi.
+    local TRAIN_WINDOW = 300   -- 5 phút (trước đây 60s → hop quá sớm khi có người cùng server tranh quái)
     local function trainTimeoutHop()
         if not isaccmain[myName] then return false end           -- CHỈ MAIN (ally không hop khi train)
         if not _G.trainWinStart then return false end
-        if (tick() - _G.trainWinStart) < 60 then return false end
+        if (tick() - _G.trainWinStart) < TRAIN_WINDOW then return false end
         if (_G.trainKills or 0) > 10 then
-            _G.trainWinStart = tick(); _G.trainKills = 0          -- >10 quái/phút → ổn, đếm phút mới
+            _G.trainWinStart = tick(); _G.trainKills = 0          -- >10 quái/5' → ổn, đếm cửa sổ mới
             return false
         end
-        hopBadTrainServer(("kill %d/phut <=10"):format(_G.trainKills or 0))
+        status(tag .. " ⏱ Timeout train (kill " .. tostring(_G.trainKills or 0) .. "/5' <=10) → hop server")
+        HopServer(("Timeout train kill %d/5phut <=10"):format(_G.trainKills or 0))
         _G.trainWinStart = tick(); _G.trainKills = 0
         return true
     end
@@ -1601,12 +1672,7 @@ spawn(function()
                 end
             end
 
-            -- ===== MAIN2–6 JOIN SERVER MAIN1 khi Main1 in_trail =====
-            -- ĐÃ CHUYỂN RA VÒNG NỀN RIÊNG (spawn) — xem khối "MAIN2-6 BACKGROUND JOIN" gần warmer.
-            -- LÝ DO: khi Main2-6 train song song, vòng chính KẸT trong doTrainGrind (repeat...until
-            -- not checkmob_) rất lâu (nhất là V4 hover) → khối join ở đây KHÔNG được chạy kịp khi
-            -- Main1 chuyển in_trail → "Main2-6 không join Main1". Vòng nền chạy mỗi 1s độc lập, join
-            -- được kể cả khi vòng chính đang kẹt train.
+            -- ===== MAIN2–6 JOIN SERVER MAIN1 — ĐÃ GỠ BỎ HẲN (theo yêu cầu, dự định khác cho Main2-6) =====
 
             -- ===== VIỆC 1: MAIN STT1 QUÁ 5 PHÚT CHƯA XONG LƯỢT → TỤT CUỐI HÀNG WAITING =====
             -- Đếm từ lúc CHÍNH MÌNH lên stt1 (currentmain==myName). Quá 300s mà status VẪN
@@ -1768,6 +1834,23 @@ spawn(function()
                 else
                     if myStatus == "training" then setMyMainStatus("waiting") end
                     status("[MAIN " .. myStt .. "] Waiting for current main: " .. tostring(currentmain))
+                    -- ===== MAIN2-4 KHI WAITING → LUÔN Ở SERVER FULL MOON =====
+                    -- Yêu cầu: Main index 2/3/4 trong lúc waiting (đã train xong, chờ tới lượt stt1)
+                    -- phải LUÔN nằm trong server đang full moon. Nếu server hiện tại KHÔNG full moon
+                    -- (hoặc không phải đêm) → hop sang server full moon. Throttle 30s/lần để không
+                    -- teleport dồn dập (API + char reload mỗi lần hop). Hop xong nhớ jobid vào cache_v4
+                    -- để lần sau không bị chọn lại (tránh bounce).
+                    if myMainIndex and myMainIndex >= 2 and myMainIndex <= 4 then
+                        local inFullmoon = isfullmoon() and isnight()
+                        local lastTry = _G.waitFmHopT or 0
+                        if (not inFullmoon) and (tick() - lastTry) > 30 then
+                            _G.waitFmHopT = tick()
+                            if hopFullmoonServer("[MAIN " .. myStt .. "] Waiting →") then
+                                wait(10)
+                                Net.postJSON(BASE_URL .. "/noguchi?name=" .. myName, { jobid = game.JobId }, "noguchi")
+                            end
+                        end
+                    end
                 end
             else
                 -- CHỈ ALLY THẬT vào đây: liên tục detect jobid của main stt1 → join + help.
