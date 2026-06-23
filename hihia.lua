@@ -496,7 +496,42 @@ spawn(function()
     end
 end)
 
--- FIX: Join team bền — retry cả 2 cách (remote + ChooseTeam UI) tới khi có team thật.
+-- ============================================================
+-- [MAIN2-6 BACKGROUND JOIN] Vòng NỀN riêng: Main index 2..6 join server Main1 khi Main1 in_trail.
+-- TÁCH KHỎI VÒNG CHÍNH vì vòng chính hay KẸT lâu trong doTrainGrind (train song song, V4 hover)
+-- → khối join nằm trong vòng chính KHÔNG chạy kịp lúc Main1 chuyển in_trail. Vòng nền 1s/lần đọc
+-- _G.srvCurMain / _G.srvCurMainJobid (warmer giữ tươi ~0.7s) nên join được dù vòng chính đang kẹt.
+-- Teleport sẽ tự ngắt train (char reload) → đúng ý "Main1 in_trail thì Main2-6 nhảy vào".
+-- ============================================================
+spawn(function()
+    while true do
+        wait(1)
+        pcall(function()
+            if not (isaccmain[myName] and myMainIndex and myMainIndex >= 2 and myMainIndex <= 6) then return end
+            if teleporting then return end                       -- đang teleport rồi → khỏi gọi chồng
+            local curName = _G.srvCurMain
+            if not curName or curName == myName then
+                _G.lastMain1Join = nil                           -- mình là stt1 / chưa có current → reset
+                return
+            end
+            if getMainStatus(curName) ~= "in_trail" then
+                _G.lastMain1Join = nil                           -- Main1 hết in_trail → reset throttle
+                return
+            end
+            local curJob = _G.srvCurMainJobid or (mainJobCache[curName] and mainJobCache[curName].jobid)
+            if not curJob or curJob == "" or curJob == game.JobId then return end  -- chưa có jobid / đã cùng server
+            if _G.lastMain1Join and (tick() - _G.lastMain1Join) <= 1.5 then return end
+            _G.lastMain1Join = tick()
+            pcall(function()
+                game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser")
+                    :InvokeServer("teleport", curJob)
+            end)
+            DBG(("[MAIN%d] Join server Main1 (%s) — in_trail"):format(myMainIndex, curName), "ok")
+        end)
+    end
+end)
+
+
 -- Trước đây chỉ gọi 1 lần nên "lúc được lúc không" (remote chưa sẵn / UI chưa load kịp).
 spawn(function()
     local LP = game:GetService("Players").LocalPlayer
@@ -1395,11 +1430,74 @@ function doTrainGrind(tag, AB, reassertFn)
         end)
     end
     pressV4()
+    -- ===== TIMEOUT TRAIN (CHỈ MAIN): 1 phút kill ≤10 quái → server kém/stuck → HOP SERVER =====
+    -- Đếm số quái xong trong cửa sổ 60s, BỀN qua các nhịp gọi doTrainGrind (lưu _G). Train bị ngắt
+    -- >5s (đi trial / đổi việc) → reset cửa sổ. Đủ 60s: >10 kill → reset đếm phút mới; ≤10 → hop.
+    local function hopBadTrainServer(reason)
+        status(tag .. " ⏱ Timeout train (" .. tostring(reason) .. ") → hop server")
+        DBG(tag .. " timeout train → hop: " .. tostring(reason), "err")
+        local cachedJobs = {}
+        pcall(function()
+            local d = game.HttpService:JSONDecode(readfile("cache_v4.json"))
+            if type(d) == "table" then cachedJobs = d end
+        end)
+        local hopped = false
+        pcall(function()
+            -- __ServerBrowser chỉ trả server CÙNG PlaceId (browser của chính game này) → khỏi lo lệch sea.
+            local SB = game:GetService("ReplicatedStorage"):FindFirstChild("__ServerBrowser")
+            if not SB then return end
+            for page = 1, 10 do
+                local ok, data = pcall(function() return SB:InvokeServer(page) end)
+                if ok and type(data) == "table" then
+                    local arr = {}
+                    for id, info in pairs(data) do
+                        -- bỏ server hiện tại + chỉ server <8 người (còn chỗ) + chưa ghé trong 1h (tránh bounce lại)
+                        if id ~= game.JobId and type(info) == "table" and (info.Count or 0) < 8 then
+                            local last = cachedJobs[id]
+                            if not last or (math.floor(tick()) - last) > 3600 then
+                                table.insert(arr, id)
+                            end
+                        end
+                    end
+                    if #arr > 0 then
+                        SB:InvokeServer("teleport", arr[math.random(1, #arr)])
+                        hopped = true
+                        return
+                    end
+                end
+            end
+        end)
+        if not hopped then
+            pcall(function() TeleportService:Teleport(game.PlaceId, game.Players.LocalPlayer) end)  -- fallback: rejoin random
+        end
+    end
+    local function trainTimeoutHop()
+        if not isaccmain[myName] then return false end           -- CHỈ MAIN (ally không hop khi train)
+        if not _G.trainWinStart then return false end
+        if (tick() - _G.trainWinStart) < 60 then return false end
+        if (_G.trainKills or 0) > 10 then
+            _G.trainWinStart = tick(); _G.trainKills = 0          -- >10 quái/phút → ổn, đếm phút mới
+            return false
+        end
+        hopBadTrainServer(("kill %d/phut <=10"):format(_G.trainKills or 0))
+        _G.trainWinStart = tick(); _G.trainKills = 0
+        return true
+    end
+    -- mở cửa sổ đếm (lazy) + reset khi train vừa bị ngắt >5s (gap giữa 2 lần gọi doTrainGrind)
+    if isaccmain[myName] then
+        if not _G.trainGrindLastT or (tick() - _G.trainGrindLastT) > 5 then
+            _G.trainWinStart = tick(); _G.trainKills = 0
+        end
+        _G.trainGrindLastT = tick()
+        if not _G.trainWinStart then _G.trainWinStart = tick() end
+    end
     local pos__ = CFrame.new(214.688675, 126.626984, -12600.2236, -0.180400655, -1.09679892e-08, 0.983593225, 1.94620693e-08, 1, 1.47204746e-08, -0.983593225, 2.17983427e-08, -0.180400655)
     if getdis(pos__) < 1500 then
         for _, v in ipairs(getmob1(pos__)) do
+            if trainTimeoutHop() then return end                 -- check timeout TRƯỚC mỗi quái (đã hop → thoát)
             local lastY, lastTf, lastTrainPost = 0, nil, 0
             repeat
+                if trainTimeoutHop() then return end             -- check cả KHI KẸT trong 1 quái (V4 hover / quái không chết)
                 local c  = LP.Character
                 local tf = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
                 if tf then
@@ -1426,6 +1524,7 @@ function doTrainGrind(tag, AB, reassertFn)
                     wait()
                 end
             until not checkmob_(v)
+            if isaccmain[myName] then _G.trainKills = (_G.trainKills or 0) + 1 end  -- quái này đã chết → +1
         end
     else
         topos(pos__)
@@ -1502,33 +1601,12 @@ spawn(function()
                 end
             end
 
-            -- ===== MAIN2–6 SPAM-JOIN SERVER MAIN1 khi Main1 in_trail =====
-            -- Chỉ main index 2..6; index ≥7 KHÔNG tham gia. Khi Main1 (stt1) đang in_trail,
-            -- teleport vào server của Main1 mỗi 1.5s (throttle) cho đến khi Main1 hết in_trail
-            -- hoặc stt1 đổi. Dùng data từ /curmain đã có sẵn (warmer).
-            if isaccmain[myName] and myMainIndex and myMainIndex >= 2 and myMainIndex <= 6 then
-                local curName = _G.srvCurMain
-                if curName and curName ~= myName then
-                    local curStatus = getMainStatus(curName)
-                    if curStatus == "in_trail" then
-                        local curJob = _G.srvCurMainJobid or (mainJobCache[curName] and mainJobCache[curName].jobid)
-                        if curJob and curJob ~= "" and curJob ~= game.JobId then
-                            if not _G.lastMain1Join or (tick() - _G.lastMain1Join) > 1.5 then
-                                _G.lastMain1Join = tick()
-                                pcall(function()
-                                    game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser")
-                                        :InvokeServer("teleport", curJob)
-                                end)
-                                DBG(("[MAIN%d] Join server Main1 (%s) — in_trail"):format(myMainIndex, curName), "ok")
-                            end
-                        end
-                    else
-                        _G.lastMain1Join = nil  -- Main1 hết in_trail → reset throttle
-                    end
-                else
-                    _G.lastMain1Join = nil  -- mình là stt1 hoặc chưa có current → reset
-                end
-            end
+            -- ===== MAIN2–6 JOIN SERVER MAIN1 khi Main1 in_trail =====
+            -- ĐÃ CHUYỂN RA VÒNG NỀN RIÊNG (spawn) — xem khối "MAIN2-6 BACKGROUND JOIN" gần warmer.
+            -- LÝ DO: khi Main2-6 train song song, vòng chính KẸT trong doTrainGrind (repeat...until
+            -- not checkmob_) rất lâu (nhất là V4 hover) → khối join ở đây KHÔNG được chạy kịp khi
+            -- Main1 chuyển in_trail → "Main2-6 không join Main1". Vòng nền chạy mỗi 1s độc lập, join
+            -- được kể cả khi vòng chính đang kẹt train.
 
             -- ===== VIỆC 1: MAIN STT1 QUÁ 5 PHÚT CHƯA XONG LƯỢT → TỤT CUỐI HÀNG WAITING =====
             -- Đếm từ lúc CHÍNH MÌNH lên stt1 (currentmain==myName). Quá 300s mà status VẪN
