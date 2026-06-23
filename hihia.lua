@@ -1032,7 +1032,7 @@ end
 
 -- 1 nhịp đánh player trong trial: topos quanh target. Offset random đổi mỗi 0.3s (không mỗi
 -- frame) → hết giật, bám target lâu hơn nên kill nhanh hơn. Nil-safe.
-local _atkOff, _atkT = CFrame.new(0, 3, 0), 0
+local _atkOff, _atkT, _atkEqT = CFrame.new(0, 3, 0), 0, 0
 function attackTick(target)
     if tick() - _atkT > 0.3 then
         _atkT = tick()
@@ -1040,6 +1040,16 @@ function attackTick(target)
         if math.random(1, 2) == 1 then x = -x end
         if math.random(1, 2) == 1 then z = -z end
         _atkOff = CFrame.new(x, 3, z)
+    end
+    -- KILL PLAYER NÂNG CẤP (giống kkv4): vừa bám target vừa CẦM VŨ KHÍ + HAKI + SPAM CHIÊU.
+    -- _G.SHOULDSPAMSKILLS bật → vòng spam-skills (Z/X/C/V/F) tự bấm chiêu liên tục. eq/haki throttle
+    -- 0.4s cho đỡ tốn (không cần cầm lại/haki mỗi frame). FastAttack/AttackNoCoolDown đã chạy nền sẵn
+    -- nên click chém cũng có; phần này thêm CHIÊU + đảm bảo có vũ khí trên tay.
+    _G.SHOULDSPAMSKILLS = true
+    if tick() - _atkEqT > 0.4 then
+        _atkEqT = tick()
+        pcall(function() module:eq() end)
+        pcall(function() module:haki() end)
     end
     local hrp = target and target:FindFirstChild("HumanoidRootPart")
     if hrp then pcall(function() topos(hrp.CFrame * _atkOff) end) end
@@ -1567,6 +1577,7 @@ spawn(function()
                                     until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or templeState() ~= "ffup"
                                 end
                             end
+                            _G.SHOULDSPAMSKILLS = false   -- hết người trong tầm → ngừng spam chiêu
                         else
                             status("[MAIN " .. myStt .. "] Chờ ở cửa (chưa in_trial → KHÔNG kill)")
                             goToMyDoor()
@@ -1656,6 +1667,7 @@ spawn(function()
                                         until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or templeState() ~= "ffup"
                                     end
                                 end
+                                _G.SHOULDSPAMSKILLS = false   -- hết người trong tầm → ngừng spam chiêu
                                 if countplayers() <= 0 then
                                     local isCurrentMain = isaccmain[myName] and myName == currentmain
                                     local isOtherMain = isaccmain[myName] and myName ~= currentmain  -- acc main phụ
@@ -1738,15 +1750,23 @@ end
 spawn(function()
     while wait() do
         if _G.SHOULDSPAMSKILLS then
+          -- BỌC PCALL: char/PlayerGui.Main.Skills lỡ nil 1 nhịp (respawn/đổi map) sẽ KHÔNG giết
+          -- coroutine → spam chiêu hoạt động bền cho cả trial lẫn kill-player.
+          pcall(function()
+            local LP = game:GetService("Players").LocalPlayer
+            local char = LP.Character
+            local skillsUI = LP.PlayerGui:FindFirstChild("Main")
+            skillsUI = skillsUI and skillsUI:FindFirstChild("Skills")
+            if not (char and skillsUI) then return end
             local weapon = getallweapon()
             for i, v in pairs(weapon) do
-                if not game:GetService("Players").LocalPlayer.PlayerGui.Main.Skills:FindFirstChild(v.Name) then
+                if not skillsUI:FindFirstChild(v.Name) then
                     EquipTool(v.Name)
                 end
             end
             for i, v in pairs(weapon) do
-                if v.Parent ~= game.Players.LocalPlayer.Character then EquipTool(v.Name) end
-                local ui_ = game:GetService("Players").LocalPlayer.PlayerGui.Main.Skills:FindFirstChild(v.Name)
+                if v.Parent ~= char then EquipTool(v.Name) end
+                local ui_ = skillsUI:FindFirstChild(v.Name)
                 if ui_ then
                     for _, vl in pairs(ui_:GetChildren()) do
                         if isvalidnameui[vl.Name] then
@@ -1773,6 +1793,7 @@ spawn(function()
                     end
                 end
             end
+          end) -- end pcall
         end
     end
 end)
@@ -2340,7 +2361,13 @@ pcall(function()
 end)
 
 -- ---- RGB animator: viền chạy 7 màu ----
+-- TỐI ƯU LAG: trước đây chạy MỖI FRAME (RenderStepped ~60fps) + pcall TỪNG object → với mấy
+-- chục card mỗi card 1 stroke = vài nghìn lần set Color3 + pcall/giây = LAG (nhất là nhiều acc/PC).
+-- Giờ: (1) throttle ~12fps (mắt không phân biệt được với 60fps cho hiệu ứng đổi màu chậm),
+--      (2) NGỪNG HẲN khi panel ẩn (rgbActive=false) → ẩn UI là hết tốn,
+--      (3) bỏ pcall (set Color3 lên UIStroke/TextLabel không ném lỗi), tự DỌN object đã huỷ khỏi list.
 local rgbObjects = {} -- { {obj=, offset=, s=, v=, prop=} }
+local rgbActive = true -- panel đang hiện? (toggle/close cập nhật) → ẩn thì khỏi animate cho đỡ lag
 local function RegisterRGB(obj, offset, s, v, prop)
     table.insert(rgbObjects, {
         obj = obj, offset = offset or 0, s = s or 0.85, v = v or 1,
@@ -2349,14 +2376,18 @@ local function RegisterRGB(obj, offset, s, v, prop)
 end
 spawn(function()
     while true do
-        local t = tick()
-        for _, o in ipairs(rgbObjects) do
-            if o.obj and o.obj.Parent then
-                local hue = (t * 0.12 + o.offset) % 1
-                pcall(function() o.obj[o.prop] = Color3.fromHSV(hue, o.s, o.v) end)
+        task.wait(0.08) -- ~12fps thay vì mỗi frame
+        if rgbActive then
+            local base = tick() * 0.12
+            for i = #rgbObjects, 1, -1 do      -- duyệt ngược để remove an toàn
+                local o = rgbObjects[i]
+                if o.obj and o.obj.Parent then
+                    o.obj[o.prop] = Color3.fromHSV((base + o.offset) % 1, o.s, o.v)
+                else
+                    table.remove(rgbObjects, i) -- object đã bị Destroy → bỏ khỏi list (list ngắn dần)
+                end
             end
         end
-        RunService.RenderStepped:Wait()
     end
 end)
 
@@ -2475,8 +2506,11 @@ CloseBtn.TextSize         = 15
 CloseBtn.AutoButtonColor  = false
 CloseBtn.Parent           = Header
 Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 8)
-CloseBtn.MouseButton1Click:Connect(function() Panel.Visible = false end)
-Toggle.MouseButton1Click:Connect(function() Panel.Visible = not Panel.Visible end)
+CloseBtn.MouseButton1Click:Connect(function() Panel.Visible = false; rgbActive = false end)
+Toggle.MouseButton1Click:Connect(function()
+    Panel.Visible = not Panel.Visible
+    rgbActive = Panel.Visible   -- ẩn panel → dừng RGB (hết lag); hiện lại → chạy tiếp
+end)
 
 -- ---- Tab bar ----
 local TabBar = Instance.new("Frame")
@@ -2817,9 +2851,9 @@ spawn(function()
     end
 end)
 
--- live status loop
+-- live status loop — 0.2s/lần là đủ mượt cho text (trước đây mỗi frame = phí CPU)
 spawn(function()
-    while wait() do
+    while wait(0.2) do
         if _G.statusnow then StatusValue.Text = _G.statusnow end
     end
 end)
