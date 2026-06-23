@@ -616,8 +616,7 @@ function HopServer(Reason, MaxPlayers)
 
     local Servers = GetServers()
     if not Servers then
-        DBG("[HOP] Không có dữ liệu server → hop random bằng TeleportService", "err")
-        pcall(function() TeleportService:Teleport(game.PlaceId, game.Players.LocalPlayer) end)
+        DBG("[HOP] Không có dữ liệu server → bỏ qua, vòng sau thử lại (KHÔNG dùng TeleportService)", "err")
         return false
     end
 
@@ -630,8 +629,7 @@ function HopServer(Reason, MaxPlayers)
     end
     DBG(("[HOP] Nhận được %d server"):format(#ArrayServers), "ok")
     if #ArrayServers == 0 then
-        DBG("[HOP] Danh sách server rỗng → hop random", "err")
-        pcall(function() TeleportService:Teleport(game.PlaceId, game.Players.LocalPlayer) end)
+        DBG("[HOP] Danh sách server rỗng → bỏ qua, vòng sau thử lại (KHÔNG dùng TeleportService)", "err")
         return false
     end
 
@@ -1113,7 +1111,11 @@ end
 
 -- Hop sang 1 server ĐANG full moon (dùng API fi11). Trả true nếu đã gửi lệnh teleport.
 -- Dùng cho: (a) Main2-4 đứng waiting muốn LUÔN ở server full moon (gọi từ nhánh waiting),
--- giữ NGUYÊN tiêu chí như khối hop fullmoon lúc tới lượt: cùng PlaceId + ≤8 người + chưa ghé 1h.
+-- Hop sang 1 server ĐANG full moon (dùng API fi11). Trả true nếu đã gửi lệnh teleport.
+-- Dùng cho: (a) Main2-4 đứng waiting muốn LUÔN ở server full moon (gọi từ nhánh waiting),
+-- (b) hop fullmoon lúc tới lượt. Tiêu chí: cùng PlaceId + ≤8 người + khác server hiện tại.
+-- ƯU TIÊN server chưa ghé 1h (tránh bounce), nhưng nếu HẾT server mới → vẫn vào fullmoon bất kỳ
+-- (KHÔNG kẹt ngoài fullmoon). Trong mỗi nhóm chọn server ÍT NGƯỜI NHẤT để bám lâu.
 function hopFullmoonServer(reason)
     local hopped = false
     pcall(function()
@@ -1122,20 +1124,44 @@ function hopFullmoonServer(reason)
         if okCache and cacheData then cachedJobs = cacheData end
         local thua = Net.getJSON("http://fi11.bot-hosting.net:20758/api/name=fullmoon", 5)
         -- API trả {success, count, data:[{jobid, placeid, player}], updated_at}
-        if thua and thua["success"] and type(thua["data"]) == "table" then
-            for _, v in pairs(thua["data"]) do
-                local jobid = v["jobid"]
-                if jobid and jobid ~= game.JobId and v.player <= 8 and isSamePlace(v) then
+        if not (thua and thua["success"] and type(thua["data"]) == "table") then
+            DBG("[FM] API fullmoon lỗi/rỗng (success=" .. tostring(thua and thua["success"]) .. ")", "err", "fm_api")
+            return
+        end
+
+        local now = math.floor(tick())
+        local fresh, any = {}, {}   -- fresh: chưa ghé 1h | any: mọi server fullmoon hợp lệ
+        local total, badPlace, tooMany = 0, 0, 0
+        for _, v in pairs(thua["data"]) do
+            total = total + 1
+            local jobid = v["jobid"]
+            if jobid and jobid ~= game.JobId then
+                if not isSamePlace(v) then
+                    badPlace = badPlace + 1
+                elseif (v.player or 0) > 8 then
+                    tooMany = tooMany + 1
+                else
+                    local entry = { jobid = jobid, player = v.player or 0 }
+                    table.insert(any, entry)
                     local lastVisit = cachedJobs[jobid]
-                    if not lastVisit or (math.floor(tick()) - lastVisit) > 3600 then
-                        status(tostring(reason) .. " Hop fullmoon server")
-                        game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", jobid)
-                        hopped = true
-                        break
+                    if not lastVisit or (now - lastVisit) > 3600 then
+                        table.insert(fresh, entry)
                     end
                 end
             end
         end
+
+        local pool = (#fresh > 0) and fresh or any   -- ưu tiên server mới, hết thì dùng bất kỳ
+        if #pool == 0 then
+            DBG(("[FM] Không có server fullmoon hợp lệ (API=%d, khác placeid=%d, >8người=%d)"):format(total, badPlace, tooMany), "err", "fm_nopool")
+            return
+        end
+        table.sort(pool, function(a, b) return a.player < b.player end)  -- ít người nhất trước
+        local pick = pool[1]
+        status(tostring(reason) .. " Hop fullmoon server (" .. tostring(pick.player) .. " người)")
+        DBG(("[FM] %s → teleport %s (%d người, pool=%d/%d)"):format(tostring(reason), tostring(pick.jobid), pick.player, #pool, #any), "ok", "fm_hop")
+        game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", pick.jobid)
+        hopped = true
     end)
     return hopped
 end
@@ -1833,23 +1859,29 @@ spawn(function()
                     status("[MAIN " .. myStt .. "] Training song song (chưa tới lượt)")
                 else
                     if myStatus == "training" then setMyMainStatus("waiting") end
-                    status("[MAIN " .. myStt .. "] Waiting for current main: " .. tostring(currentmain))
-                    -- ===== MAIN2-4 KHI WAITING → LUÔN Ở SERVER FULL MOON =====
-                    -- Yêu cầu: Main index 2/3/4 trong lúc waiting (đã train xong, chờ tới lượt stt1)
-                    -- phải LUÔN nằm trong server đang full moon. Nếu server hiện tại KHÔNG full moon
-                    -- (hoặc không phải đêm) → hop sang server full moon. Throttle 30s/lần để không
-                    -- teleport dồn dập (API + char reload mỗi lần hop). Hop xong nhớ jobid vào cache_v4
-                    -- để lần sau không bị chọn lại (tránh bounce).
-                    if myMainIndex and myMainIndex >= 2 and myMainIndex <= 4 then
-                        local inFullmoon = isfullmoon() and isnight()
+                    -- ===== MAIN STT 2/3/4 ĐANG WAITING → LUÔN Ở SERVER FULL MOON =====
+                    -- Yêu cầu: con có SỐ THỨ TỰ động = 2, 3, 4 (myStt — đúng số "MAIN x" hiển thị trên
+                    -- panel, do mainSttOf theo hàng đợi) khi đang waiting (train xong, chưa tới lượt stt1)
+                    -- phải LUÔN nằm trong server full moon. Server hiện tại KHÔNG full moon → hop sang fullmoon.
+                    -- LỌC theo myStt (KHÔNG dùng myMainIndex — đó là index cố định /init, khác số hiển thị).
+                    -- DÙNG isfullmoon() (MoonPhase==5) — KHÔNG kèm isnight(): isnight đổi theo giờ trong game,
+                    -- ban ngày sẽ tưởng "hết fullmoon" → hop đi mất server tốt → lặp vô ích.
+                    -- Throttle 30s/lần để không teleport dồn dập (API + char reload mỗi lần hop).
+                    local isWaitFmStt = (type(myStt) == "number") and myStt >= 2 and myStt <= 4
+                    if isWaitFmStt and getgenv().Config["Hop Server FullMoon"] then
                         local lastTry = _G.waitFmHopT or 0
-                        if (not inFullmoon) and (tick() - lastTry) > 30 then
+                        if (not isfullmoon()) and (tick() - lastTry) > 30 then
                             _G.waitFmHopT = tick()
+                            status("[MAIN " .. myStt .. "] Waiting + Hop Full Moon (chờ tới lượt: " .. tostring(currentmain) .. ")")
                             if hopFullmoonServer("[MAIN " .. myStt .. "] Waiting →") then
                                 wait(10)
                                 Net.postJSON(BASE_URL .. "/noguchi?name=" .. myName, { jobid = game.JobId }, "noguchi")
                             end
+                        else
+                            status("[MAIN " .. myStt .. "] Waiting + Full Moon (chờ tới lượt: " .. tostring(currentmain) .. ")")
                         end
+                    else
+                        status("[MAIN " .. myStt .. "] Waiting for current main: " .. tostring(currentmain))
                     end
                 end
             else
