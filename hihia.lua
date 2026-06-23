@@ -475,6 +475,7 @@ spawn(function()
             if data and type(data.order) == "table" then
                 _G.srvMainOrder = data.order
                 _G.srvCurMain = data.current
+                _G.srvCurMainJobid = data.current_jobid   -- để Main2-6 biết join đâu
                 -- nóng statusCache cho TẤT CẢ main từ 1 response (TRỪ chính mình — self do
                 -- setMyMainStatus quản lý cục bộ, không để server cũ ghi đè gây nhấp nháy rotation).
                 if type(data.mains) == "table" then
@@ -764,6 +765,11 @@ end
 -- Trả: "loading" (chưa vào Map) | "ffup" (forcefield đóng → khúc kill-player) | "ffdown" (mở → vào trial).
 -- ============================================================
 function templeState()
+    -- Cache TTL 0.5s: templeState bị gọi nhiều lần/mỗi tick (latch + main flow + ally flow)
+    -- nhưng Forcefield chỉ đổi khi game chuyển phase → cache giảm đáng kể FindFirstChild lặp.
+    local t = tick()
+    if _G._tsCacheTime and (t - _G._tsCacheTime) < 0.5 then return _G._tsCacheValue end
+    _G._tsCacheTime = t
     local temple = workspace.Map:FindFirstChild("Temple of Time")
     if not temple then
         if not _G.lastTempleReparent or (tick() - _G.lastTempleReparent) > 5 then
@@ -774,6 +780,7 @@ function templeState()
                 if m then m.Parent = workspace.Map end
             end)
         end
+        _G._tsCacheValue = "loading"
         return "loading"
     end
     local ff
@@ -782,7 +789,11 @@ function templeState()
         local field = border and border:FindFirstChild("Forcefield")
         if field then ff = field.Transparency end
     end)
-    if ff == 0 then return "ffup" end
+    if ff == 0 then
+        _G._tsCacheValue = "ffup"
+        return "ffup"
+    end
+    _G._tsCacheValue = "ffdown"
     return "ffdown"
 end
 
@@ -1349,6 +1360,78 @@ end)
 local checktempledoor = readTempleDoor()
 _G.ShouldSendData = false
 local issobusy = false
+
+-- ============================================================
+-- TRAIN GRIND DÙNG CHUNG (main lẫn ally): raiding lấy fragment HOẶC train V4 ở mob spot.
+--   tag        : nhãn hiển thị, vd "[MAIN 1]" / "[ALLY]".
+--   AB         : giá trị thứ 2 của trialable() ("raiding" → đi raid boss; còn lại → train V4).
+--   reassertFn : callback re-assert status "training" (main: setMyMainStatus; ally: reportStatus)
+--                để dashboard không dính moon/in_trail cũ. Có thể nil.
+-- 1 NHỊP grind (chạy trong vòng chính 0.35s) — KHÔNG tự loop vô hạn để vòng chính còn poll
+-- trialable: train đủ (ab=true) là nhánh gọi sẽ tự thoát ra.
+-- ============================================================
+function doTrainGrind(tag, AB, reassertFn)
+    if reassertFn then reassertFn() end
+    if AB == "raiding" then
+        local boss = workspace.Enemies:FindFirstChild("Cake Prince") or workspace.Enemies:FindFirstChild("Dough King")
+        if boss then
+            status(tag .. " Raiding for fragment")
+            repeat wait()
+                pcall(function() topos(boss.HumanoidRootPart.CFrame * CFrame.new(0, 25, 0)) end)
+                module:eq(); module:haki(); BringMob()
+            until not checkmob_(boss)
+        end
+        return
+    end
+    local LP  = game:GetService("Players").LocalPlayer
+    local VIM = game:GetService("VirtualInputManager")
+    local function pressV4()  -- bấm Y biến hình V4 khi RaceEnergy đầy (nil-safe)
+        pcall(function()
+            local c = LP.Character
+            if c and c:FindFirstChild("RaceEnergy") and c.RaceEnergy.Value == 1 then
+                VIM:SendKeyEvent(true, "Y", false, game)
+                VIM:SendKeyEvent(false, "Y", false, game)
+            end
+        end)
+    end
+    pressV4()
+    local pos__ = CFrame.new(214.688675, 126.626984, -12600.2236, -0.180400655, -1.09679892e-08, 0.983593225, 1.94620693e-08, 1, 1.47204746e-08, -0.983593225, 2.17983427e-08, -0.180400655)
+    if getdis(pos__) < 1500 then
+        for _, v in ipairs(getmob1(pos__)) do
+            local lastY, lastTf, lastTrainPost = 0, nil, 0
+            repeat
+                local c  = LP.Character
+                local tf = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
+                if tf then
+                    -- ===== ĐANG V4 → CHỈ CHỜ HẾT V4: NGẮT vòng nặng cho đỡ hao tài nguyên =====
+                    if lastTf ~= true then
+                        local hrp = v:FindFirstChild("HumanoidRootPart")
+                        if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 150, 0)) end) end
+                        status(tag .. " Training (Wait for end V4)")
+                        lastTf = true
+                    end
+                    -- re-assert "training" mỗi 4s → dashboard LUÔN là training (không dính moon)
+                    if (tick() - lastTrainPost) > 4 then if reassertFn then reassertFn() end; lastTrainPost = tick() end
+                    wait(0.5)   -- nghỉ dài: chỉ chờ V4 hết, không làm gì nặng
+                else
+                    -- ===== CHƯA V4 → áp sát + kill nạp energy =====
+                    module:eq(); module:haki(); BringMob()
+                    local hrp = v:FindFirstChild("HumanoidRootPart")
+                    if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 20, 0)) end) end
+                    if lastTf ~= false then
+                        status(tag .. " Training (Kill Mobs)")
+                        lastTf = false
+                    end
+                    if (tick() - lastY > 0.4) then lastY = tick(); pressV4() end
+                    wait()
+                end
+            until not checkmob_(v)
+        end
+    else
+        topos(pos__)
+    end
+end
+
 spawn(function()
     -- THROTTLE: trước đây `while wait()` ~mỗi frame → getCurrentMainBeingUpgraded gọi HTTP
     -- nhiều lần/frame → bão request → executor rate-limit → rớt dữ liệu. Giờ chạy 0.35s/vòng,
@@ -1419,6 +1502,58 @@ spawn(function()
                 end
             end
 
+            -- ===== MAIN2–6 SPAM-JOIN SERVER MAIN1 khi Main1 in_trail =====
+            -- Chỉ main index 2..6; index ≥7 KHÔNG tham gia. Khi Main1 (stt1) đang in_trail,
+            -- teleport vào server của Main1 mỗi 1.5s (throttle) cho đến khi Main1 hết in_trail
+            -- hoặc stt1 đổi. Dùng data từ /curmain đã có sẵn (warmer).
+            if isaccmain[myName] and myMainIndex and myMainIndex >= 2 and myMainIndex <= 6 then
+                local curName = _G.srvCurMain
+                if curName and curName ~= myName then
+                    local curStatus = getMainStatus(curName)
+                    if curStatus == "in_trail" then
+                        local curJob = _G.srvCurMainJobid or (mainJobCache[curName] and mainJobCache[curName].jobid)
+                        if curJob and curJob ~= "" and curJob ~= game.JobId then
+                            if not _G.lastMain1Join or (tick() - _G.lastMain1Join) > 1.5 then
+                                _G.lastMain1Join = tick()
+                                pcall(function()
+                                    game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser")
+                                        :InvokeServer("teleport", curJob)
+                                end)
+                                DBG(("[MAIN%d] Join server Main1 (%s) — in_trail"):format(myMainIndex, curName), "ok")
+                            end
+                        end
+                    else
+                        _G.lastMain1Join = nil  -- Main1 hết in_trail → reset throttle
+                    end
+                else
+                    _G.lastMain1Join = nil  -- mình là stt1 hoặc chưa có current → reset
+                end
+            end
+
+            -- ===== VIỆC 1: MAIN STT1 QUÁ 5 PHÚT CHƯA XONG LƯỢT → TỤT CUỐI HÀNG WAITING =====
+            -- Đếm từ lúc CHÍNH MÌNH lên stt1 (currentmain==myName). Quá 300s mà status VẪN
+            -- chưa training/done (chưa xong lượt: kẹt ở moon chờ ally/fullmoon/cửa, hoặc in_trail
+            -- treo) → setMyMainStatus("waiting"): server đặt waitingSince=now → đẩy xuống CUỐI nhóm
+            -- waiting (FIFO) → nhường main kế lên stt1. Áp cả khi đang in_trail dở (cắt latch).
+            -- Reset đồng hồ khi rời stt1 hoặc đã training/done.
+            local MAIN_TURN_TIMEOUT = 300
+            if isaccmain[myName] then
+                if currentmain == myName and myStatus ~= "training" and myStatus ~= "done" then
+                    if not _G.myTurnStart then _G.myTurnStart = tick() end
+                    if (tick() - _G.myTurnStart) > MAIN_TURN_TIMEOUT then
+                        status("[MAIN " .. myStt .. "] ⏱ Quá 5 phút chưa xong lượt → tụt cuối (waiting)")
+                        DBG(("[MAIN %s] timeout 5' tại stt1 → demote waiting"):format(tostring(myStt)), "err")
+                        setMyMainStatus("waiting")
+                        myStatus = "waiting"
+                        _G.inTrial = false        -- nhả in-trial latch nếu đang kẹt trong đó
+                        _G.myTurnStart = nil       -- xoay vòng kế: lượt sau lên stt1 lại đếm từ đầu
+                        return
+                    end
+                else
+                    _G.myTurnStart = nil           -- không phải stt1 / đã xong lượt → reset đồng hồ
+                end
+            end
+
             -- ===== IN-TRIAL LATCH =====
             -- Đã VÀO khu trial (ability sync đẩy vào) + bản thân CÒN cần trial (ab) → CHỐT in_trial:
             -- DỪNG mọi điều phối (hop / chờ main / kill-player), CHỈ làm trial. Áp cho CẢ Main lẫn Ally.
@@ -1440,7 +1575,23 @@ spawn(function()
                 doTrialForMyRace()
                 return
             else
-                if _G.inTrial and not isaccmain[myName] then reportStatus("ally") end  -- vừa RỜI trial → trả status ally
+                if _G.inTrial then
+                    -- Vừa RỜI latch (trial xong / rời khu trial). Force refresh trialable để
+                    -- transition status NGAY (không chờ cache TTL 1.5s) → hết "trial xong
+                    -- đứng cửa vẫn báo in_trail".
+                    if not isaccmain[myName] then
+                        reportStatus("ally")
+                    elseif isaccmain[myName] then
+                        local fresh_ab, fresh_AB = trialable()
+                        if not fresh_ab then
+                            if fresh_AB == "done" then
+                                setMyMainStatus("done")
+                            else
+                                setMyMainStatus("training")
+                            end
+                        end
+                    end
+                end
                 _G.inTrial = false
             end
 
@@ -1450,65 +1601,7 @@ spawn(function()
                 status("[MAIN " .. myStt .. "] Training (parallel)")
                 if not ab then
                     setMyMainStatus("training")   -- CHỐT chắc status training (chống dashboard dính moon/in_trail cũ)
-                    if AB == "raiding" then
-                        local boss = workspace.Enemies:FindFirstChild("Cake Prince") or workspace.Enemies:FindFirstChild("Dough King")
-                        if boss then
-                            status("[MAIN " .. myStt .. "] Raiding for fragment")
-                            repeat wait()
-                                pcall(function() topos(boss.HumanoidRootPart.CFrame * CFrame.new(0, 25, 0)) end)
-                                module:eq(); module:haki(); BringMob()
-                            until not checkmob_(boss)
-                        end
-                    else
-                        local LP  = game:GetService("Players").LocalPlayer
-                        local VIM = game:GetService("VirtualInputManager")
-                        local function pressV4()  -- bấm Y biến hình V4 khi RaceEnergy đầy (nil-safe)
-                            pcall(function()
-                                local c = LP.Character
-                                if c and c:FindFirstChild("RaceEnergy") and c.RaceEnergy.Value == 1 then
-                                    VIM:SendKeyEvent(true, "Y", false, game)
-                                    VIM:SendKeyEvent(false, "Y", false, game)
-                                end
-                            end)
-                        end
-                        pressV4()
-                        local pos__ = CFrame.new(214.688675, 126.626984, -12600.2236, -0.180400655, -1.09679892e-08, 0.983593225, 1.94620693e-08, 1, 1.47204746e-08, -0.983593225, 2.17983427e-08, -0.180400655)
-                        if getdis(pos__) < 1500 then
-                            for _, v in ipairs(getmob1(pos__)) do
-                                local lastY, lastTf, lastTrainPost = 0, nil, 0
-                                repeat
-                                    local c  = LP.Character
-                                    local tf = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
-                                    if tf then
-                                        -- ===== ĐANG V4 → CHỈ CHỜ HẾT V4: NGẮT vòng nặng cho đỡ hao tài nguyên =====
-                                        -- KHÔNG eq/haki/BringMob/topos mỗi frame; đứng cao 1 lần rồi nghỉ dài.
-                                        if lastTf ~= true then
-                                            local hrp = v:FindFirstChild("HumanoidRootPart")
-                                            if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 150, 0)) end) end
-                                            status("[MAIN " .. myStt .. "] Training (Wait for end V4)")
-                                            lastTf = true
-                                        end
-                                        -- re-assert "training" mỗi 4s → dashboard LUÔN là training (không dính moon)
-                                        if (tick() - lastTrainPost) > 4 then setMyMainStatus("training"); lastTrainPost = tick() end
-                                        wait(0.5)   -- nghỉ dài: chỉ chờ V4 hết, không làm gì nặng
-                                    else
-                                        -- ===== CHƯA V4 → áp sát + kill nạp energy =====
-                                        module:eq(); module:haki(); BringMob()
-                                        local hrp = v:FindFirstChild("HumanoidRootPart")
-                                        if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 20, 0)) end) end
-                                        if lastTf ~= false then
-                                            status("[MAIN " .. myStt .. "] Training (Kill Mobs)")
-                                            lastTf = false
-                                        end
-                                        if (tick() - lastY > 0.4) then lastY = tick(); pressV4() end
-                                        wait()
-                                    end
-                                until not checkmob_(v)
-                            end
-                        else
-                            topos(pos__)
-                        end
-                    end
+                    doTrainGrind("[MAIN " .. myStt .. "]", AB, function() setMyMainStatus("training") end)
                 else
                     -- TRAINING XONG (sẵn sàng trial) → về WAITING để vào hàng đợi (MỌI main, không chỉ stt1).
                     -- Thứ tự xoay theo INDEX (config) nên con nào xong train trước cũng KHÔNG cắt hàng —
@@ -1601,6 +1694,21 @@ spawn(function()
             else
                 -- CHỈ ALLY THẬT vào đây: liên tục detect jobid của main stt1 → join + help.
                 local roleName = "[ALLY]"
+
+                -- ===== VIỆC 3: ALLY CŨNG CHECK TRAIN =====
+                -- Nếu ally CÒN train được (chưa sẵn sàng trial: not ab, và chưa done) → DỪNG mọi
+                -- việc ally hiện tại, đi train như main. Train xong (ab=true) → rớt xuống dưới nhận
+                -- lệnh ally bình thường. Đứng train = xa cửa → checkalready của ally = false → main
+                -- chờ ally (đúng lựa chọn "train bất kể, main chờ ally"). KHÔNG vào nhánh này khi
+                -- đang in_trial (đã bị IN-TRIAL latch ở trên giữ lại làm trial cho xong).
+                if (not ab) and AB ~= "done" then
+                    _G.allyKillReset = false   -- rời khúc kill-player → cho reset lại ở trial sau
+                    reportStatus("training")
+                    status(roleName .. " Train race (chưa sẵn sàng trial) → tạm dừng phụ main")
+                    doTrainGrind(roleName, AB, function() reportStatus("training") end)
+                    return
+                end
+
                 -- set status TRƯỚC các call mạng bên dưới (fetchMainStatusLive / isSameServerAsMain
                 -- vẫn YIELD); nếu mạng kẹt thì panel hiện dòng này thay vì đứng "Đang khởi động...".
                 status(roleName .. " Đang dò main đang tới lượt…")
@@ -1649,11 +1757,8 @@ spawn(function()
                                 if not _G.allyKillReset then
                                     _G.allyKillReset = true
                                     spawn(function()
-                                        local delay = 2
-                                        for i, name in ipairs(getgenv().Config["Allies"] or {}) do
-                                            if name == myName then delay = i * 2 break end
-                                        end
-                                        wait(delay)
+                                        -- RESET NGAY (bỏ stagger delay i*2): ally vừa vào khúc kill-player
+                                        -- là tự sát liền → tránh trường hợp đứng chờ tới lượt mà main die.
                                         pcall(function() game.Players.LocalPlayer.Character.Humanoid.Health = 0 end)
                                         wait(1)
                                         Net.postJSON(BASE_URL .. "/helpreset", { name = myName }, "helpreset")
@@ -2360,36 +2465,18 @@ pcall(function()
     if old then old:Destroy() end
 end)
 
--- ---- RGB animator: viền chạy 7 màu ----
--- TỐI ƯU LAG: trước đây chạy MỖI FRAME (RenderStepped ~60fps) + pcall TỪNG object → với mấy
--- chục card mỗi card 1 stroke = vài nghìn lần set Color3 + pcall/giây = LAG (nhất là nhiều acc/PC).
--- Giờ: (1) throttle ~12fps (mắt không phân biệt được với 60fps cho hiệu ứng đổi màu chậm),
---      (2) NGỪNG HẲN khi panel ẩn (rgbActive=false) → ẩn UI là hết tốn,
---      (3) bỏ pcall (set Color3 lên UIStroke/TextLabel không ném lỗi), tự DỌN object đã huỷ khỏi list.
-local rgbObjects = {} -- { {obj=, offset=, s=, v=, prop=} }
-local rgbActive = true -- panel đang hiện? (toggle/close cập nhật) → ẩn thì khỏi animate cho đỡ lag
+-- ---- Stroke decorator: viền MÀU TĨNH (KHÔNG animate) → hết lag RGB × N account ----
+-- Trước đây vòng spawn chạy ~12fps cập nhật HSV cho từng object → với nhiều card + nhiều account
+-- cùng máy: vài nghìn lần set Color3 / frame = LAG. Giờ màu tím-xanh cố định, set 1 lần lúc tạo.
+-- rgbActive giữ để tương thích với toggle panel (dòng ẩn/hiện vẫn đọc).
+local rgbActive = true
 local function RegisterRGB(obj, offset, s, v, prop)
-    table.insert(rgbObjects, {
-        obj = obj, offset = offset or 0, s = s or 0.85, v = v or 1,
-        prop = prop or "Color"
-    })
+    local hue = (0.65 + (offset or 0)) % 1   -- tím-xanh làm base, offset để thay đổi nhẹ giữa các stroke
+    local _s = s or 0.85
+    local _v = v or 1
+    local _prop = prop or "Color"
+    pcall(function() obj[_prop] = Color3.fromHSV(hue, _s, _v) end)
 end
-spawn(function()
-    while true do
-        task.wait(0.08) -- ~12fps thay vì mỗi frame
-        if rgbActive then
-            local base = tick() * 0.12
-            for i = #rgbObjects, 1, -1 do      -- duyệt ngược để remove an toàn
-                local o = rgbObjects[i]
-                if o.obj and o.obj.Parent then
-                    o.obj[o.prop] = Color3.fromHSV((base + o.offset) % 1, o.s, o.v)
-                else
-                    table.remove(rgbObjects, i) -- object đã bị Destroy → bỏ khỏi list (list ngắn dần)
-                end
-            end
-        end
-    end
-end)
 
 local Gui = Instance.new("ScreenGui")
 Gui.Name           = "VuNguyenKaitunV4"
