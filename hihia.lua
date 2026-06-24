@@ -3208,7 +3208,10 @@ end)
 -- live status loop — 0.2s/lần là đủ mượt cho text (trước đây mỗi frame = phí CPU)
 spawn(function()
     while wait(0.2) do
-        if _G.statusnow then StatusValue.Text = _G.statusnow end
+        if _G.statusnow then
+            -- Kèm PlaceId ngay trong card STATUS (đầu trang, luôn thấy không phải cuộn)
+            StatusValue.Text = _G.statusnow .. "\nPlaceId: " .. tostring(game.PlaceId)
+        end
     end
 end)
 
