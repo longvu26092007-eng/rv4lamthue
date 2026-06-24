@@ -186,27 +186,10 @@ do
     end
 
     -- ---- POST: hàng đợi + worker + retry + coalesce theo key ----
-    -- Hàng đợi vòng dùng head/tail index thay vì table.remove(q,1) (O(n) → O(1));
-    -- với queue tới 800 job + 4 worker, pop đầu mảng cũ phải dịch cả mảng mỗi lần.
     local postQ = {}
-    local qHead = 1   -- vị trí job kế tiếp sẽ lấy
-    local qTail = 0   -- vị trí job cuối đã thêm
     local keyed = {} -- key -> job mới nhất
     local MAX_Q = 800
     local POST_RETRIES = 6
-    local function qPush(job)
-        qTail = qTail + 1
-        postQ[qTail] = job
-    end
-    local function qPop()
-        if qHead > qTail then return nil end
-        local job = postQ[qHead]
-        postQ[qHead] = nil
-        qHead = qHead + 1
-        -- reset index khi rỗng để không phình vô hạn
-        if qHead > qTail then qHead, qTail = 1, 0 end
-        return job
-    end
     function Net.postJSON(url, tbl, key)
         local bodyStr
         local ok = pcall(function() bodyStr = HS:JSONEncode(tbl or {}) end)
@@ -217,16 +200,16 @@ do
             if old then old.replaced = true end -- bỏ job cũ cùng key (chỉ gửi dữ liệu mới nhất)
             keyed[key] = job
         end
-        if (qTail - qHead + 1) >= MAX_Q then
-            qPop()
+        if #postQ >= MAX_Q then
+            table.remove(postQ, 1)
             Net.log("WARN", "postQ tràn, bỏ job cũ nhất")
         end
-        qPush(job)
+        table.insert(postQ, job)
     end
 
     local function worker()
         while true do
-            local job = qPop()
+            local job = table.remove(postQ, 1)
             if not job or job.replaced then
                 task.wait(0.05)
             else
@@ -240,7 +223,7 @@ do
                     if (not job.replaced) and job.attempts < POST_RETRIES then
                         Net.log("WARN", ("POST retry %d/%d %s : %s"):format(job.attempts, POST_RETRIES, job.url, tostring(err)))
                         task.wait(0.3 * job.attempts)
-                        qPush(job)
+                        table.insert(postQ, job)
                     elseif not job.replaced then
                         Net.log("ERR", ("POST bỏ sau %d lần: %s"):format(job.attempts, job.url))
                         if job.key and keyed[job.key] == job then keyed[job.key] = nil end
@@ -362,14 +345,9 @@ end
 local ALIVE = true
 
 -- Heartbeat: báo server account còn sống (qua hàng đợi, coalesce).
--- Kèm cờ fullmoon = đang ở server full moon? → server dùng để ƯU TIÊN main này lên ĐẦU
--- hàng waiting (xem rank trong /curmain). pcall vì isfullmoon() là global khai báo phía dưới,
--- nhịp heartbeat đầu tiên có thể chạy trước khi nó được định nghĩa → tránh lỗi gọi nil.
 function sendHeartbeat()
     if not ALIVE then return end
-    local fm = false
-    pcall(function() fm = isfullmoon() and true or false end)
-    Net.postJSON(BASE_URL .. "/heartbeat?name=" .. myName, { role = myRole, fullmoon = fm }, "heartbeat")
+    Net.postJSON(BASE_URL .. "/heartbeat?name=" .. myName, { role = myRole }, "heartbeat")
 end
 
 -- Báo server account OUT → server xoá NGAY (không chờ prune 30s).
@@ -497,7 +475,6 @@ spawn(function()
             if data and type(data.order) == "table" then
                 _G.srvMainOrder = data.order
                 _G.srvCurMain = data.current
-                _G.srvCurMainJobid = data.current_jobid   -- để Main2-6 biết join đâu
                 -- nóng statusCache cho TẤT CẢ main từ 1 response (TRỪ chính mình — self do
                 -- setMyMainStatus quản lý cục bộ, không để server cũ ghi đè gây nhấp nháy rotation).
                 if type(data.mains) == "table" then
@@ -518,13 +495,7 @@ spawn(function()
     end
 end)
 
--- ============================================================
--- [MAIN2-6 BACKGROUND JOIN] ĐÃ GỠ BỎ theo yêu cầu (dự định khác cho Main2-6).
--- Trước đây: vòng nền 1s/lần để Main index 2..6 tự teleport vào server Main1 khi Main1 in_trail.
--- Đã xóa hẳn — Main2-6 KHÔNG còn tự join server Main1 nữa.
--- ============================================================
-
-
+-- FIX: Join team bền — retry cả 2 cách (remote + ChooseTeam UI) tới khi có team thật.
 -- Trước đây chỉ gọi 1 lần nên "lúc được lúc không" (remote chưa sẵn / UI chưa load kịp).
 spawn(function()
     local LP = game:GetService("Players").LocalPlayer
@@ -590,110 +561,6 @@ local function safeInvoke(timeout, ...)
     if not done or not packed then return false end
     return table.unpack(packed, 1, packed.n)
 end
-
--- ============================================================
--- [HOP SERVER] PORT BÁM SÁT "Hop Sever.txt" (DRACO HUNTER V17.3) — bản bạn xài ổn.
---   • GetServers: __ServerBrowser:WaitForChild(...):InvokeServer(trang) lặp 1→100, cache 60s.
---   • HopServer:  dict→mảng (bỏ JobId hiện tại) → lọc Players<=MaxPlayers → NỚI LỎNG dần → random
---                 → teleport bằng __ServerBrowser:InvokeServer('teleport', JobId).
---   • TeleportInitFailed: GameFull / fail → tự HopServer lại.
--- KHÁC reference (để khớp script này, KHÔNG đổi logic hop):
---   • dùng DBG thay print/warn → bạn thấy tín hiệu hop ngay trong panel debug.
---   • error-handler chỉ retry khi cờ _G.trainHopArmedT <15s → KHÔNG cướp teleport ally/join-main/fullmoon.
--- ============================================================
-local HOP_CONFIG = {
-    MaxPlayers    = 6,     -- chỉ hop vào server có <= N người (đặt nil để bỏ qua). 6 = "6 người trở xuống".
-    CacheDuration = 60,    -- giây cache danh sách server
-    MaxPages      = 100,   -- số trang tối đa khi lấy danh sách server
-    RetryDelay    = 2,     -- giây chờ trước khi thử lại khi teleport lỗi
-}
-
-local function _ifTableHaveIndex(j)
-    for _ in pairs(j) do return true end
-    return false
-end
-
-local _hopLastPull, _hopCachedServers
-local function GetServers()
-    if _hopLastPull and _hopCachedServers and (tick() - _hopLastPull) < HOP_CONFIG.CacheDuration then
-        return _hopCachedServers
-    end
-    for i = 1, HOP_CONFIG.MaxPages do
-        local ok, data = pcall(function()
-            return game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer(i)
-        end)
-        if ok and data and _ifTableHaveIndex(data) then
-            _hopLastPull = tick()
-            _hopCachedServers = data
-            return data
-        end
-    end
-    DBG("[HOP] Không lấy được danh sách server!", "err")
-    return nil
-end
-
--- HopServer(reason): lấy server <=MaxPlayers người (khác server hiện tại) rồi teleport bằng __ServerBrowser.
-function HopServer(Reason, MaxPlayers)
-    MaxPlayers = MaxPlayers or HOP_CONFIG.MaxPlayers
-
-    local Servers = GetServers()
-    if not Servers then
-        DBG("[HOP] Không có dữ liệu server → bỏ qua, vòng sau thử lại (KHÔNG dùng TeleportService)", "err")
-        return false
-    end
-
-    -- dictionary → mảng, loại bỏ server hiện tại (game.JobId)
-    local ArrayServers = {}
-    for id, v in pairs(Servers) do
-        if id ~= game.JobId and type(v) == "table" then
-            table.insert(ArrayServers, { JobId = id, Players = v.Count or 0 })
-        end
-    end
-    DBG(("[HOP] Nhận được %d server"):format(#ArrayServers), "ok")
-    if #ArrayServers == 0 then
-        DBG("[HOP] Danh sách server rỗng → bỏ qua, vòng sau thử lại (KHÔNG dùng TeleportService)", "err")
-        return false
-    end
-
-    -- Lọc: giữ server có Players <= MaxPlayers (ít người). Không có → NỚI LỎNG: dùng toàn bộ.
-    local Filtered = {}
-    for _, s in ipairs(ArrayServers) do
-        if (not MaxPlayers) or s.Players <= MaxPlayers then
-            table.insert(Filtered, s)
-        end
-    end
-    DBG(("[HOP] Sau lọc (<=%s người): %d server"):format(tostring(MaxPlayers), #Filtered), "ok")
-    if #Filtered == 0 then
-        DBG("[HOP] Không có server ít người → dùng toàn bộ danh sách", "err")
-        Filtered = ArrayServers
-    end
-
-    -- random để các tài khoản không dồn cùng 1 server
-    local ServerData = Filtered[math.random(1, #Filtered)]
-    _G.trainHopArmedT = tick()   -- cờ: vừa hop (cho TeleportInitFailed retry đúng ngữ cảnh hop)
-    DBG(("[HOP] %s → teleport %s (Players=%d)"):format(tostring(Reason), tostring(ServerData.JobId), ServerData.Players), "ok")
-    local ok = pcall(function()
-        game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", ServerData.JobId)
-    end)
-    return ok
-end
-
--- ERROR HANDLING (port từ reference) — server đầy / teleport lỗi → tự HopServer lại.
--- CHỈ áp khi cờ _G.trainHopArmedT <15s → KHÔNG đụng teleport ally / join-main / fullmoon.
-pcall(function()
-    TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, message)
-        if player ~= game.Players.LocalPlayer then return end
-        if not (_G.trainHopArmedT and (tick() - _G.trainHopArmedT) < 15) then return end
-        _G.trainHopArmedT = nil
-        if teleportResult == Enum.TeleportResult.GameFull then
-            DBG("[HOP] Server đầy → thử hop lại", "err")
-            task.delay(HOP_CONFIG.RetryDelay, function() HopServer("Retry - Server đầy") end)
-        else
-            DBG("[HOP] Teleport thất bại (" .. tostring(teleportResult) .. ") → thử server khác", "err")
-            task.delay(3, function() HopServer("Retry - Teleport fail") end)
-        end
-    end)
-end)
 -- ============================================================
 -- [MODULE] Bản module_bf NHÚNG THẲNG (không tải GitHub) — đã FIX:
 --   • topos: HỦY tween cũ trước khi tạo mới (hết chồng tween + memory leak + giật),
@@ -897,11 +764,6 @@ end
 -- Trả: "loading" (chưa vào Map) | "ffup" (forcefield đóng → khúc kill-player) | "ffdown" (mở → vào trial).
 -- ============================================================
 function templeState()
-    -- Cache TTL 0.5s: templeState bị gọi nhiều lần/mỗi tick (latch + main flow + ally flow)
-    -- nhưng Forcefield chỉ đổi khi game chuyển phase → cache giảm đáng kể FindFirstChild lặp.
-    local t = tick()
-    if _G._tsCacheTime and (t - _G._tsCacheTime) < 0.5 then return _G._tsCacheValue end
-    _G._tsCacheTime = t
     local temple = workspace.Map:FindFirstChild("Temple of Time")
     if not temple then
         if not _G.lastTempleReparent or (tick() - _G.lastTempleReparent) > 5 then
@@ -912,7 +774,6 @@ function templeState()
                 if m then m.Parent = workspace.Map end
             end)
         end
-        _G._tsCacheValue = "loading"
         return "loading"
     end
     local ff
@@ -921,11 +782,7 @@ function templeState()
         local field = border and border:FindFirstChild("Forcefield")
         if field then ff = field.Transparency end
     end)
-    if ff == 0 then
-        _G._tsCacheValue = "ffup"
-        return "ffup"
-    end
-    _G._tsCacheValue = "ffdown"
+    if ff == 0 then return "ffup" end
     return "ffdown"
 end
 
@@ -1131,63 +988,6 @@ function isSamePlace(serverEntry)
     return serverEntry ~= nil and tonumber(serverEntry.placeid) == game.PlaceId
 end
 
--- Hop sang 1 server ĐANG full moon (dùng API fi11). Trả true nếu đã gửi lệnh teleport.
--- Dùng cho: (a) Main2-4 đứng waiting muốn LUÔN ở server full moon (gọi từ nhánh waiting),
--- Hop sang 1 server ĐANG full moon (dùng API fi11). Trả true nếu đã gửi lệnh teleport.
--- Dùng cho: (a) Main2-4 đứng waiting muốn LUÔN ở server full moon (gọi từ nhánh waiting),
--- (b) hop fullmoon lúc tới lượt. Tiêu chí: cùng PlaceId + ≤8 người + khác server hiện tại.
--- ƯU TIÊN server chưa ghé 1h (tránh bounce), nhưng nếu HẾT server mới → vẫn vào fullmoon bất kỳ
--- (KHÔNG kẹt ngoài fullmoon). Trong mỗi nhóm chọn server ÍT NGƯỜI NHẤT để bám lâu.
-function hopFullmoonServer(reason)
-    local hopped = false
-    pcall(function()
-        local cachedJobs = {}
-        local okCache, cacheData = pcall(function() return game.HttpService:JSONDecode(readfile("cache_v4.json")) end)
-        if okCache and cacheData then cachedJobs = cacheData end
-        local thua = Net.getJSON("http://fi11.bot-hosting.net:20758/api/name=fullmoon", 5)
-        -- API trả {success, count, data:[{jobid, placeid, player}], updated_at}
-        if not (thua and thua["success"] and type(thua["data"]) == "table") then
-            DBG("[FM] API fullmoon lỗi/rỗng (success=" .. tostring(thua and thua["success"]) .. ")", "err", "fm_api")
-            return
-        end
-
-        local now = math.floor(tick())
-        local fresh, any = {}, {}   -- fresh: chưa ghé 1h | any: mọi server fullmoon hợp lệ
-        local total, badPlace, tooMany = 0, 0, 0
-        for _, v in pairs(thua["data"]) do
-            total = total + 1
-            local jobid = v["jobid"]
-            if jobid and jobid ~= game.JobId then
-                if not isSamePlace(v) then
-                    badPlace = badPlace + 1
-                elseif (v.player or 0) > 8 then
-                    tooMany = tooMany + 1
-                else
-                    local entry = { jobid = jobid, player = v.player or 0 }
-                    table.insert(any, entry)
-                    local lastVisit = cachedJobs[jobid]
-                    if not lastVisit or (now - lastVisit) > 3600 then
-                        table.insert(fresh, entry)
-                    end
-                end
-            end
-        end
-
-        local pool = (#fresh > 0) and fresh or any   -- ưu tiên server mới, hết thì dùng bất kỳ
-        if #pool == 0 then
-            DBG(("[FM] Không có server fullmoon hợp lệ (API=%d, khác placeid=%d, >8người=%d)"):format(total, badPlace, tooMany), "err", "fm_nopool")
-            return
-        end
-        table.sort(pool, function(a, b) return a.player < b.player end)  -- ít người nhất trước
-        local pick = pool[1]
-        status(tostring(reason) .. " Hop fullmoon server (" .. tostring(pick.player) .. " người)")
-        DBG(("[FM] %s → teleport %s (%d người, pool=%d/%d)"):format(tostring(reason), tostring(pick.jobid), pick.player, #pool, #any), "ok", "fm_hop")
-        game:GetService("ReplicatedStorage"):WaitForChild("__ServerBrowser"):InvokeServer("teleport", pick.jobid)
-        hopped = true
-    end)
-    return hopped
-end
-
 if module then module:noclip([[return true]]) end
 
 function getmob1(pos)
@@ -1232,7 +1032,7 @@ end
 
 -- 1 nhịp đánh player trong trial: topos quanh target. Offset random đổi mỗi 0.3s (không mỗi
 -- frame) → hết giật, bám target lâu hơn nên kill nhanh hơn. Nil-safe.
-local _atkOff, _atkT, _atkEqT = CFrame.new(0, 3, 0), 0, 0
+local _atkOff, _atkT = CFrame.new(0, 3, 0), 0
 function attackTick(target)
     if tick() - _atkT > 0.3 then
         _atkT = tick()
@@ -1240,16 +1040,6 @@ function attackTick(target)
         if math.random(1, 2) == 1 then x = -x end
         if math.random(1, 2) == 1 then z = -z end
         _atkOff = CFrame.new(x, 3, z)
-    end
-    -- KILL PLAYER NÂNG CẤP (giống kkv4): vừa bám target vừa CẦM VŨ KHÍ + HAKI + SPAM CHIÊU.
-    -- _G.SHOULDSPAMSKILLS bật → vòng spam-skills (Z/X/C/V/F) tự bấm chiêu liên tục. eq/haki throttle
-    -- 0.4s cho đỡ tốn (không cần cầm lại/haki mỗi frame). FastAttack/AttackNoCoolDown đã chạy nền sẵn
-    -- nên click chém cũng có; phần này thêm CHIÊU + đảm bảo có vũ khí trên tay.
-    _G.SHOULDSPAMSKILLS = true
-    if tick() - _atkEqT > 0.4 then
-        _atkEqT = tick()
-        pcall(function() module:eq() end)
-        pcall(function() module:haki() end)
     end
     local hrp = target and target:FindFirstChild("HumanoidRootPart")
     if hrp then pcall(function() topos(hrp.CFrame * _atkOff) end) end
@@ -1549,107 +1339,6 @@ end)
 local checktempledoor = readTempleDoor()
 _G.ShouldSendData = false
 local issobusy = false
-
--- ============================================================
--- TRAIN GRIND DÙNG CHUNG (main lẫn ally): raiding lấy fragment HOẶC train V4 ở mob spot.
---   tag        : nhãn hiển thị, vd "[MAIN 1]" / "[ALLY]".
---   AB         : giá trị thứ 2 của trialable() ("raiding" → đi raid boss; còn lại → train V4).
---   reassertFn : callback re-assert status "training" (main: setMyMainStatus; ally: reportStatus)
---                để dashboard không dính moon/in_trail cũ. Có thể nil.
--- 1 NHỊP grind (chạy trong vòng chính 0.35s) — KHÔNG tự loop vô hạn để vòng chính còn poll
--- trialable: train đủ (ab=true) là nhánh gọi sẽ tự thoát ra.
--- ============================================================
-function doTrainGrind(tag, AB, reassertFn)
-    if reassertFn then reassertFn() end
-    if AB == "raiding" then
-        local boss = workspace.Enemies:FindFirstChild("Cake Prince") or workspace.Enemies:FindFirstChild("Dough King")
-        if boss then
-            status(tag .. " Raiding for fragment")
-            repeat wait()
-                pcall(function() topos(boss.HumanoidRootPart.CFrame * CFrame.new(0, 25, 0)) end)
-                module:eq(); module:haki(); BringMob()
-            until not checkmob_(boss)
-        end
-        return
-    end
-    local LP  = game:GetService("Players").LocalPlayer
-    local VIM = game:GetService("VirtualInputManager")
-    local function pressV4()  -- bấm Y biến hình V4 khi RaceEnergy đầy (nil-safe)
-        pcall(function()
-            local c = LP.Character
-            if c and c:FindFirstChild("RaceEnergy") and c.RaceEnergy.Value == 1 then
-                VIM:SendKeyEvent(true, "Y", false, game)
-                VIM:SendKeyEvent(false, "Y", false, game)
-            end
-        end)
-    end
-    pressV4()
-    -- ===== TIMEOUT TRAIN (CHỈ MAIN): 5 phút kill ≤10 quái → server kém / có người tranh quái → HOP =====
-    -- Đếm số quái xong trong cửa sổ 300s (5'), BỀN qua các nhịp gọi doTrainGrind (lưu _G). Train bị
-    -- ngắt >5s (đi trial / đổi việc) → reset cửa sổ. Đủ 5': >10 kill → reset đếm mới; ≤10 → hop.
-    -- Dùng HopServer (port chuẩn từ Hop Sever.txt) → tìm server chắc + tránh server vừa rời + retry khi lỗi.
-    local TRAIN_WINDOW = 300   -- 5 phút (trước đây 60s → hop quá sớm khi có người cùng server tranh quái)
-    local function trainTimeoutHop()
-        if not isaccmain[myName] then return false end           -- CHỈ MAIN (ally không hop khi train)
-        if not _G.trainWinStart then return false end
-        if (tick() - _G.trainWinStart) < TRAIN_WINDOW then return false end
-        if (_G.trainKills or 0) > 10 then
-            _G.trainWinStart = tick(); _G.trainKills = 0          -- >10 quái/5' → ổn, đếm cửa sổ mới
-            return false
-        end
-        status(tag .. " ⏱ Timeout train (kill " .. tostring(_G.trainKills or 0) .. "/5' <=10) → hop server")
-        HopServer(("Timeout train kill %d/5phut <=10"):format(_G.trainKills or 0))
-        _G.trainWinStart = tick(); _G.trainKills = 0
-        return true
-    end
-    -- mở cửa sổ đếm (lazy) + reset khi train vừa bị ngắt >5s (gap giữa 2 lần gọi doTrainGrind)
-    if isaccmain[myName] then
-        if not _G.trainGrindLastT or (tick() - _G.trainGrindLastT) > 5 then
-            _G.trainWinStart = tick(); _G.trainKills = 0
-        end
-        _G.trainGrindLastT = tick()
-        if not _G.trainWinStart then _G.trainWinStart = tick() end
-    end
-    local pos__ = CFrame.new(214.688675, 126.626984, -12600.2236, -0.180400655, -1.09679892e-08, 0.983593225, 1.94620693e-08, 1, 1.47204746e-08, -0.983593225, 2.17983427e-08, -0.180400655)
-    if getdis(pos__) < 1500 then
-        for _, v in ipairs(getmob1(pos__)) do
-            if trainTimeoutHop() then return end                 -- check timeout TRƯỚC mỗi quái (đã hop → thoát)
-            local lastY, lastTf, lastTrainPost = 0, nil, 0
-            repeat
-                if trainTimeoutHop() then return end             -- check cả KHI KẸT trong 1 quái (V4 hover / quái không chết)
-                local c  = LP.Character
-                local tf = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
-                if tf then
-                    -- ===== ĐANG V4 → CHỈ CHỜ HẾT V4: NGẮT vòng nặng cho đỡ hao tài nguyên =====
-                    if lastTf ~= true then
-                        local hrp = v:FindFirstChild("HumanoidRootPart")
-                        if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 150, 0)) end) end
-                        status(tag .. " Training (Wait for end V4)")
-                        lastTf = true
-                    end
-                    -- re-assert "training" mỗi 4s → dashboard LUÔN là training (không dính moon)
-                    if (tick() - lastTrainPost) > 4 then if reassertFn then reassertFn() end; lastTrainPost = tick() end
-                    wait(0.5)   -- nghỉ dài: chỉ chờ V4 hết, không làm gì nặng
-                else
-                    -- ===== CHƯA V4 → áp sát + kill nạp energy =====
-                    module:eq(); module:haki(); BringMob()
-                    local hrp = v:FindFirstChild("HumanoidRootPart")
-                    if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 20, 0)) end) end
-                    if lastTf ~= false then
-                        status(tag .. " Training (Kill Mobs)")
-                        lastTf = false
-                    end
-                    if (tick() - lastY > 0.4) then lastY = tick(); pressV4() end
-                    wait()
-                end
-            until not checkmob_(v)
-            if isaccmain[myName] then _G.trainKills = (_G.trainKills or 0) + 1 end  -- quái này đã chết → +1
-        end
-    else
-        topos(pos__)
-    end
-end
-
 spawn(function()
     -- THROTTLE: trước đây `while wait()` ~mỗi frame → getCurrentMainBeingUpgraded gọi HTTP
     -- nhiều lần/frame → bão request → executor rate-limit → rớt dữ liệu. Giờ chạy 0.35s/vòng,
@@ -1720,32 +1409,6 @@ spawn(function()
                 end
             end
 
-            -- ===== MAIN2–6 JOIN SERVER MAIN1 — ĐÃ GỠ BỎ HẲN (theo yêu cầu, dự định khác cho Main2-6) =====
-
-            -- ===== VIỆC 1: MAIN STT1 QUÁ 5 PHÚT CHƯA XONG LƯỢT → TỤT CUỐI HÀNG WAITING =====
-            -- Đếm từ lúc CHÍNH MÌNH lên stt1 (currentmain==myName). Quá 300s mà status VẪN
-            -- chưa training/done (chưa xong lượt: kẹt ở moon chờ ally/fullmoon/cửa, hoặc in_trail
-            -- treo) → setMyMainStatus("waiting"): server đặt waitingSince=now → đẩy xuống CUỐI nhóm
-            -- waiting (FIFO) → nhường main kế lên stt1. Áp cả khi đang in_trail dở (cắt latch).
-            -- Reset đồng hồ khi rời stt1 hoặc đã training/done.
-            local MAIN_TURN_TIMEOUT = 300
-            if isaccmain[myName] then
-                if currentmain == myName and myStatus ~= "training" and myStatus ~= "done" then
-                    if not _G.myTurnStart then _G.myTurnStart = tick() end
-                    if (tick() - _G.myTurnStart) > MAIN_TURN_TIMEOUT then
-                        status("[MAIN " .. myStt .. "] ⏱ Quá 5 phút chưa xong lượt → tụt cuối (waiting)")
-                        DBG(("[MAIN %s] timeout 5' tại stt1 → demote waiting"):format(tostring(myStt)), "err")
-                        setMyMainStatus("waiting")
-                        myStatus = "waiting"
-                        _G.inTrial = false        -- nhả in-trial latch nếu đang kẹt trong đó
-                        _G.myTurnStart = nil       -- xoay vòng kế: lượt sau lên stt1 lại đếm từ đầu
-                        return
-                    end
-                else
-                    _G.myTurnStart = nil           -- không phải stt1 / đã xong lượt → reset đồng hồ
-                end
-            end
-
             -- ===== IN-TRIAL LATCH =====
             -- Đã VÀO khu trial (ability sync đẩy vào) + bản thân CÒN cần trial (ab) → CHỐT in_trial:
             -- DỪNG mọi điều phối (hop / chờ main / kill-player), CHỈ làm trial. Áp cho CẢ Main lẫn Ally.
@@ -1767,23 +1430,7 @@ spawn(function()
                 doTrialForMyRace()
                 return
             else
-                if _G.inTrial then
-                    -- Vừa RỜI latch (trial xong / rời khu trial). Force refresh trialable để
-                    -- transition status NGAY (không chờ cache TTL 1.5s) → hết "trial xong
-                    -- đứng cửa vẫn báo in_trail".
-                    if not isaccmain[myName] then
-                        reportStatus("ally")
-                    elseif isaccmain[myName] then
-                        local fresh_ab, fresh_AB = trialable()
-                        if not fresh_ab then
-                            if fresh_AB == "done" then
-                                setMyMainStatus("done")
-                            else
-                                setMyMainStatus("training")
-                            end
-                        end
-                    end
-                end
+                if _G.inTrial and not isaccmain[myName] then reportStatus("ally") end  -- vừa RỜI trial → trả status ally
                 _G.inTrial = false
             end
 
@@ -1793,7 +1440,65 @@ spawn(function()
                 status("[MAIN " .. myStt .. "] Training (parallel)")
                 if not ab then
                     setMyMainStatus("training")   -- CHỐT chắc status training (chống dashboard dính moon/in_trail cũ)
-                    doTrainGrind("[MAIN " .. myStt .. "]", AB, function() setMyMainStatus("training") end)
+                    if AB == "raiding" then
+                        local boss = workspace.Enemies:FindFirstChild("Cake Prince") or workspace.Enemies:FindFirstChild("Dough King")
+                        if boss then
+                            status("[MAIN " .. myStt .. "] Raiding for fragment")
+                            repeat wait()
+                                pcall(function() topos(boss.HumanoidRootPart.CFrame * CFrame.new(0, 25, 0)) end)
+                                module:eq(); module:haki(); BringMob()
+                            until not checkmob_(boss)
+                        end
+                    else
+                        local LP  = game:GetService("Players").LocalPlayer
+                        local VIM = game:GetService("VirtualInputManager")
+                        local function pressV4()  -- bấm Y biến hình V4 khi RaceEnergy đầy (nil-safe)
+                            pcall(function()
+                                local c = LP.Character
+                                if c and c:FindFirstChild("RaceEnergy") and c.RaceEnergy.Value == 1 then
+                                    VIM:SendKeyEvent(true, "Y", false, game)
+                                    VIM:SendKeyEvent(false, "Y", false, game)
+                                end
+                            end)
+                        end
+                        pressV4()
+                        local pos__ = CFrame.new(214.688675, 126.626984, -12600.2236, -0.180400655, -1.09679892e-08, 0.983593225, 1.94620693e-08, 1, 1.47204746e-08, -0.983593225, 2.17983427e-08, -0.180400655)
+                        if getdis(pos__) < 1500 then
+                            for _, v in ipairs(getmob1(pos__)) do
+                                local lastY, lastTf, lastTrainPost = 0, nil, 0
+                                repeat
+                                    local c  = LP.Character
+                                    local tf = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
+                                    if tf then
+                                        -- ===== ĐANG V4 → CHỈ CHỜ HẾT V4: NGẮT vòng nặng cho đỡ hao tài nguyên =====
+                                        -- KHÔNG eq/haki/BringMob/topos mỗi frame; đứng cao 1 lần rồi nghỉ dài.
+                                        if lastTf ~= true then
+                                            local hrp = v:FindFirstChild("HumanoidRootPart")
+                                            if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 150, 0)) end) end
+                                            status("[MAIN " .. myStt .. "] Training (Wait for end V4)")
+                                            lastTf = true
+                                        end
+                                        -- re-assert "training" mỗi 4s → dashboard LUÔN là training (không dính moon)
+                                        if (tick() - lastTrainPost) > 4 then setMyMainStatus("training"); lastTrainPost = tick() end
+                                        wait(0.5)   -- nghỉ dài: chỉ chờ V4 hết, không làm gì nặng
+                                    else
+                                        -- ===== CHƯA V4 → áp sát + kill nạp energy =====
+                                        module:eq(); module:haki(); BringMob()
+                                        local hrp = v:FindFirstChild("HumanoidRootPart")
+                                        if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 20, 0)) end) end
+                                        if lastTf ~= false then
+                                            status("[MAIN " .. myStt .. "] Training (Kill Mobs)")
+                                            lastTf = false
+                                        end
+                                        if (tick() - lastY > 0.4) then lastY = tick(); pressV4() end
+                                        wait()
+                                    end
+                                until not checkmob_(v)
+                            end
+                        else
+                            topos(pos__)
+                        end
+                    end
                 else
                     -- TRAINING XONG (sẵn sàng trial) → về WAITING để vào hàng đợi (MỌI main, không chỉ stt1).
                     -- Thứ tự xoay theo INDEX (config) nên con nào xong train trước cũng KHÔNG cắt hàng —
@@ -1862,7 +1567,6 @@ spawn(function()
                                     until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or templeState() ~= "ffup"
                                 end
                             end
-                            _G.SHOULDSPAMSKILLS = false   -- hết người trong tầm → ngừng spam chiêu
                         else
                             status("[MAIN " .. myStt .. "] Chờ ở cửa (chưa in_trial → KHÔNG kill)")
                             goToMyDoor()
@@ -1881,49 +1585,11 @@ spawn(function()
                     status("[MAIN " .. myStt .. "] Training song song (chưa tới lượt)")
                 else
                     if myStatus == "training" then setMyMainStatus("waiting") end
-                    -- ===== MAIN STT 2/3/4 ĐANG WAITING → LUÔN Ở SERVER FULL MOON =====
-                    -- Yêu cầu: con có SỐ THỨ TỰ động = 2, 3, 4 (myStt — đúng số "MAIN x" hiển thị trên
-                    -- panel, do mainSttOf theo hàng đợi) khi đang waiting (train xong, chưa tới lượt stt1)
-                    -- phải LUÔN nằm trong server full moon. Server hiện tại KHÔNG full moon → hop sang fullmoon.
-                    -- LỌC theo myStt (KHÔNG dùng myMainIndex — đó là index cố định /init, khác số hiển thị).
-                    -- DÙNG isfullmoon() (MoonPhase==5) — KHÔNG kèm isnight(): isnight đổi theo giờ trong game,
-                    -- ban ngày sẽ tưởng "hết fullmoon" → hop đi mất server tốt → lặp vô ích.
-                    -- Throttle 30s/lần để không teleport dồn dập (API + char reload mỗi lần hop).
-                    local isWaitFmStt = (type(myStt) == "number") and myStt >= 2 and myStt <= 4
-                    if isWaitFmStt and getgenv().Config["Hop Server FullMoon"] then
-                        local lastTry = _G.waitFmHopT or 0
-                        if (not isfullmoon()) and (tick() - lastTry) > 30 then
-                            _G.waitFmHopT = tick()
-                            status("[MAIN " .. myStt .. "] Waiting + Hop Full Moon (chờ tới lượt: " .. tostring(currentmain) .. ")")
-                            if hopFullmoonServer("[MAIN " .. myStt .. "] Waiting →") then
-                                wait(10)
-                                Net.postJSON(BASE_URL .. "/noguchi?name=" .. myName, { jobid = game.JobId }, "noguchi")
-                            end
-                        else
-                            status("[MAIN " .. myStt .. "] Waiting + Full Moon (chờ tới lượt: " .. tostring(currentmain) .. ")")
-                        end
-                    else
-                        status("[MAIN " .. myStt .. "] Waiting for current main: " .. tostring(currentmain))
-                    end
+                    status("[MAIN " .. myStt .. "] Waiting for current main: " .. tostring(currentmain))
                 end
             else
                 -- CHỈ ALLY THẬT vào đây: liên tục detect jobid của main stt1 → join + help.
                 local roleName = "[ALLY]"
-
-                -- ===== VIỆC 3: ALLY CŨNG CHECK TRAIN =====
-                -- Nếu ally CÒN train được (chưa sẵn sàng trial: not ab, và chưa done) → DỪNG mọi
-                -- việc ally hiện tại, đi train như main. Train xong (ab=true) → rớt xuống dưới nhận
-                -- lệnh ally bình thường. Đứng train = xa cửa → checkalready của ally = false → main
-                -- chờ ally (đúng lựa chọn "train bất kể, main chờ ally"). KHÔNG vào nhánh này khi
-                -- đang in_trial (đã bị IN-TRIAL latch ở trên giữ lại làm trial cho xong).
-                if (not ab) and AB ~= "done" then
-                    _G.allyKillReset = false   -- rời khúc kill-player → cho reset lại ở trial sau
-                    reportStatus("training")
-                    status(roleName .. " Train race (chưa sẵn sàng trial) → tạm dừng phụ main")
-                    doTrainGrind(roleName, AB, function() reportStatus("training") end)
-                    return
-                end
-
                 -- set status TRƯỚC các call mạng bên dưới (fetchMainStatusLive / isSameServerAsMain
                 -- vẫn YIELD); nếu mạng kẹt thì panel hiện dòng này thay vì đứng "Đang khởi động...".
                 status(roleName .. " Đang dò main đang tới lượt…")
@@ -1972,8 +1638,11 @@ spawn(function()
                                 if not _G.allyKillReset then
                                     _G.allyKillReset = true
                                     spawn(function()
-                                        -- RESET NGAY (bỏ stagger delay i*2): ally vừa vào khúc kill-player
-                                        -- là tự sát liền → tránh trường hợp đứng chờ tới lượt mà main die.
+                                        local delay = 2
+                                        for i, name in ipairs(getgenv().Config["Allies"] or {}) do
+                                            if name == myName then delay = i * 2 break end
+                                        end
+                                        wait(delay)
                                         pcall(function() game.Players.LocalPlayer.Character.Humanoid.Health = 0 end)
                                         wait(1)
                                         Net.postJSON(BASE_URL .. "/helpreset", { name = myName }, "helpreset")
@@ -1987,7 +1656,6 @@ spawn(function()
                                         until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid") or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0 or templeState() ~= "ffup"
                                     end
                                 end
-                                _G.SHOULDSPAMSKILLS = false   -- hết người trong tầm → ngừng spam chiêu
                                 if countplayers() <= 0 then
                                     local isCurrentMain = isaccmain[myName] and myName == currentmain
                                     local isOtherMain = isaccmain[myName] and myName ~= currentmain  -- acc main phụ
@@ -2070,31 +1738,20 @@ end
 spawn(function()
     while wait() do
         if _G.SHOULDSPAMSKILLS then
-          -- BỌC PCALL: char/PlayerGui.Main.Skills lỡ nil 1 nhịp (respawn/đổi map) sẽ KHÔNG giết
-          -- coroutine → spam chiêu hoạt động bền cho cả trial lẫn kill-player.
-          pcall(function()
-            local LP = game:GetService("Players").LocalPlayer
-            local char = LP.Character
-            local skillsUI = LP.PlayerGui:FindFirstChild("Main")
-            skillsUI = skillsUI and skillsUI:FindFirstChild("Skills")
-            if not (char and skillsUI) then return end
             local weapon = getallweapon()
             for i, v in pairs(weapon) do
-                if not skillsUI:FindFirstChild(v.Name) then
+                if not game:GetService("Players").LocalPlayer.PlayerGui.Main.Skills:FindFirstChild(v.Name) then
                     EquipTool(v.Name)
                 end
             end
             for i, v in pairs(weapon) do
-                if v.Parent ~= char then EquipTool(v.Name) end
-                local ui_ = skillsUI:FindFirstChild(v.Name)
+                if v.Parent ~= game.Players.LocalPlayer.Character then EquipTool(v.Name) end
+                local ui_ = game:GetService("Players").LocalPlayer.PlayerGui.Main.Skills:FindFirstChild(v.Name)
                 if ui_ then
                     for _, vl in pairs(ui_:GetChildren()) do
                         if isvalidnameui[vl.Name] then
-                            -- FindFirstChild (không block) thay cho WaitForChild(...,3): trong loop nóng mỗi frame,
-                            -- WaitForChild block tới 3s/nhịp khi UI thiếu → đứng hình. Frame Cooldown/Title là con
-                            -- cố định của slot, sẵn rồi → lấy ngay; thiếu thì bỏ nhịp, vòng sau gặp lại.
-                            local cooldown_frame = vl:FindFirstChild("Cooldown")
-                            local title_frame = vl:FindFirstChild("Title")
+                            local cooldown_frame = vl:WaitForChild("Cooldown", 3)
+                            local title_frame = vl:WaitForChild("Title", 3)
                             if cooldown_frame and title_frame and (title_frame.TextColor3 == Color3.new(1, 1, 1) or title_frame.TextColor3 == Color3.fromRGB(255, 255, 255)) then
                                 if cooldown_frame.Size == UDim2.new(0, 0, 1, -1) then
                                     if vl.Name == "V" then
@@ -2116,7 +1773,6 @@ spawn(function()
                     end
                 end
             end
-          end) -- end pcall
         end
     end
 end)
@@ -2149,9 +1805,6 @@ local function Pc(x, L)
     end
     return H
 end
--- Cache remote/flag cho AttackNoCoolDown: trước đây WaitForChild 2 remote + require(Flags)
--- chạy LẠI mỗi frame trong loop nóng (2331). Lấy 1 lần rồi tái dùng → bớt tra cây Instance mỗi nhịp.
-local _ANC_RegAttack, _ANC_RegHit, _ANC_FlagsResolved, _ANC_CombatThread
 function AttackNoCoolDown()
     local x = (game:GetService("Players"))["LocalPlayer"]
     local L = x["Character"]
@@ -2168,13 +1821,8 @@ function AttackNoCoolDown()
     local H = game:GetService("ReplicatedStorage")
     local r = H:FindFirstChild("Modules")
     if not r then return end
-    if not (_ANC_RegAttack and _ANC_RegHit) then
-        local net = r:FindFirstChild("Net")
-        if not net then return end
-        _ANC_RegAttack = net:FindFirstChild("RE/RegisterAttack")
-        _ANC_RegHit = net:FindFirstChild("RE/RegisterHit")
-    end
-    local R, y = _ANC_RegAttack, _ANC_RegHit
+    local R = ((H:WaitForChild("Modules")):WaitForChild("Net")):WaitForChild("RE/RegisterAttack")
+    local y = ((H:WaitForChild("Modules")):WaitForChild("Net")):WaitForChild("RE/RegisterHit")
     if not R or not y then return end
     local l, M = {}, nil
     for x, L in ipairs(V) do
@@ -2199,15 +1847,9 @@ function AttackNoCoolDown()
         local x, L = pcall(getsenv, b)
         if x and L then Z = L["_G"]["SendHitsToServer"] end
     end
-    if not _ANC_FlagsResolved then
-        local q, I = pcall(function()
-            return (require(r["Flags"]))["COMBAT_REMOTE_THREAD"] or false
-        end)
-        _ANC_FlagsResolved = q and "ok" or "fail"
-        _ANC_CombatThread = q and I or false
-    end
-    local q = (_ANC_FlagsResolved == "ok")
-    local I = _ANC_CombatThread
+    local q, I = pcall(function()
+        return (require(r["Flags"]))["COMBAT_REMOTE_THREAD"] or false
+    end)
     if q and (I and Z) then
         Z(M, l)
     elseif q and not I then
@@ -2215,13 +1857,8 @@ function AttackNoCoolDown()
     end
 end
 
--- BỌC PCALL: path Util.CameraShaker đổi/thiếu sẽ giết NGUYÊN script ngay lúc load (top-level).
--- Pcall hoá → mất hiệu ứng rung cam là cùng, bot vẫn chạy.
-CameraShakerR = nil
-pcall(function()
-    CameraShakerR = require(game["ReplicatedStorage"]["Util"]["CameraShaker"])
-    CameraShakerR:Stop()
-end)
+CameraShakerR = require(game["ReplicatedStorage"]["Util"]["CameraShaker"])
+CameraShakerR:Stop()
 _G.FastAttack = true
 
 if _G.FastAttack then
@@ -2322,43 +1959,27 @@ if _G.FastAttack then
 end
 
 local remote, idremote
--- BỌC PCALL từng folder: thiếu 1 folder (vd .FX) trước đây làm văng cả block top-level → script chết lúc load.
-for _, getter in ipairs({
-    function() return game.ReplicatedStorage.Util end,
-    function() return game.ReplicatedStorage.Common end,
-    function() return game.ReplicatedStorage.Remotes end,
-    function() return game.ReplicatedStorage.Assets end,
-    function() return game.ReplicatedStorage.FX end,
-}) do
-    pcall(function()
-        local v = getter()
-        if not v then return end
-        for _, n in next, v:GetChildren() do
-            if n:IsA("RemoteEvent") and n:GetAttribute("Id") then remote, idremote = n, n:GetAttribute("Id") end
-        end
-        v.ChildAdded:Connect(function(n)
-            if n:IsA("RemoteEvent") and n:GetAttribute("Id") then remote, idremote = n, n:GetAttribute("Id") end
-        end)
+for _, v in next, ({ game.ReplicatedStorage.Util, game.ReplicatedStorage.Common, game.ReplicatedStorage.Remotes,
+    game.ReplicatedStorage.Assets, game.ReplicatedStorage.FX }) do
+    for _, n in next, v:GetChildren() do
+        if n:IsA("RemoteEvent") and n:GetAttribute("Id") then remote, idremote = n, n:GetAttribute("Id") end
+    end
+    v.ChildAdded:Connect(function(n)
+        if n:IsA("RemoteEvent") and n:GetAttribute("Id") then remote, idremote = n, n:GetAttribute("Id") end
     end)
 end
 task.spawn(function()
-    -- Cache Net 1 lần: require được memoize sẵn nhưng vẫn tránh tra cây ReplicatedStorage.Modules.Net mỗi nhịp.
-    local netMod
     while task.wait(0.05) do
         local char = game.Players.LocalPlayer.Character
         local root = char and char:FindFirstChild("HumanoidRootPart")
-        -- GUARD: char/root nil 1 nhịp (respawn) → bỏ qua, KHÔNG để (hrp.Position - root.Position) văng
-        -- ngoài pcall và giết coroutine attack.
-        if char and root then
-        local rootPos = root.Position
         local parts = {}
         for _, x in ipairs({ workspace.Enemies, workspace.Characters }) do
             for _, v in ipairs(x and x:GetChildren() or {}) do
                 local hrp = v:FindFirstChild("HumanoidRootPart")
                 local hum = v:FindFirstChild("Humanoid")
-                if v ~= char and hrp and hum and hum.Health > 0 and (hrp.Position - rootPos).Magnitude <= 60 then
+                if v ~= char and hrp and hum and hum.Health > 0 and (hrp.Position - root.Position).Magnitude <= 60 then
                     for _, _v in ipairs(v:GetChildren()) do
-                        if _v:IsA("BasePart") then
+                        if _v:IsA("BasePart") and (hrp.Position - root.Position).Magnitude <= 60 then
                             parts[#parts + 1] = { v, _v }
                         end
                     end
@@ -2369,21 +1990,18 @@ task.spawn(function()
         if #parts > 0 and tool and
             (tool:GetAttribute("WeaponType") == "Melee" or tool:GetAttribute("WeaponType") == "Sword") then
             pcall(function()
-                netMod = netMod or require(game.ReplicatedStorage.Modules.Net)
-                local Net_ = game.ReplicatedStorage.Modules.Net
-                netMod:RemoteEvent("RegisterHit", true)
-                Net_["RE/RegisterAttack"]:FireServer()
+                require(game.ReplicatedStorage.Modules.Net):RemoteEvent("RegisterHit", true)
+                game.ReplicatedStorage.Modules.Net["RE/RegisterAttack"]:FireServer()
                 local head = parts[1][1]:FindFirstChild("Head")
                 if not head then return end
-                Net_["RE/RegisterHit"]:FireServer(head, parts, {}, tostring(
+                game.ReplicatedStorage.Modules.Net["RE/RegisterHit"]:FireServer(head, parts, {}, tostring(
                     game.Players.LocalPlayer.UserId):sub(2, 4) .. tostring(coroutine.running()):sub(11, 15))
                 cloneref(remote):FireServer(string.gsub("RE/RegisterHit", ".", function(c)
                     return string.char(bit32.bxor(string.byte(c), math.floor(workspace:GetServerTimeNow() / 10 % 10) + 1))
-                end), bit32.bxor(idremote + 909090, Net_.seed:InvokeServer() * 2), head,
+                end), bit32.bxor(idremote + 909090, game.ReplicatedStorage.Modules.Net.seed:InvokeServer() * 2), head,
                     parts)
             end)
         end
-        end -- if char and root
     end
 end)
 spawn(function()
@@ -2721,18 +2339,26 @@ pcall(function()
     if old then old:Destroy() end
 end)
 
--- ---- Stroke decorator: viền MÀU TĨNH (KHÔNG animate) → hết lag RGB × N account ----
--- Trước đây vòng spawn chạy ~12fps cập nhật HSV cho từng object → với nhiều card + nhiều account
--- cùng máy: vài nghìn lần set Color3 / frame = LAG. Giờ màu tím-xanh cố định, set 1 lần lúc tạo.
--- rgbActive giữ để tương thích với toggle panel (dòng ẩn/hiện vẫn đọc).
-local rgbActive = true
+-- ---- RGB animator: viền chạy 7 màu ----
+local rgbObjects = {} -- { {obj=, offset=, s=, v=, prop=} }
 local function RegisterRGB(obj, offset, s, v, prop)
-    local hue = (0.65 + (offset or 0)) % 1   -- tím-xanh làm base, offset để thay đổi nhẹ giữa các stroke
-    local _s = s or 0.85
-    local _v = v or 1
-    local _prop = prop or "Color"
-    pcall(function() obj[_prop] = Color3.fromHSV(hue, _s, _v) end)
+    table.insert(rgbObjects, {
+        obj = obj, offset = offset or 0, s = s or 0.85, v = v or 1,
+        prop = prop or "Color"
+    })
 end
+spawn(function()
+    while true do
+        local t = tick()
+        for _, o in ipairs(rgbObjects) do
+            if o.obj and o.obj.Parent then
+                local hue = (t * 0.12 + o.offset) % 1
+                pcall(function() o.obj[o.prop] = Color3.fromHSV(hue, o.s, o.v) end)
+            end
+        end
+        RunService.RenderStepped:Wait()
+    end
+end)
 
 local Gui = Instance.new("ScreenGui")
 Gui.Name           = "VuNguyenKaitunV4"
@@ -2849,11 +2475,8 @@ CloseBtn.TextSize         = 15
 CloseBtn.AutoButtonColor  = false
 CloseBtn.Parent           = Header
 Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 8)
-CloseBtn.MouseButton1Click:Connect(function() Panel.Visible = false; rgbActive = false end)
-Toggle.MouseButton1Click:Connect(function()
-    Panel.Visible = not Panel.Visible
-    rgbActive = Panel.Visible   -- ẩn panel → dừng RGB (hết lag); hiện lại → chạy tiếp
-end)
+CloseBtn.MouseButton1Click:Connect(function() Panel.Visible = false end)
+Toggle.MouseButton1Click:Connect(function() Panel.Visible = not Panel.Visible end)
 
 -- ---- Tab bar ----
 local TabBar = Instance.new("Frame")
@@ -3171,19 +2794,8 @@ spawn(function()
     end
 end)
 
--- 🆔 Place/Job card — PlaceId + JobId server hiện tại (bấm để copy JobId nếu executor hỗ trợ)
-local PlaceCard = LabelCard(mainPage, 8, "🆔 Place / Server", "…")
-spawn(function()
-    while wait(2) do
-        pcall(function()
-            PlaceCard:SetDesc(("PlaceId: %s | Job: %s"):format(
-                tostring(game.PlaceId), tostring(game.JobId):sub(1, 18)))
-        end)
-    end
-end)
-
 -- 🔎 Sync Debug card — dump trạng thái đồng bộ Main/Ally (chỉ đọc cache, KHÔNG gọi mạng)
-local SyncDbg = LabelCard(mainPage, 9, "🔎 Sync Debug", "…")
+local SyncDbg = LabelCard(mainPage, 8, "🔎 Sync Debug", "…")
 spawn(function()
     while wait(0.5) do
         pcall(function()
@@ -3205,13 +2817,10 @@ spawn(function()
     end
 end)
 
--- live status loop — 0.2s/lần là đủ mượt cho text (trước đây mỗi frame = phí CPU)
+-- live status loop
 spawn(function()
-    while wait(0.2) do
-        if _G.statusnow then
-            -- Kèm PlaceId ngay trong card STATUS (đầu trang, luôn thấy không phải cuộn)
-            StatusValue.Text = _G.statusnow .. "\nPlaceId: " .. tostring(game.PlaceId)
-        end
+    while wait() do
+        if _G.statusnow then StatusValue.Text = _G.statusnow end
     end
 end)
 
