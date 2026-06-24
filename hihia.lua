@@ -186,10 +186,27 @@ do
     end
 
     -- ---- POST: hàng đợi + worker + retry + coalesce theo key ----
+    -- Hàng đợi vòng dùng head/tail index thay vì table.remove(q,1) (O(n) → O(1));
+    -- với queue tới 800 job + 4 worker, pop đầu mảng cũ phải dịch cả mảng mỗi lần.
     local postQ = {}
+    local qHead = 1   -- vị trí job kế tiếp sẽ lấy
+    local qTail = 0   -- vị trí job cuối đã thêm
     local keyed = {} -- key -> job mới nhất
     local MAX_Q = 800
     local POST_RETRIES = 6
+    local function qPush(job)
+        qTail = qTail + 1
+        postQ[qTail] = job
+    end
+    local function qPop()
+        if qHead > qTail then return nil end
+        local job = postQ[qHead]
+        postQ[qHead] = nil
+        qHead = qHead + 1
+        -- reset index khi rỗng để không phình vô hạn
+        if qHead > qTail then qHead, qTail = 1, 0 end
+        return job
+    end
     function Net.postJSON(url, tbl, key)
         local bodyStr
         local ok = pcall(function() bodyStr = HS:JSONEncode(tbl or {}) end)
@@ -200,16 +217,16 @@ do
             if old then old.replaced = true end -- bỏ job cũ cùng key (chỉ gửi dữ liệu mới nhất)
             keyed[key] = job
         end
-        if #postQ >= MAX_Q then
-            table.remove(postQ, 1)
+        if (qTail - qHead + 1) >= MAX_Q then
+            qPop()
             Net.log("WARN", "postQ tràn, bỏ job cũ nhất")
         end
-        table.insert(postQ, job)
+        qPush(job)
     end
 
     local function worker()
         while true do
-            local job = table.remove(postQ, 1)
+            local job = qPop()
             if not job or job.replaced then
                 task.wait(0.05)
             else
@@ -223,7 +240,7 @@ do
                     if (not job.replaced) and job.attempts < POST_RETRIES then
                         Net.log("WARN", ("POST retry %d/%d %s : %s"):format(job.attempts, POST_RETRIES, job.url, tostring(err)))
                         task.wait(0.3 * job.attempts)
-                        table.insert(postQ, job)
+                        qPush(job)
                     elseif not job.replaced then
                         Net.log("ERR", ("POST bỏ sau %d lần: %s"):format(job.attempts, job.url))
                         if job.key and keyed[job.key] == job then keyed[job.key] = nil end
@@ -345,9 +362,14 @@ end
 local ALIVE = true
 
 -- Heartbeat: báo server account còn sống (qua hàng đợi, coalesce).
+-- Kèm cờ fullmoon = đang ở server full moon? → server dùng để ƯU TIÊN main này lên ĐẦU
+-- hàng waiting (xem rank trong /curmain). pcall vì isfullmoon() là global khai báo phía dưới,
+-- nhịp heartbeat đầu tiên có thể chạy trước khi nó được định nghĩa → tránh lỗi gọi nil.
 function sendHeartbeat()
     if not ALIVE then return end
-    Net.postJSON(BASE_URL .. "/heartbeat?name=" .. myName, { role = myRole }, "heartbeat")
+    local fm = false
+    pcall(function() fm = isfullmoon() and true or false end)
+    Net.postJSON(BASE_URL .. "/heartbeat?name=" .. myName, { role = myRole, fullmoon = fm }, "heartbeat")
 end
 
 -- Báo server account OUT → server xoá NGAY (không chờ prune 30s).
@@ -2068,8 +2090,11 @@ spawn(function()
                 if ui_ then
                     for _, vl in pairs(ui_:GetChildren()) do
                         if isvalidnameui[vl.Name] then
-                            local cooldown_frame = vl:WaitForChild("Cooldown", 3)
-                            local title_frame = vl:WaitForChild("Title", 3)
+                            -- FindFirstChild (không block) thay cho WaitForChild(...,3): trong loop nóng mỗi frame,
+                            -- WaitForChild block tới 3s/nhịp khi UI thiếu → đứng hình. Frame Cooldown/Title là con
+                            -- cố định của slot, sẵn rồi → lấy ngay; thiếu thì bỏ nhịp, vòng sau gặp lại.
+                            local cooldown_frame = vl:FindFirstChild("Cooldown")
+                            local title_frame = vl:FindFirstChild("Title")
                             if cooldown_frame and title_frame and (title_frame.TextColor3 == Color3.new(1, 1, 1) or title_frame.TextColor3 == Color3.fromRGB(255, 255, 255)) then
                                 if cooldown_frame.Size == UDim2.new(0, 0, 1, -1) then
                                     if vl.Name == "V" then
@@ -2124,6 +2149,9 @@ local function Pc(x, L)
     end
     return H
 end
+-- Cache remote/flag cho AttackNoCoolDown: trước đây WaitForChild 2 remote + require(Flags)
+-- chạy LẠI mỗi frame trong loop nóng (2331). Lấy 1 lần rồi tái dùng → bớt tra cây Instance mỗi nhịp.
+local _ANC_RegAttack, _ANC_RegHit, _ANC_FlagsResolved, _ANC_CombatThread
 function AttackNoCoolDown()
     local x = (game:GetService("Players"))["LocalPlayer"]
     local L = x["Character"]
@@ -2140,8 +2168,13 @@ function AttackNoCoolDown()
     local H = game:GetService("ReplicatedStorage")
     local r = H:FindFirstChild("Modules")
     if not r then return end
-    local R = ((H:WaitForChild("Modules")):WaitForChild("Net")):WaitForChild("RE/RegisterAttack")
-    local y = ((H:WaitForChild("Modules")):WaitForChild("Net")):WaitForChild("RE/RegisterHit")
+    if not (_ANC_RegAttack and _ANC_RegHit) then
+        local net = r:FindFirstChild("Net")
+        if not net then return end
+        _ANC_RegAttack = net:FindFirstChild("RE/RegisterAttack")
+        _ANC_RegHit = net:FindFirstChild("RE/RegisterHit")
+    end
+    local R, y = _ANC_RegAttack, _ANC_RegHit
     if not R or not y then return end
     local l, M = {}, nil
     for x, L in ipairs(V) do
@@ -2166,9 +2199,15 @@ function AttackNoCoolDown()
         local x, L = pcall(getsenv, b)
         if x and L then Z = L["_G"]["SendHitsToServer"] end
     end
-    local q, I = pcall(function()
-        return (require(r["Flags"]))["COMBAT_REMOTE_THREAD"] or false
-    end)
+    if not _ANC_FlagsResolved then
+        local q, I = pcall(function()
+            return (require(r["Flags"]))["COMBAT_REMOTE_THREAD"] or false
+        end)
+        _ANC_FlagsResolved = q and "ok" or "fail"
+        _ANC_CombatThread = q and I or false
+    end
+    local q = (_ANC_FlagsResolved == "ok")
+    local I = _ANC_CombatThread
     if q and (I and Z) then
         Z(M, l)
     elseif q and not I then
@@ -2176,8 +2215,13 @@ function AttackNoCoolDown()
     end
 end
 
-CameraShakerR = require(game["ReplicatedStorage"]["Util"]["CameraShaker"])
-CameraShakerR:Stop()
+-- BỌC PCALL: path Util.CameraShaker đổi/thiếu sẽ giết NGUYÊN script ngay lúc load (top-level).
+-- Pcall hoá → mất hiệu ứng rung cam là cùng, bot vẫn chạy.
+CameraShakerR = nil
+pcall(function()
+    CameraShakerR = require(game["ReplicatedStorage"]["Util"]["CameraShaker"])
+    CameraShakerR:Stop()
+end)
 _G.FastAttack = true
 
 if _G.FastAttack then
@@ -2278,27 +2322,43 @@ if _G.FastAttack then
 end
 
 local remote, idremote
-for _, v in next, ({ game.ReplicatedStorage.Util, game.ReplicatedStorage.Common, game.ReplicatedStorage.Remotes,
-    game.ReplicatedStorage.Assets, game.ReplicatedStorage.FX }) do
-    for _, n in next, v:GetChildren() do
-        if n:IsA("RemoteEvent") and n:GetAttribute("Id") then remote, idremote = n, n:GetAttribute("Id") end
-    end
-    v.ChildAdded:Connect(function(n)
-        if n:IsA("RemoteEvent") and n:GetAttribute("Id") then remote, idremote = n, n:GetAttribute("Id") end
+-- BỌC PCALL từng folder: thiếu 1 folder (vd .FX) trước đây làm văng cả block top-level → script chết lúc load.
+for _, getter in ipairs({
+    function() return game.ReplicatedStorage.Util end,
+    function() return game.ReplicatedStorage.Common end,
+    function() return game.ReplicatedStorage.Remotes end,
+    function() return game.ReplicatedStorage.Assets end,
+    function() return game.ReplicatedStorage.FX end,
+}) do
+    pcall(function()
+        local v = getter()
+        if not v then return end
+        for _, n in next, v:GetChildren() do
+            if n:IsA("RemoteEvent") and n:GetAttribute("Id") then remote, idremote = n, n:GetAttribute("Id") end
+        end
+        v.ChildAdded:Connect(function(n)
+            if n:IsA("RemoteEvent") and n:GetAttribute("Id") then remote, idremote = n, n:GetAttribute("Id") end
+        end)
     end)
 end
 task.spawn(function()
+    -- Cache Net 1 lần: require được memoize sẵn nhưng vẫn tránh tra cây ReplicatedStorage.Modules.Net mỗi nhịp.
+    local netMod
     while task.wait(0.05) do
         local char = game.Players.LocalPlayer.Character
         local root = char and char:FindFirstChild("HumanoidRootPart")
+        -- GUARD: char/root nil 1 nhịp (respawn) → bỏ qua, KHÔNG để (hrp.Position - root.Position) văng
+        -- ngoài pcall và giết coroutine attack.
+        if char and root then
+        local rootPos = root.Position
         local parts = {}
         for _, x in ipairs({ workspace.Enemies, workspace.Characters }) do
             for _, v in ipairs(x and x:GetChildren() or {}) do
                 local hrp = v:FindFirstChild("HumanoidRootPart")
                 local hum = v:FindFirstChild("Humanoid")
-                if v ~= char and hrp and hum and hum.Health > 0 and (hrp.Position - root.Position).Magnitude <= 60 then
+                if v ~= char and hrp and hum and hum.Health > 0 and (hrp.Position - rootPos).Magnitude <= 60 then
                     for _, _v in ipairs(v:GetChildren()) do
-                        if _v:IsA("BasePart") and (hrp.Position - root.Position).Magnitude <= 60 then
+                        if _v:IsA("BasePart") then
                             parts[#parts + 1] = { v, _v }
                         end
                     end
@@ -2309,18 +2369,21 @@ task.spawn(function()
         if #parts > 0 and tool and
             (tool:GetAttribute("WeaponType") == "Melee" or tool:GetAttribute("WeaponType") == "Sword") then
             pcall(function()
-                require(game.ReplicatedStorage.Modules.Net):RemoteEvent("RegisterHit", true)
-                game.ReplicatedStorage.Modules.Net["RE/RegisterAttack"]:FireServer()
+                netMod = netMod or require(game.ReplicatedStorage.Modules.Net)
+                local Net_ = game.ReplicatedStorage.Modules.Net
+                netMod:RemoteEvent("RegisterHit", true)
+                Net_["RE/RegisterAttack"]:FireServer()
                 local head = parts[1][1]:FindFirstChild("Head")
                 if not head then return end
-                game.ReplicatedStorage.Modules.Net["RE/RegisterHit"]:FireServer(head, parts, {}, tostring(
+                Net_["RE/RegisterHit"]:FireServer(head, parts, {}, tostring(
                     game.Players.LocalPlayer.UserId):sub(2, 4) .. tostring(coroutine.running()):sub(11, 15))
                 cloneref(remote):FireServer(string.gsub("RE/RegisterHit", ".", function(c)
                     return string.char(bit32.bxor(string.byte(c), math.floor(workspace:GetServerTimeNow() / 10 % 10) + 1))
-                end), bit32.bxor(idremote + 909090, game.ReplicatedStorage.Modules.Net.seed:InvokeServer() * 2), head,
+                end), bit32.bxor(idremote + 909090, Net_.seed:InvokeServer() * 2), head,
                     parts)
             end)
         end
+        end -- if char and root
     end
 end)
 spawn(function()
@@ -3108,8 +3171,19 @@ spawn(function()
     end
 end)
 
+-- 🆔 Place/Job card — PlaceId + JobId server hiện tại (bấm để copy JobId nếu executor hỗ trợ)
+local PlaceCard = LabelCard(mainPage, 8, "🆔 Place / Server", "…")
+spawn(function()
+    while wait(2) do
+        pcall(function()
+            PlaceCard:SetDesc(("PlaceId: %s | Job: %s"):format(
+                tostring(game.PlaceId), tostring(game.JobId):sub(1, 18)))
+        end)
+    end
+end)
+
 -- 🔎 Sync Debug card — dump trạng thái đồng bộ Main/Ally (chỉ đọc cache, KHÔNG gọi mạng)
-local SyncDbg = LabelCard(mainPage, 8, "🔎 Sync Debug", "…")
+local SyncDbg = LabelCard(mainPage, 9, "🔎 Sync Debug", "…")
 spawn(function()
     while wait(0.5) do
         pcall(function()
