@@ -2316,9 +2316,10 @@ do
 end
 
 --[[ ============================================================================
-[24] TEAMMANAGER — join team bền + recovery loop sau hop.
-ensureTeamSelected() có retry mềm, pcall đúng cách. (File A 528-559)
+ [24] TEAMMANAGER — join team bền + recovery loop sau hop.
+ ensureTeamSelected() có retry mềm, pcall đúng cách. (File A 528-559)
 ============================================================================ ]]
+local startGameReadyGate
 local TeamManager = {}
 TeamManager.started = false
 TeamManager._started = false
@@ -2638,7 +2639,7 @@ end
 [27b] GAME READY GATE — chờ team/char/data (timeout 45s), KHÔNG block.
 (File A 1549-1568)
 ============================================================================ ]]
-local function startGameReadyGate()
+startGameReadyGate = function()
     Logger.info("[BOOT] waiting game ready", "boot_gate")
     task.spawn(function()
         local t0 = tick()
