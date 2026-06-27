@@ -103,6 +103,7 @@ local LastEyeBindAttempt = 0
 local CurrentMode = "STARTING"
 local CurrentTarget = nil
 local LastStatus = ""
+local SetStatusLast = ""
 local TrackedBreakables = setmetatable({}, {__mode = "k"})
 local CachedBreakables = {}
 local LastBreakableScan = 0
@@ -145,25 +146,40 @@ end
 -- === Driver reroll race ===
 -- Chạy nền, mỗi 3s/lần gọi remote phù hợp. Khi race đạt -> biến RaceReady lên true.
 local RaceReady = false
+local CF_DBG_LAST_LOG = 0
+local function dlog(msg)
+    warn("[Race] " .. msg)
+end
 local function RaceDriverLoop(target)
     local lastAct = 0
+    dlog(("Driver bat dau, target = %s"):format(target))
     while target and not RaceReady do
         task.wait(0.5)
         local cur = raceOf()
-        if cur == target then RaceReady = true; break end
+        if cur == target then
+            RaceReady = true
+            dlog(("Race da dat -> %s (RaceReady = true)"):format(target))
+            break
+        end
         local frag = GetCurrentFragments() or 0
         if CF_REROLLABLE[target] then
             if frag >= 2500 and tick() - lastAct >= 3 then
+                dlog(("Reroll: cur=%s target=%s frag=%d"):format(tostring(cur), target, frag))
                 pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "1") end)
                 pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "2") end)
                 lastAct = tick(); task.wait(1.5)
+            elseif frag < 2500 and tick() - CF_DBG_LAST_LOG >= 5 then
+                CF_DBG_LAST_LOG = tick()
+                dlog(("Cho du frag de reroll: cur=%s target=%s frag=%d/2500"):format(tostring(cur), target, frag))
             end
         elseif target == "Ghoul" and tick() - lastAct >= 3 then
+            dlog("Mua Ghoul qua Ectoplasm")
             pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("Ectoplasm", "BuyCheck", 4) end)
             task.wait(0.5)
             pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("Ectoplasm", "Change", 4) end)
             lastAct = tick(); task.wait(1.5)
         elseif target == "Cyborg" and tick() - lastAct >= 3 then
+            dlog("Mua Cyborg qua CyborgTrainer")
             pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("CyborgTrainer", "Buy") end)
             lastAct = tick(); task.wait(1.5)
         end
@@ -178,14 +194,18 @@ do
             RaceReady = true -- off -> bỏ qua gate race
         elseif cur == target then
             RaceReady = true
+            warn(("[Race] Race hien tai (%s) trung target (%s) -> bo qua driver"):format(tostring(cur), target))
         else
             RaceReady = false
+            warn(("[Race] Spawn driver: target=%s, cur=%s"):format(target, tostring(cur)))
             task.spawn(RaceDriverLoop, target)
         end
     else
         RaceReady = true -- chưa set getgenv().race -> bỏ qua
+        warn("[Race] Khong set getgenv().race -> bo qua gate")
     end
 end
+getgenv().RaceTarget = getRaceTarget() or false
 
 local TIKI_CENTER = CFrame.new(-16490.9727, 98.1144867, 1245.58984, -0.034969449, 0, 0.999388516, 0, 1, 0, -0.999388516, 0, -0.034969449)
 local TYRANT_ENTRANCE = CFrame.new(-16342.5, 174, 1397)
@@ -235,6 +255,7 @@ local TikiMobs = {
 local function SetStatus(text)
     if LastStatus ~= text then
         LastStatus = text
+        SetStatusLast = text
         warn("[Auto Tyrant] " .. text)
     end
 end
@@ -2516,6 +2537,111 @@ SetupBringMobs()
 SetupRegenTracker()
 InstallSkillAimHook()
 LoadAttack()
+
+-- ===== Lightweight Status UI (debug) =====
+-- ScreenGui cố định góc trên trái, hiện: race, frag, raceReady, mode, target status.
+-- Toggle bằng phím K (mặc định). Có thể tắt bằng getgenv().UI_HIDE = true.
+do
+    if pcall(function()
+        local ps = game:GetService("Players")
+        local pgui = ps.LocalPlayer and ps.LocalPlayer:FindFirstChild("PlayerGui")
+        return pgui and true or false
+    end) then
+        local PlayerGui = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui", 5)
+        if PlayerGui and not getgenv().TyrantUI then
+            local gui = Instance.new("ScreenGui")
+            gui.Name = "TyrantDebugUI"
+            gui.ResetOnSpawn = false
+            gui.IgnoreGuiInset = true
+            gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+            local frame = Instance.new("Frame")
+            frame.Size = UDim2.new(0, 320, 0, 110)
+            frame.Position = UDim2.new(0, 10, 0, 10)
+            frame.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
+            frame.BackgroundTransparency = 0.15
+            frame.BorderSizePixel = 0
+            frame.Parent = gui
+            Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+            local stroke = Instance.new("UIStroke", frame)
+            stroke.Color = Color3.fromRGB(120, 120, 140)
+            stroke.Thickness = 1
+            stroke.Transparency = 0.5
+
+            local title = Instance.new("TextLabel")
+            title.Size = UDim2.new(1, -12, 0, 18)
+            title.Position = UDim2.new(0, 6, 0, 4)
+            title.BackgroundTransparency = 1
+            title.Font = Enum.Font.GothamBold
+            title.TextSize = 13
+            title.TextColor3 = Color3.fromRGB(180, 200, 255)
+            title.TextXAlignment = Enum.TextXAlignment.Left
+            title.Text = "Tyrant Kaitun - Status"
+            title.Parent = frame
+
+            local body = Instance.new("TextLabel")
+            body.Size = UDim2.new(1, -12, 1, -24)
+            body.Position = UDim2.new(0, 6, 0, 22)
+            body.BackgroundTransparency = 1
+            body.Font = Enum.Font.Code
+            body.TextSize = 12
+            body.TextColor3 = Color3.fromRGB(220, 220, 230)
+            body.TextXAlignment = Enum.TextXAlignment.Left
+            body.TextYAlignment = Enum.TextYAlignment.Top
+            body.Text = "loading..."
+            body.Parent = frame
+
+            local function render()
+                local race, frag, raceReady = "?", "?", "false"
+                pcall(function()
+                    local d = LocalPlayer and LocalPlayer:FindFirstChild("Data")
+                    if d then
+                        local r = d:FindFirstChild("Race")
+                        if r then race = tostring(r.Value) end
+                        local f = d:FindFirstChild("Fragments")
+                        if f then frag = tostring(f.Value) end
+                    end
+                    local rname = getgenv().RaceTarget
+                    raceReady = tostring(RaceReady)
+                    if rname and rname ~= false and race ~= "?" then
+                        if race == rname then raceReady = "READY (" .. rname .. ")" end
+                    elseif rname == false then
+                        raceReady = "off"
+                    elseif rname == nil then
+                        raceReady = "no target"
+                    end
+                end)
+                local mode = CurrentMode or "?"
+                local status = SetStatusLast or "?"
+                local targetFrag = getgenv().fragmenttarget or "?"
+                body.Text = string.format(
+                    "Race : %s\nTarget: %s\nFrag : %s / %s\nReady: %s\nMode : %s\nStat : %s",
+                    race, tostring(getgenv().race or "nil"), frag, targetFrag, raceReady, mode, status
+                )
+            end
+
+            task.spawn(function()
+                while task.wait(0.25) do
+                    pcall(render)
+                end
+            end)
+
+            local toggleKey = Enum.KeyCode.K
+            local UIS = game:GetService("UserInputService")
+            UIS.InputBegan:Connect(function(input, gp)
+                if gp then return end
+                if input.KeyCode == toggleKey then
+                    frame.Visible = not frame.Visible
+                end
+            end)
+
+            getgenv().TyrantUI = gui
+            getgenv().TyrantUIFrame = frame
+            gui.Parent = PlayerGui
+        end
+    end
+end
 
 if NormalizeName(Config.Weapon) == NormalizeName("Dragon Talon")
     and not FindTool("Dragon Talon")
