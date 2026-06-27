@@ -115,6 +115,78 @@ local FragmentFolderLock = false
 local LastFragmentLogAt = 0
 local CURRENT_FRAGMENT_LOG_INTERVAL = 30
 
+-- ===== Race target (gate đổi folder) =====
+-- getgenv().race = "Mink" | "Fishman" | "Skypiea" | "Human" | "Ghoul" | "Cyborg" | "rabbit/shark/angel/..." (alias) | "off" | nil
+--   nil / "off" / rỗng -> KHÔNG check race (đổi folder chỉ phụ thuộc fragmenttarget).
+--   Có giá trị       -> phải đạt đúng race đó trước khi đợi fragmenttarget.
+local CF_RACE_MAP = {
+    rabbit = "Mink", mink = "Mink", shark = "Fishman", fishman = "Fishman",
+    angel = "Skypiea", skypiea = "Skypiea", human = "Human",
+    ghoul = "Ghoul", cyborg = "Cyborg",
+    Mink = "Mink", Fishman = "Fishman", Skypiea = "Skypiea",
+    Human = "Human", Ghoul = "Ghoul", Cyborg = "Cyborg",
+}
+local CF_REROLLABLE = { Mink = true, Fishman = true, Skypiea = true, Human = true }
+
+local function raceOf()
+    local d = LocalPlayer:FindFirstChild("Data")
+    return (d and d:FindFirstChild("Race") and tostring(d.Race.Value)) or nil
+end
+
+local function getRaceTarget()
+    local raw
+    pcall(function() raw = getgenv().race end)
+    if raw == nil then return nil end
+    local key = tostring(raw):lower()
+    if key == "" or key == "off" then return false end -- false = explicit off (skip race gate)
+    return CF_RACE_MAP[key] -- nil nếu không map được -> coi như off
+end
+
+-- === Driver reroll race ===
+-- Chạy nền, mỗi 3s/lần gọi remote phù hợp. Khi race đạt -> biến RaceReady lên true.
+local RaceReady = false
+local function RaceDriverLoop(target)
+    local lastAct = 0
+    while target and not RaceReady do
+        task.wait(0.5)
+        local cur = raceOf()
+        if cur == target then RaceReady = true; break end
+        local frag = GetCurrentFragments() or 0
+        if CF_REROLLABLE[target] then
+            if frag >= 2500 and tick() - lastAct >= 3 then
+                pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "1") end)
+                pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "2") end)
+                lastAct = tick(); task.wait(1.5)
+            end
+        elseif target == "Ghoul" and tick() - lastAct >= 3 then
+            pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("Ectoplasm", "BuyCheck", 4) end)
+            task.wait(0.5)
+            pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("Ectoplasm", "Change", 4) end)
+            lastAct = tick(); task.wait(1.5)
+        elseif target == "Cyborg" and tick() - lastAct >= 3 then
+            pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("CyborgTrainer", "Buy") end)
+            lastAct = tick(); task.wait(1.5)
+        end
+    end
+end
+
+do
+    local target = getRaceTarget() -- nil = chưa set, false = explicit off, string = cần đạt race này
+    if target then
+        local cur = raceOf()
+        if target == false then
+            RaceReady = true -- off -> bỏ qua gate race
+        elseif cur == target then
+            RaceReady = true
+        else
+            RaceReady = false
+            task.spawn(RaceDriverLoop, target)
+        end
+    else
+        RaceReady = true -- chưa set getgenv().race -> bỏ qua
+    end
+end
+
 local TIKI_CENTER = CFrame.new(-16490.9727, 98.1144867, 1245.58984, -0.034969449, 0, 0.999388516, 0, 1, 0, -0.999388516, 0, -0.034969449)
 local TYRANT_ENTRANCE = CFrame.new(-16342.5, 174, 1397)
 local ARENA_CENTER = Vector3.new(-16335, 174, 1397)
@@ -567,6 +639,20 @@ end
 -- theo interval (mặc định 30s) để tránh spam warn. Khi đủ thì gọi TryChangeFolder.
 local function MaybeCheckFragment()
     if FragmentFolderLock then
+        return
+    end
+
+    -- Gate race: nếu getgenv().race được set mà chưa đạt -> KHÔNG đổi folder,
+    -- chỉ log định kỳ để biết script đang chờ race.
+    if not RaceReady then
+        local now = tick()
+        if now - LastFragmentLogAt >= CURRENT_FRAGMENT_LOG_INTERVAL then
+            LastFragmentLogAt = now
+            warn(string.format(
+                "[Fragment] Đang chờ Race đạt target (race hiện tại = %s) - chưa đổi folder",
+                tostring(raceOf() or "?")
+            ))
+        end
         return
     end
 
