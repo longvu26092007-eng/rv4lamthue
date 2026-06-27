@@ -134,13 +134,22 @@ local function raceOf()
     return (d and d:FindFirstChild("Race") and tostring(d.Race.Value)) or nil
 end
 
+-- Forward declare GetCurrentFragments: RaceDriverLoop bên dưới dùng trước khi hàm được định nghĩa.
+-- (Sửa lỗi A: RaceDriverLoop gọi nhầm global nil nếu thiếu forward declare.)
+local GetCurrentFragments
+
 local function getRaceTarget()
     local raw
     pcall(function() raw = getgenv().race end)
     if raw == nil then return nil end
     local key = tostring(raw):lower()
     if key == "" or key == "off" then return false end -- false = explicit off (skip race gate)
-    return CF_RACE_MAP[key] -- nil nếu không map được -> coi như off
+    local mapped = CF_RACE_MAP[key]
+    if mapped == nil then
+        warn(("[Race] getgenv().race='%s' khong phai alias hop le -> skip race gate (treated as off)"):format(tostring(raw)))
+        return false
+    end
+    return mapped
 end
 
 -- === Driver reroll race ===
@@ -153,20 +162,29 @@ end
 local function RaceDriverLoop(target)
     local lastAct = 0
     dlog(("Driver bat dau, target = %s"):format(target))
+    local initWait = 0
     while target and not RaceReady do
         task.wait(0.5)
+        initWait = initWait + 0.5
         local cur = raceOf()
         if cur == target then
             RaceReady = true
             dlog(("Race da dat -> %s (RaceReady = true)"):format(target))
             break
         end
-        local frag = GetCurrentFragments() or 0
+        local frag = (GetCurrentFragments and GetCurrentFragments()) or 0
         if CF_REROLLABLE[target] then
-            if frag >= 2500 and tick() - lastAct >= 3 then
-                dlog(("Reroll: cur=%s target=%s frag=%d"):format(tostring(cur), target, frag))
-                pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "1") end)
-                pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "2") end)
+            local elapsed = tick() - lastAct
+            if frag >= 2500 and (lastAct == 0 or elapsed >= 3) then
+                dlog(("Reroll #%d: cur=%s target=%s frag=%d elapsed=%.1f"):format(
+                    (lastAct == 0) and 0 or math.floor(elapsed / 3), tostring(cur), target, frag, elapsed))
+                -- pcall từng remote để lỗi không giết driver loop (Sửa lỗi C).
+                pcall(function()
+                    ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "1")
+                end)
+                pcall(function()
+                    ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "2")
+                end)
                 lastAct = tick(); task.wait(1.5)
             elseif frag < 2500 and tick() - CF_DBG_LAST_LOG >= 5 then
                 CF_DBG_LAST_LOG = tick()
@@ -555,7 +573,9 @@ end
 -- Đọc số Fragment hiện tại theo đúng pattern đã có trong source:
 --   game.Players.LocalPlayer.Data.Fragments.Value  (IntValue)
 -- Trả về nil nếu chưa có Data/Fragments (nhân vật chưa load).
-local function GetCurrentFragments()
+-- Gán thay vì `local function` để tương thích với forward declare ở phần race gate
+-- (RaceDriverLoop gọi hàm này TRƯỚC khi đến định nghĩa này).
+GetCurrentFragments = function()
     local ok, value = pcall(function()
         local data = LocalPlayer and LocalPlayer:FindFirstChild("Data")
         local fragments = data and data:FindFirstChild("Fragments")
@@ -2555,42 +2575,143 @@ do
             gui.IgnoreGuiInset = true
             gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
+            -- Frame chính
             local frame = Instance.new("Frame")
-            frame.Size = UDim2.new(0, 320, 0, 110)
+            frame.Name = "MainFrame"
+            frame.Size = UDim2.new(0, 320, 0, 160)
             frame.Position = UDim2.new(0, 10, 0, 10)
-            frame.BackgroundColor3 = Color3.fromRGB(20, 20, 26)
-            frame.BackgroundTransparency = 0.15
+            frame.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+            frame.BackgroundTransparency = 0.05
             frame.BorderSizePixel = 0
             frame.Parent = gui
-            Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+            Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+            Instance.new("UIStroke", frame).Color = Color3.fromRGB(80, 80, 110)
+            Instance.new("UIStroke", frame).Thickness = 1
+            Instance.new("UIStroke", frame).Transparency = 0.4
 
-            local stroke = Instance.new("UIStroke", frame)
-            stroke.Color = Color3.fromRGB(120, 120, 140)
-            stroke.Thickness = 1
-            stroke.Transparency = 0.5
+            -- Title bar (kéo được)
+            local titleBar = Instance.new("Frame")
+            titleBar.Name = "TitleBar"
+            titleBar.Size = UDim2.new(1, 0, 0, 26)
+            titleBar.Position = UDim2.new(0, 0, 0, 0)
+            titleBar.BackgroundColor3 = Color3.fromRGB(28, 28, 40)
+            titleBar.BackgroundTransparency = 0
+            titleBar.BorderSizePixel = 0
+            titleBar.Parent = frame
+            Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 10)
 
             local title = Instance.new("TextLabel")
-            title.Size = UDim2.new(1, -12, 0, 18)
-            title.Position = UDim2.new(0, 6, 0, 4)
+            title.Name = "Title"
+            title.Size = UDim2.new(1, -70, 1, 0)
+            title.Position = UDim2.new(0, 10, 0, 0)
             title.BackgroundTransparency = 1
             title.Font = Enum.Font.GothamBold
-            title.TextSize = 13
-            title.TextColor3 = Color3.fromRGB(180, 200, 255)
+            title.TextSize = 12
+            title.TextColor3 = Color3.fromRGB(160, 190, 255)
             title.TextXAlignment = Enum.TextXAlignment.Left
-            title.Text = "Tyrant Kaitun - Status"
-            title.Parent = frame
+            title.Text = "Tyrant Kaitun  [K] toggle"
+            title.Parent = titleBar
 
+            -- Nút đóng
+            local btnClose = Instance.new("TextButton")
+            btnClose.Name = "CloseBtn"
+            btnClose.Size = UDim2.new(0, 22, 0, 22)
+            btnClose.Position = UDim2.new(1, -60, 0.5, -11)
+            btnClose.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+            btnClose.BackgroundTransparency = 0.2
+            btnClose.Font = Enum.Font.GothamBold
+            btnClose.TextSize = 11
+            btnClose.TextColor3 = Color3.new(1, 1, 1)
+            btnClose.Text = "X"
+            btnClose.Parent = titleBar
+            Instance.new("UICorner", btnClose).CornerRadius = UDim.new(0, 6)
+            btnClose.MouseButton1Click:Connect(function()
+                frame.Visible = false
+            end)
+
+            -- Nút reroll manual
+            local btnReroll = Instance.new("TextButton")
+            btnReroll.Name = "RerollBtn"
+            btnReroll.Size = UDim2.new(0, 50, 0, 22)
+            btnReroll.Position = UDim2.new(1, -130, 0.5, -11)
+            btnReroll.BackgroundColor3 = Color3.fromRGB(60, 140, 220)
+            btnReroll.BackgroundTransparency = 0.2
+            btnReroll.Font = Enum.Font.GothamBold
+            btnReroll.TextSize = 10
+            btnReroll.TextColor3 = Color3.new(1, 1, 1)
+            btnReroll.Text = "⟳ Roll"
+            btnReroll.Parent = titleBar
+            Instance.new("UICorner", btnReroll).CornerRadius = UDim.new(0, 6)
+            btnReroll.MouseButton1Click:Connect(function()
+                local target = getgenv().RaceTarget
+                if target and type(target) == "string" then
+                    local cur = raceOf()
+                    if cur ~= target then
+                        dlog(("Manual reroll: cur=%s target=%s"):format(tostring(cur), target))
+                        pcall(function()
+                            ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "1")
+                        end)
+                        pcall(function()
+                            ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "2")
+                        end)
+                    end
+                end
+            end)
+
+            -- Body text
             local body = Instance.new("TextLabel")
-            body.Size = UDim2.new(1, -12, 1, -24)
-            body.Position = UDim2.new(0, 6, 0, 22)
+            body.Name = "Body"
+            body.Size = UDim2.new(1, -16, 1, -50)
+            body.Position = UDim2.new(0, 8, 0, 32)
             body.BackgroundTransparency = 1
             body.Font = Enum.Font.Code
-            body.TextSize = 12
-            body.TextColor3 = Color3.fromRGB(220, 220, 230)
+            body.TextSize = 11
+            body.TextColor3 = Color3.fromRGB(210, 210, 225)
             body.TextXAlignment = Enum.TextXAlignment.Left
             body.TextYAlignment = Enum.TextYAlignment.Top
             body.Text = "loading..."
             body.Parent = frame
+
+            -- Notif nhỏ khi nhấn reroll
+            local notif = Instance.new("TextLabel")
+            notif.Name = "Notif"
+            notif.Size = UDim2.new(0, 140, 0, 20)
+            notif.Position = UDim2.new(1, -148, 1, -28)
+            notif.BackgroundColor3 = Color3.fromRGB(40, 120, 220)
+            notif.BackgroundTransparency = 0.2
+            notif.Font = Enum.Font.GothamBold
+            notif.TextSize = 10
+            notif.TextColor3 = Color3.new(1, 1, 1)
+            notif.Text = "Rerolled!"
+            notif.Visible = false
+            notif.Parent = frame
+            Instance.new("UICorner", notif).CornerRadius = UDim.new(0, 6)
+
+            -- DRAG logic trên titleBar
+            local dragging, dragStart, startPos = false, nil, nil
+            titleBar.InputBegan:Connect(function(input, gp)
+                if gp then return end
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                    dragging = true
+                    dragStart = input.Position
+                    startPos = frame.Position
+                end
+            end)
+            titleBar.InputEnded:Connect(function(input, gp)
+                if gp then return end
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                    dragging = false
+                end
+            end)
+            game:GetService("RunService").Heartbeat:Connect(function()
+                if dragging then
+                    local delta = game:GetService("UserInputService"):GetMouseLocation() - dragStart
+                    frame.Position = UDim2.new(
+                        startPos.X.Scale, startPos.X.Offset + delta.X,
+                        startPos.Y.Scale, startPos.Y.Offset + delta.Y
+                    )
+                end
+            end)
 
             local function render()
                 local race, frag, raceReady = "?", "?", "false"
@@ -2605,7 +2726,7 @@ do
                     local rname = getgenv().RaceTarget
                     raceReady = tostring(RaceReady)
                     if rname and rname ~= false and race ~= "?" then
-                        if race == rname then raceReady = "READY (" .. rname .. ")" end
+                        if race == rname then raceReady = "READY" end
                     elseif rname == false then
                         raceReady = "off"
                     elseif rname == nil then
@@ -2616,7 +2737,7 @@ do
                 local status = SetStatusLast or "?"
                 local targetFrag = getgenv().fragmenttarget or "?"
                 body.Text = string.format(
-                    "Race : %s\nTarget: %s\nFrag : %s / %s\nReady: %s\nMode : %s\nStat : %s",
+                    "Race   : %s\nTarget : %s\nFrag   : %s / %s\nStatus : %s\nMode   : %s\nInfo   : %s",
                     race, tostring(getgenv().race or "nil"), frag, targetFrag, raceReady, mode, status
                 )
             end
@@ -2627,11 +2748,17 @@ do
                 end
             end)
 
-            local toggleKey = Enum.KeyCode.K
+            -- Khi nhấn nút reroll -> flash notif
+            btnReroll.MouseButton1Click:Connect(function()
+                notif.Visible = true
+                task.delay(1.5, function() notif.Visible = false end)
+            end)
+
+            -- Phím K toggle
             local UIS = game:GetService("UserInputService")
             UIS.InputBegan:Connect(function(input, gp)
                 if gp then return end
-                if input.KeyCode == toggleKey then
+                if input.KeyCode == Enum.KeyCode.K then
                     frame.Visible = not frame.Visible
                 end
             end)
