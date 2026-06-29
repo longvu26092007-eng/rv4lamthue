@@ -18,7 +18,6 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
     ["Team"]               = "Pirates",
     ["Allowed Races"]      = {"Mink", "Human", "Skypiea", "Fishman"},
     ["Auto Roll Race"]     = false,
-    ["Use Server API"]     = true,
     ["Hop Mirage"]         = true,
     ["Boost FPS"]          = true,
     ["FPS"]                = 20,
@@ -152,7 +151,6 @@ Config["Enabled"]           = Config["Enabled"] ~= false
 Config["Team"]              = Config["Team"] or "Pirates"
 Config["Allowed Races"]     = Config["Allowed Races"] or {"Mink", "Human", "Skypiea", "Fishman"}
 Config["Auto Roll Race"]    = Config["Auto Roll Race"] or false
-Config["Use Server API"]    = Config["Use Server API"] ~= false
 Config["Hop Mirage"]        = Config["Hop Mirage"] ~= false
 Config["Use Mirage API"]    = Config["Use Mirage API"] ~= false
 Config["Mirage API"]        = Config["Mirage API"] or "http://fi12.bot-hosting.cloud:20112/api/name=mirage"
@@ -205,31 +203,7 @@ end
 RefreshCharacter()
 LocalPlayer.CharacterAdded:Connect(function() RefreshCharacter() end)
 
--- Tim nut chon team trong GUI (ho tro ca "Main (minimal)" va "Main")
-local function GetChooseTeamButton(teamName)
-    local pg = LocalPlayer:FindFirstChild("PlayerGui")
-    if not pg then return nil end
-
-    local mainMinimal = pg:FindFirstChild("Main (minimal)")
-    if mainMinimal
-        and mainMinimal:FindFirstChild("ChooseTeam")
-        and mainMinimal.ChooseTeam:FindFirstChild("Container")
-    then
-        return mainMinimal.ChooseTeam.Container:FindFirstChild(teamName)
-    end
-
-    local main = pg:FindFirstChild("Main")
-    if main
-        and main:FindFirstChild("ChooseTeam")
-        and main.ChooseTeam:FindFirstChild("Container")
-    then
-        return main.ChooseTeam.Container:FindFirstChild(teamName)
-    end
-
-    return nil
-end
-
--- Choose team chac chan hon: vua goi remote SetTeam vua firesignal nut, retry 20 lan
+-- Choose team (pattern y het Source_SG)
 local function ChooseTeam()
     local teamName = tostring(Config["Team"] or "Pirates")
 
@@ -239,17 +213,15 @@ local function ChooseTeam()
     end
 
     SetStatus("Waiting loading screen...")
-    pcall(function()
-        local pg = LocalPlayer:FindFirstChild("PlayerGui")
-        if pg and pg:FindFirstChild("LoadingScreen") then
-            repeat
-                task.wait(1)
-                SetStatus("Waiting LoadingScreen removed...")
-            until not pg:FindFirstChild("LoadingScreen")
-        end
-    end)
+    if LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen") then
+        repeat
+            task.wait(1)
+            SetStatus("LoadingScreen still present...")
+        until not LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
+    end
 
-    for attempt = 1, 20 do
+    -- Retry ben bi: moi vong vua goi remote SetTeam, vua fallback firesignal nut
+    for attempt = 1, 30 do
         if LocalPlayer.Team then
             SetStatus("Team selected: " .. tostring(LocalPlayer.Team.Name))
             return true
@@ -257,44 +229,20 @@ local function ChooseTeam()
 
         SetStatus("Choose team attempt " .. tostring(attempt) .. " -> " .. teamName)
 
-        local okRemote, errRemote = pcall(function()
+        xpcall(function()
             ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_"):InvokeServer("SetTeam", teamName)
+        end, function(err)
+            DebugStatus("SetTeam remote error", err)
+            pcall(function()
+                firesignal(LocalPlayer.PlayerGui["Main (minimal)"].ChooseTeam.Container[teamName].Activated)
+            end)
         end)
 
-        if not okRemote then
-            DebugStatus("SetTeam remote error", errRemote)
-        end
-
-        task.wait(0.5)
-
-        if not LocalPlayer.Team then
-            local btn = GetChooseTeamButton(teamName)
-            if btn then
-                local okClick, errClick = pcall(function()
-                    firesignal(btn.Activated)
-                end)
-
-                if not okClick then
-                    okClick, errClick = pcall(function()
-                        firesignal(btn.MouseButton1Click)
-                    end)
-                end
-
-                if not okClick then
-                    DebugStatus("ChooseTeam firesignal error", errClick)
-                else
-                    SetStatus("ChooseTeam button fired")
-                end
-            else
-                SetStatus("ChooseTeam button not found")
-            end
-        end
-
-        task.wait(1)
+        task.wait(1.5)
     end
 
     if LocalPlayer.Team then
-        SetStatus("Team selected after retry: " .. tostring(LocalPlayer.Team.Name))
+        SetStatus("Team selected: " .. tostring(LocalPlayer.Team.Name))
         return true
     end
 
@@ -302,9 +250,10 @@ local function ChooseTeam()
     return false
 end
 
+-- Khong hard-stop neu chua set duoc Team ngay: van di tiep cho character
+-- (giong Source_SG, viec cho character moi la cong chan that su)
 if not ChooseTeam() then
-    SetStatus("ChooseTeam failed, script stopped")
-    return
+    SetStatus("ChooseTeam chua set Team -> van cho character...")
 end
 
 SetStatus("Waiting character...")
@@ -457,7 +406,7 @@ RefreshPlayerData()
 RefreshInventory()
 
 -----------------------------------------------------------------------------------
--- 6. STORAGE (dung cho WrapToServer khong nhap lai server)
+-- 6. STORAGE (luu JobId da join de khong join lai)
 -----------------------------------------------------------------------------------
 local Storage = { Data = {}, WRITE_DELAY = 10 }
 local StoragePath = ".pull_lever_storage_" .. tostring(LocalPlayer.UserId)
@@ -493,21 +442,7 @@ local function urlencode(str)
     return str
 end
 
-local function AsynclyPullServerDatas(Category)
-    if not Config["Use Server API"] then return {} end
-    local url = ("https://api2.chimovo.com/v1/servers/%s"):format(urlencode(Category))
-    local ok, raw = pcall(function()
-        return request({
-            Url = url,
-            Method = "GET",
-            Headers = { ["x-authorization"] = "kkk" },
-        })
-    end)
-    if not ok or not raw or raw.Success ~= true then return {} end
-    local ok2, decoded = pcall(function() return HttpService:JSONDecode(raw.Body) end)
-    if not ok2 then return {} end
-    return decoded.data or {}
-end
+-- [Da bo API chimovo] Chi dung Mirage API fi12 (GetMirageServersFromAPI) + Hop bang __ServerBrowser.
 
 local function IfTableHaveIndex(t)
     if type(t) ~= "table" then return false end
@@ -545,31 +480,8 @@ local function Hop(Reason)
     end)
 end
 
--- Forward declare de WrapToServer (dinh nghia phia tren) co the goi duoc
--- Ham that dinh nghia phia duoi (sau WrapToServer).
+-- Forward declare: ham JoinJobIdByServerBrowser dinh nghia phia duoi (dung cho HopMirageByAPI).
 local JoinJobIdByServerBrowser
-
-local function WrapToServer(Category, Filter, IgnoreHop)
-    print("[PullLever] WrapToServer: " .. tostring(Category))
-    local List = AsynclyPullServerDatas(Category)
-    if type(List) ~= "table" or #List == 0 then return false end
-    for _ = 1, #List do
-        local Server = List[math.random(math.max(1, #List - 50), #List)]
-        if Server and not Storage:Get(Server.JobId) and Server.Players ~= "12/12" then
-            if (not Filter or Filter(Server)) and Server.PlaceId == game.PlaceId then
-                Storage:Set(Server.JobId, true)
-
-                local joined = JoinJobIdByServerBrowser(Server.JobId)
-                if joined then
-                    task.wait(5)
-                    return true
-                end
-            end
-        end
-    end
-    if not IgnoreHop then Hop("WrapToServer failed: " .. tostring(Category)) end
-    return false
-end
 
 -----------------------------------------------------------------------------------
 -- 7b. MIRAGE API (custom endpoint fi12.bot-hosting.cloud)
@@ -584,11 +496,18 @@ local function HttpRequest(opts)
         return false, "executor does not support request"
     end
 
-    local ok, res = pcall(function() return req(opts) end)
-    if not ok then
-        return false, res
+    -- Retry vai lan: server bot-hosting hay sleep, "failed to fetch" thuong la tam thoi
+    local lastErr
+    for attempt = 1, 3 do
+        local ok, res = pcall(function() return req(opts) end)
+        if ok and type(res) == "table" then
+            return true, res
+        end
+        lastErr = res
+        warn("[MirageAPI] request attempt " .. tostring(attempt) .. " failed: " .. tostring(res))
+        task.wait(2)
     end
-    return true, res
+    return false, lastErr
 end
 
 local function JsonDecodeSafe(body)
@@ -601,11 +520,24 @@ local function JsonDecodeSafe(body)
 end
 
 local function NormalizeServerEntry(v)
+    -- Entry co the la string (chi chua JobId tho)
+    if type(v) == "string" then
+        local s = v:gsub("^%s+", ""):gsub("%s+$", "")
+        if s == "" then return nil end
+        return {
+            JobId   = s,
+            PlaceId = game.PlaceId,
+            Players = 0,
+            Region  = nil,
+            Raw     = v,
+        }
+    end
+
     if type(v) ~= "table" then return nil end
 
-    local jobId   = v.JobId or v.jobId or v.job_id or v.id
-    local placeId = v.PlaceId or v.placeId or v.place_id or v.place
-    local players = v.Players or v.players or v.Count or v.count or v.playerCount
+    local jobId   = v.JobId or v.jobId or v.jobid or v.job_id or v.id
+    local placeId = v.PlaceId or v.placeId or v.placeid or v.place_id or v.place
+    local players = v.Players or v.players or v.player or v.Count or v.count or v.playerCount
     local region  = v.Region or v.region
 
     if type(players) == "string" then
@@ -626,9 +558,26 @@ end
 
 local function ExtractServerList(data)
     local list = {}
+
+    -- Body decode ra 1 string -> chinh la JobId
+    if type(data) == "string" then
+        local one = NormalizeServerEntry(data)
+        if one then table.insert(list, one) end
+        return list
+    end
+
     if type(data) ~= "table" then return list end
 
     local source = data.data or data.servers or data.result or data.results or data
+
+    -- source la string -> JobId tho
+    if type(source) == "string" then
+        local one = NormalizeServerEntry(source)
+        if one then table.insert(list, one) end
+        return list
+    end
+
+    if type(source) ~= "table" then return list end
 
     -- Neu source la 1 server don le (co JobId truc tiep)
     if source.JobId or source.jobId or source.job_id or source.id then
@@ -637,7 +586,7 @@ local function ExtractServerList(data)
         return list
     end
 
-    -- Neu source la mang/object cac server
+    -- Neu source la mang/object cac server (entry co the la table hoac string)
     for _, v in pairs(source) do
         local one = NormalizeServerEntry(v)
         if one then table.insert(list, one) end
@@ -664,7 +613,10 @@ local function GetMirageServersFromAPI()
     local ok, res = HttpRequest({
         Url = url,
         Method = "GET",
-        Headers = { ["Accept"] = "application/json" },
+        Headers = {
+            ["Accept"]     = "application/json",
+            ["User-Agent"] = "Roblox/WinInet",
+        },
     })
 
     if not ok then
@@ -682,16 +634,39 @@ local function GetMirageServersFromAPI()
         return {}
     end
 
+    local servers = {}
+
     local data = JsonDecodeSafe(body)
-    if not data then
+    if data then
+        servers = ExtractServerList(data)
+    else
         warn("[MirageAPI] JSON decode failed. Body head: " .. tostring(body):sub(1, 300))
-        return {}
     end
 
-    local servers = ExtractServerList(data)
+    -- Fallback catch-all: neu khong parse duoc server nao, thu trich JobId (GUID)
+    -- truc tiep tu body tho. Bat duoc ca khi body la text/list string/schema la.
+    if #servers == 0 then
+        local seen = {}
+        for guid in tostring(body):gmatch("%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x") do
+            if not seen[guid] then
+                seen[guid] = true
+                table.insert(servers, {
+                    JobId   = guid,
+                    PlaceId = game.PlaceId,
+                    Players = 0,
+                })
+            end
+        end
+        if #servers > 0 then
+            warn("[MirageAPI] Fallback: trich " .. tostring(#servers) .. " JobId tho tu body")
+        end
+    end
 
-    LastMirageApiFetch = os.time()
-    CachedMirageServers = servers
+    -- Chi cache khi co ket qua, de lan sau con retry neu lan nay rong
+    if #servers > 0 then
+        LastMirageApiFetch = os.time()
+        CachedMirageServers = servers
+    end
 
     print("[MirageAPI] Parsed " .. tostring(#servers) .. " server(s)")
     SetStatus("Mirage API servers: " .. tostring(#servers))
@@ -797,7 +772,7 @@ local function CaculateDistance(Origin, Destination)
     return (a - b).Magnitude
 end
 
-local TweenInstance
+local TweenConn, TweenInstance, TweenGhost, IsTweening = nil, nil, nil, false
 local function NoclipLoop()
     if LocalPlayer.Character then
         for _, c in LocalPlayer.Character:GetDescendants() do
@@ -809,20 +784,85 @@ local function NoclipLoop()
 end
 RunService.Stepped:Connect(NoclipLoop)
 
+-- Huy tween dang chay + don ghost
+local function StopTween()
+    if TweenInstance then pcall(function() TweenInstance:Cancel() end) TweenInstance = nil end
+    if TweenConn then TweenConn:Disconnect() TweenConn = nil end
+    if TweenGhost then pcall(function() TweenGhost:Destroy() end) TweenGhost = nil end
+    IsTweening = false
+end
+
+-- Tween muot kieu V3: ghost part (anchored) + Heartbeat snap HRP + zero velocity.
+-- TweenTo(false) de huy. Khoang gan thi teleport tuc thi cho do giut.
 function TweenTo(Position)
-    if not Position or not HumanoidRootPart then return end
-    if TweenInstance then pcall(function() TweenInstance:Cancel() end) end
+    -- Char chet -> don ghost va thoat
+    if not Character or not Character:FindFirstChild("Humanoid")
+        or Character.Humanoid.Health <= 0 or not HumanoidRootPart then
+        StopTween()
+        return
+    end
+
+    if Position == false then
+        StopTween()
+        return
+    end
+    if not Position then return end
+
+    -- Chuan hoa ve CFrame + clamp Y toi thieu 5
     Position = typeof(Position) ~= "CFrame" and ConvertTo(CFrame, Position) or Position
     if typeof(Position) == "CFrame" then
         local p = Position.p
         Position = CFrame.new(p.X, math.max(p.Y, 5), p.Z)
     end
-    local dist = CaculateDistance(HumanoidRootPart.CFrame, Position)
+
+    local root = HumanoidRootPart
+    local dist = (Position.Position - root.Position).Magnitude
+
+    -- Khoang gan -> teleport tuc thi (muot cho combat/circle, khong tao ghost)
+    if dist <= 200 then
+        StopTween()
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+        root.CFrame = Position
+        return
+    end
+
+    -- Dang co tween dai chay -> bo qua de tranh giut (giong V3)
+    if IsTweening then return end
+    IsTweening = true
+
+    local ghost = Instance.new("Part")
+    ghost.Name = "TweenGhost"
+    ghost.Transparency = 1
+    ghost.Anchored = true
+    ghost.CanCollide = false
+    ghost.Size = Vector3.new(4, 4, 4)
+    ghost.CFrame = root.CFrame
+    ghost.Parent = workspace
+    TweenGhost = ghost
+
     TweenInstance = TweenService:Create(
-        HumanoidRootPart,
-        TweenInfo.new(dist / (dist < 18 and 25 or 330), Enum.EasingStyle.Linear),
+        ghost,
+        TweenInfo.new(dist / 330, Enum.EasingStyle.Linear),
         { CFrame = Position }
     )
+
+    TweenConn = RunService.Heartbeat:Connect(function()
+        if root and root.Parent and ghost and ghost.Parent then
+            pcall(function()
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+                root.CFrame = ghost.CFrame
+            end)
+        end
+    end)
+
+    TweenInstance.Completed:Connect(function()
+        StopTween()
+    end)
+
     TweenInstance:Play()
 end
 
@@ -1336,8 +1376,8 @@ local function DoMirageBlueGear()
         if Config["Hop Mirage"] then
             SetStatus("Khong co Mirage -> Hop Mirage API")
             if not HopMirageByAPI() then
-                SetStatus("Mirage API failed -> fallback WrapToServer")
-                WrapToServer("Mirage")
+                SetStatus("Mirage API rong -> fallback Hop __ServerBrowser")
+                Hop("Mirage API empty")
             end
         else
             SetStatus("Khong co Mirage (Hop Mirage = false)")
@@ -1373,8 +1413,8 @@ local function DoMirageBlueGear()
         SetStatus("Sai gio trong ngay -> Hop Mirage API")
         if Config["Hop Mirage"] then
             if not HopMirageByAPI() then
-                SetStatus("Mirage API failed -> fallback WrapToServer")
-                WrapToServer("Mirage")
+                SetStatus("Mirage API rong -> fallback Hop __ServerBrowser")
+                Hop("Mirage API empty")
             end
         end
     end
