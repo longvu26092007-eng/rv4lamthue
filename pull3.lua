@@ -1394,7 +1394,10 @@ if Config["Black Screen"] then
         local gui = game:GetService("CoreGui")
         local players = LocalPlayer:FindFirstChild("PlayerGui")
         if players then
-            pcall(function() players:FindFirstChild("Main") and players.Main.Enabled = false end)
+            pcall(function()
+                local m = players:FindFirstChild("Main")
+                if m then m.Enabled = false end
+            end)
         end
     end)
 end
