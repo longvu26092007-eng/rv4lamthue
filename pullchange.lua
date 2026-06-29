@@ -22,6 +22,17 @@ local LocalPlayer = Players.LocalPlayer
 local CHECK_INTERVAL = 5   -- giay giua 2 lan check lever
 local SEA_INTERVAL   = 15  -- giay giua 2 lan detect sea
 
+--============================================================
+-- CONFIG DOI FOLDER SAU KHI COMPLETED-PULL
+--============================================================
+getgenv().ChangeFolderOnCompleted = getgenv().ChangeFolderOnCompleted ~= false
+getgenv().id1 = getgenv().id1 or "........."
+getgenv().id2 = getgenv().id2 or "........."
+-- id3 optional, neu khong set mac dinh la nil that
+if getgenv().id3 == nil then
+    -- giu nguyen nil
+end
+
 -- PlaceId Sea 3 (Third Sea - noi co Mirage / can gat). Lay tu Auto.lua:66-69
 local THIRD_SEA_PLACES = {
     [7449423635]      = true,
@@ -57,6 +68,95 @@ local function IsLeverDone()
     return res == true
 end
 
+--============================================================
+-- DOI FOLDER SAU KHI COMPLETED-PULL
+--============================================================
+local _changedFolder = false
+
+local function NormalizeFolderId(value, allowNil)
+    if value == nil then
+        return nil, allowNil
+    end
+
+    local s = tostring(value)
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+
+    if s == "" or s == "........." or s:match("^%.+$") or s:lower() == "nil" then
+        return nil, allowNil
+    end
+
+    return s, true
+end
+
+local function ChangeFolderAfterCompleted(reason)
+    if _changedFolder then
+        return false
+    end
+
+    if getgenv().ChangeFolderOnCompleted == false then
+        warn("[changepull] ChangeFolderOnCompleted = false -> bo qua doi folder")
+        return false
+    end
+
+    if not getgenv().client then
+        warn("[changepull] getgenv().client chua duoc set -> bo qua doi folder")
+        return false
+    end
+
+    if typeof(getgenv().client.ChangeToFolder) ~= "function" then
+        warn("[changepull] client.ChangeToFolder khong ton tai -> bo qua doi folder")
+        return false
+    end
+
+    local id1, ok1 = NormalizeFolderId(getgenv().id1, false)
+    local id2, ok2 = NormalizeFolderId(getgenv().id2, false)
+    local id3      = NormalizeFolderId(getgenv().id3, true)
+
+    if not ok1 or not ok2 then
+        warn("[changepull] id1/id2 bat buoc nhung dang rong -> bo qua doi folder")
+        return false
+    end
+
+    _changedFolder = true
+
+    warn(("[changepull] %s -> ChangeToFolder(id1=%s, id2=%s, id3=%s)"):format(
+        tostring(reason or "Completed-pull"),
+        tostring(id1),
+        tostring(id2),
+        id3 == nil and "nil" or tostring(id3)
+    ))
+
+    local ok, changed = pcall(function()
+        return getgenv().client:ChangeToFolder(id1, id2, true, id3)
+    end)
+
+    if not ok then
+        warn("[changepull] ChangeToFolder loi: " .. tostring(changed))
+        _changedFolder = false
+        return false
+    end
+
+    if changed then
+        warn("[changepull] Doi folder thanh cong, disconnect + shutdown de apply")
+
+        pcall(function()
+            getgenv().client:Disconnect()
+        end)
+
+        task.wait(5)
+
+        pcall(function()
+            game:Shutdown()
+        end)
+
+        return true
+    end
+
+    warn("[changepull] ChangeToFolder tra ve false")
+    _changedFolder = false
+    return false
+end
+
 -- Ghi file "<PlayerName>.txt" = "Completed-pull" vao workspace executor (chi ghi 1 lan)
 local _savedPullFile = false
 local function SavePullFile()
@@ -70,6 +170,8 @@ local function SavePullFile()
     if ok then
         _savedPullFile = true
         print("[changepull] Da ghi file: " .. fileName .. " (Completed-pull)")
+
+        ChangeFolderAfterCompleted("Completed-pull")
     else
         warn("[changepull] Ghi file that bai: " .. fileName)
     end
