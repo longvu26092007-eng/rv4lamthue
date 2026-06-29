@@ -460,52 +460,16 @@ do
     local raceLabels = {}
 
     local function GetUnlockedRaces()
-        local unlockedV3 = {}
-        local added = {}
+        local unlockedMap = GetUnlockedV3Map()
+        local unlockedList = {}
 
-        local function addRace(raceVer)
-            if not raceVer or added[raceVer] or not string.find(raceVer, "V3") then
-                return
-            end
-            added[raceVer] = true
-            table.insert(unlockedV3, raceVer)
-        end
-
-        local ok, titles = pcall(function()
-            return ReplicatedStorage.Remotes.CommF_:InvokeServer("getTitles")
-        end)
-
-        if ok and type(titles) == "table" then
-            for _, t in pairs(titles) do
-                local name = t.Name or t[1]
-                local unlockedValue = nil
-
-                if t.Unlocked ~= nil then
-                    unlockedValue = t.Unlocked
-                elseif t.unlocked ~= nil then
-                    unlockedValue = t.unlocked
-                else
-                    unlockedValue = t[2]
-                end
-
-                if name and raceTitles[name] and IsTitleUnlockedValue(unlockedValue) then
-                    addRace(raceTitles[name])
-                end
+        for raceV3, has in pairs(unlockedMap) do
+            if has then
+                table.insert(unlockedList, raceV3)
             end
         end
 
-        local titlesFolder = plr:FindFirstChild("Titles")
-        if titlesFolder then
-            for _, inst in ipairs(titlesFolder:GetChildren()) do
-                if raceTitles[inst.Name] then
-                    if IsTitleUnlockedValue(inst.Value) then
-                        addRace(raceTitles[inst.Name])
-                    end
-                end
-            end
-        end
-
-        return unlockedV3
+        return unlockedList
     end
 
     local function createRaceLabel(raceName, order)
@@ -1336,6 +1300,22 @@ local raceTitlesV3 = {
     ["Ancient Flame"] = "Draco V3",
 }
 
+local raceUnlockTextV3 = {
+    Human = {"Unlock Human V3."},
+    Mink = {"Unlock Mink V3.", "Unlock Rabbit V3."},
+    Rabbit = {"Unlock Mink V3.", "Unlock Rabbit V3."},
+
+    Fishman = {"Unlock Fishman V3.", "Unlock Shark V3."},
+    Shark = {"Unlock Fishman V3.", "Unlock Shark V3."},
+
+    Skypiea = {"Unlock Skypiea V3.", "Unlock Angel V3."},
+    Angel = {"Unlock Skypiea V3.", "Unlock Angel V3."},
+
+    Ghoul = {"Unlock Ghoul V3."},
+    Cyborg = {"Unlock Cyborg V3."},
+    Draco = {"Unlock Draco V3."},
+}
+
 local raceNameToV3 = {
     Human = "Human V3",
     Mink = "Rabbit V3",
@@ -1367,63 +1347,96 @@ local function NormalizeRaceName(name)
     return raceAlias[s] or tostring(name or "")
 end
 
-local function IsTitleUnlockedValue(value)
-    if value == true or value == 1 then
-        return true
-    end
+local lastTitleScanAt = 0
+local cachedUnlockedV3Map = {}
 
-    if value == false or value == 0 or value == nil then
+local function ScanTitlesGuiTexts()
+    local foundTexts = {}
+
+    pcall(function()
+        COMMF_:InvokeServer("getTitles")
+    end)
+
+    pcall(function()
+        local m = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("Main")
+        if m and m:FindFirstChild("Titles") then
+            m.Titles.Visible = true
+        end
+    end)
+
+    task.wait(1)
+
+    pcall(function()
+        local m = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("Main")
+        if m and m:FindFirstChild("Titles") then
+            local tf = m.Titles
+            for _, d in pairs(tf:GetDescendants()) do
+                if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text and d.Text ~= "" then
+                    local text = tostring(d.Text)
+                    foundTexts[text] = true
+                end
+            end
+        end
+    end)
+
+    pcall(function()
+        local m = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("Main")
+        if m and m:FindFirstChild("Titles") then
+            m.Titles.Visible = false
+        end
+    end)
+
+    return foundTexts
+end
+
+local function HasAnyTitleText(foundTexts, wantedList)
+    if type(wantedList) ~= "table" then
         return false
     end
 
-    local s = tostring(value):lower()
-    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    for _, wanted in ipairs(wantedList) do
+        if foundTexts[wanted] then
+            return true
+        end
+    end
 
-    return s == "true"
-        or s == "1"
-        or s == "yes"
-        or s == "owned"
-        or s == "unlocked"
+    for text, _ in pairs(foundTexts) do
+        for _, wanted in ipairs(wantedList) do
+            if text == wanted or text:find(wanted, 1, true) then
+                return true
+            end
+        end
+    end
+
+    return false
 end
 
 local function GetUnlockedV3Map()
+    if tick() - lastTitleScanAt <= 8 then
+        return cachedUnlockedV3Map
+    end
+
+    lastTitleScanAt = tick()
+
     local unlocked = {}
+    local foundTexts = ScanTitlesGuiTexts()
 
-    local function mark(titleName, unlockedValue)
-        local raceV3 = titleName and raceTitlesV3[titleName]
-        if raceV3 and IsTitleUnlockedValue(unlockedValue) then
-            unlocked[raceV3] = true
+    local function markRace(raceName, raceV3Name)
+        local texts = raceUnlockTextV3[raceName]
+        if texts and HasAnyTitleText(foundTexts, texts) then
+            unlocked[raceV3Name] = true
         end
     end
 
-    local ok, titles = pcall(function()
-        return COMMF_:InvokeServer("getTitles")
-    end)
+    markRace("Human", "Human V3")
+    markRace("Mink", "Rabbit V3")
+    markRace("Fishman", "Shark V3")
+    markRace("Skypiea", "Angel V3")
+    markRace("Ghoul", "Ghoul V3")
+    markRace("Cyborg", "Cyborg V3")
+    markRace("Draco", "Draco V3")
 
-    if ok and type(titles) == "table" then
-        for _, t in pairs(titles) do
-            local titleName = t.Name or t.Title or t[1]
-            local unlockedValue = nil
-
-            if t.Unlocked ~= nil then
-                unlockedValue = t.Unlocked
-            elseif t.unlocked ~= nil then
-                unlockedValue = t.unlocked
-            else
-                unlockedValue = t[2]
-            end
-
-            mark(titleName, unlockedValue)
-        end
-    end
-
-    local titlesFolder = LocalPlayer:FindFirstChild("Titles")
-    if titlesFolder then
-        for _, inst in ipairs(titlesFolder:GetChildren()) do
-            mark(inst.Name, inst.Value)
-        end
-    end
-
+    cachedUnlockedV3Map = unlocked
     return unlocked
 end
 
