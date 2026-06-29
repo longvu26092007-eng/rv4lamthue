@@ -1398,11 +1398,24 @@ local function HasAnyTitleText(foundTexts, wantedList)
         if foundTexts[wanted] then
             return true
         end
+        local stripped = wanted
+        if stripped:sub(-1) == "." then
+            stripped = stripped:sub(1, -2)
+        end
+        if foundTexts[stripped] then
+            return true
+        end
     end
 
     for text, _ in pairs(foundTexts) do
         for _, wanted in ipairs(wantedList) do
-            if text == wanted or text:find(wanted, 1, true) then
+            local stripped = wanted
+            if stripped:sub(-1) == "." then
+                stripped = stripped:sub(1, -2)
+            end
+            if text == wanted or text == stripped
+                or text:find(wanted, 1, true)
+                or text:find(stripped, 1, true) then
                 return true
             end
         end
