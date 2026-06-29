@@ -201,7 +201,10 @@ local function RefreshCharacter()
     Humanoid         = Character:WaitForChild("Humanoid")
     HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
 end
-RefreshCharacter()
+-- KHONG goi RefreshCharacter() o day! Chua chon team => CHUA co Character =>
+-- CharacterAdded:Wait() se block main thread vinh vien => khong bao gio chay toi
+-- ChooseTeam => ket "load team". Chi connect cho respawn ve sau; RefreshCharacter()
+-- that su duoc goi SAU khi da chon team + co Character (phia duoi).
 LocalPlayer.CharacterAdded:Connect(function() RefreshCharacter() end)
 
 -- Choose team: remote SetTeam + fallback click nut UI bang VirtualInputManager
@@ -245,6 +248,13 @@ local function ChooseTeam()
             task.wait(1)
             SetStatus("LoadingScreen still present...")
         until not LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
+    end
+
+    -- Doi DataLoaded de SetTeam khong bi server bo qua (giong sida), cho toi da 10s
+    if not LocalPlayer:FindFirstChild("DataLoaded") then
+        SetStatus("Waiting DataLoaded...")
+        local t0 = tick()
+        repeat task.wait(0.3) until LocalPlayer:FindFirstChild("DataLoaded") or (tick() - t0) > 10
     end
 
     -- Retry ben bi: moi vong vua goi remote SetTeam, vua click nut UI
@@ -294,6 +304,7 @@ SetStatus("Waiting character...")
 repeat
     task.wait(0.5)
 until LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+RefreshCharacter()  -- gio moi populate Character/Humanoid/HumanoidRootPart (da co Character that su)
 SetStatus("Character ready")
 
 SetStatus("Waiting Data/Race...")
