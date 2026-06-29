@@ -478,8 +478,17 @@ do
         if ok and type(titles) == "table" then
             for _, t in pairs(titles) do
                 local name = t.Name or t[1]
-                local unlockedValue = tostring(t.Unlocked or t[2] or ""):lower()
-                if name and raceTitles[name] and (unlockedValue == "true" or unlockedValue == "1" or string.find(unlockedValue, "unlock")) then
+                local unlockedValue = nil
+
+                if t.Unlocked ~= nil then
+                    unlockedValue = t.Unlocked
+                elseif t.unlocked ~= nil then
+                    unlockedValue = t.unlocked
+                else
+                    unlockedValue = t[2]
+                end
+
+                if name and raceTitles[name] and IsTitleUnlockedValue(unlockedValue) then
                     addRace(raceTitles[name])
                 end
             end
@@ -489,8 +498,7 @@ do
         if titlesFolder then
             for _, inst in ipairs(titlesFolder:GetChildren()) do
                 if raceTitles[inst.Name] then
-                    local valueText = tostring(inst.Value):lower()
-                    if valueText == "true" or valueText == "1" or string.find(valueText, "unlock") then
+                    if IsTitleUnlockedValue(inst.Value) then
                         addRace(raceTitles[inst.Name])
                     end
                 end
@@ -1359,13 +1367,31 @@ local function NormalizeRaceName(name)
     return raceAlias[s] or tostring(name or "")
 end
 
+local function IsTitleUnlockedValue(value)
+    if value == true or value == 1 then
+        return true
+    end
+
+    if value == false or value == 0 or value == nil then
+        return false
+    end
+
+    local s = tostring(value):lower()
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+
+    return s == "true"
+        or s == "1"
+        or s == "yes"
+        or s == "owned"
+        or s == "unlocked"
+end
+
 local function GetUnlockedV3Map()
     local unlocked = {}
 
     local function mark(titleName, unlockedValue)
         local raceV3 = titleName and raceTitlesV3[titleName]
-        local value = tostring(unlockedValue or ""):lower()
-        if raceV3 and (value == "true" or value == "1" or value:find("unlock")) then
+        if raceV3 and IsTitleUnlockedValue(unlockedValue) then
             unlocked[raceV3] = true
         end
     end
@@ -1376,19 +1402,25 @@ local function GetUnlockedV3Map()
 
     if ok and type(titles) == "table" then
         for _, t in pairs(titles) do
-            mark(t.Name or t[1], t.Unlocked or t[2])
+            local titleName = t.Name or t.Title or t[1]
+            local unlockedValue = nil
+
+            if t.Unlocked ~= nil then
+                unlockedValue = t.Unlocked
+            elseif t.unlocked ~= nil then
+                unlockedValue = t.unlocked
+            else
+                unlockedValue = t[2]
+            end
+
+            mark(titleName, unlockedValue)
         end
     end
 
     local titlesFolder = LocalPlayer:FindFirstChild("Titles")
     if titlesFolder then
         for _, inst in ipairs(titlesFolder:GetChildren()) do
-            local okValue, valueText = pcall(function()
-                return tostring(inst.Value):lower()
-            end)
-            if okValue then
-                mark(inst.Name, valueText)
-            end
+            mark(inst.Name, inst.Value)
         end
     end
 
