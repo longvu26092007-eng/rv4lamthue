@@ -204,7 +204,33 @@ end
 RefreshCharacter()
 LocalPlayer.CharacterAdded:Connect(function() RefreshCharacter() end)
 
--- Choose team (pattern y het Source_SG)
+-- Choose team: remote SetTeam + fallback click nut UI bang VirtualInputManager
+-- (path UI that: PlayerGui.Main.ChooseTeam.Container[Team].Frame.TextButton)
+local function ClickTeamButton(teamName)
+    pcall(function()
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        local main = pg and pg:FindFirstChild("Main")
+        local choose = main and main:FindFirstChild("ChooseTeam")
+        local container = choose and choose:FindFirstChild("Container")
+        local teamFrame = container and container:FindFirstChild(teamName)
+        if not teamFrame then return end
+
+        -- Tim TextButton (qua Frame neu co, hoac quet truc tiep)
+        local btn = (teamFrame:FindFirstChild("Frame") and teamFrame.Frame:FindFirstChildWhichIsA("TextButton"))
+            or teamFrame:FindFirstChildWhichIsA("TextButton", true)
+        if not btn then return end
+
+        local x = btn.AbsolutePosition.X + btn.AbsoluteSize.X / 2
+        local y = btn.AbsolutePosition.Y + btn.AbsoluteSize.Y / 2
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        task.wait(0.1)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+
+        -- Fallback phu: firesignal Activated neu executor ho tro
+        pcall(function() firesignal(btn.Activated) end)
+    end)
+end
+
 local function ChooseTeam()
     local teamName = tostring(Config["Team"] or "Pirates")
 
@@ -221,7 +247,7 @@ local function ChooseTeam()
         until not LocalPlayer.PlayerGui:FindFirstChild("LoadingScreen")
     end
 
-    -- Retry ben bi: moi vong vua goi remote SetTeam, vua fallback firesignal nut
+    -- Retry ben bi: moi vong vua goi remote SetTeam, vua click nut UI
     for attempt = 1, 30 do
         if LocalPlayer.Team then
             SetStatus("Team selected: " .. tostring(LocalPlayer.Team.Name))
@@ -230,14 +256,16 @@ local function ChooseTeam()
 
         SetStatus("Choose team attempt " .. tostring(attempt) .. " -> " .. teamName)
 
-        xpcall(function()
+        -- 1) Remote chinh
+        local ok, err = pcall(function()
             ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_"):InvokeServer("SetTeam", teamName)
-        end, function(err)
-            DebugStatus("SetTeam remote error", err)
-            pcall(function()
-                firesignal(LocalPlayer.PlayerGui["Main (minimal)"].ChooseTeam.Container[teamName].Activated)
-            end)
         end)
+        if not ok then
+            DebugStatus("SetTeam remote error", err)
+        end
+
+        -- 2) Fallback: click nut chon team tren UI
+        ClickTeamButton(teamName)
 
         task.wait(1.5)
     end
@@ -251,9 +279,14 @@ local function ChooseTeam()
     return false
 end
 
--- Khong hard-stop neu chua set duoc Team ngay: van di tiep cho character
--- (giong Source_SG, viec cho character moi la cong chan that su)
-if not ChooseTeam() then
+-- Chay ChooseTeam o luong rieng (khong chan main), van retry nen toi 45s.
+-- Main chi cho toi da 15s roi di tiep cho character.
+task.spawn(ChooseTeam)
+do
+    local t = tick()
+    repeat task.wait(0.5) until LocalPlayer.Team ~= nil or (tick() - t) > 15
+end
+if not LocalPlayer.Team then
     SetStatus("ChooseTeam chua set Team -> van cho character...")
 end
 
