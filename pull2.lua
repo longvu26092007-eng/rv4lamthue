@@ -10,6 +10,27 @@ if not LPH_OBFUSCATED then
     LPH_NO_VIRTUALIZE = LPH_NO_VIRTUALIZE or function(...) return ... end
 end
 
+-----------------------------------------------------------------------------------
+-- 0. CONFIG
+-----------------------------------------------------------------------------------
+getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
+    ["Enabled"]            = true,
+    ["Team"]               = "Pirates",
+    ["Allowed Races"]      = {"Mink", "Human", "Skypiea", "Fishman"},
+    ["Auto Roll Race"]     = false,
+    ["Use Server API"]     = true,
+    ["Hop Mirage"]         = true,
+    ["Boost FPS"]          = true,
+    ["FPS"]                = 20,
+    ["Black Screen"]       = true,
+
+    -- Mirage API (server noi co Mirage dang spawn)
+    ["Use Mirage API"]     = true,
+    ["Mirage API"]         = "http://fi12.bot-hosting.cloud:20112/api/name=mirage",
+    ["Avoid Full Server"]  = true,
+    ["Max Players"]        = 11,
+}
+
 LPH_NO_VIRTUALIZE(function()
 
 -----------------------------------------------------------------------------------
@@ -18,12 +39,24 @@ LPH_NO_VIRTUALIZE(function()
 local PlayerGui
 local _statusLabel, _raceLabel, _seaLabel, _mirrorLabel, _valkLabel, _doorLabel, _progressLabel
 
+local _lastStatus = ""
+
 local function SetStatus(text)
     text = tostring(text or "")
+    _lastStatus = text
+
     print("[PullLever] " .. text)
+
     if _statusLabel then
         _statusLabel.Text = "Status: " .. text
     end
+end
+
+-- Hien loi ro rang len UI + warn (khong pcall im lang)
+local function DebugStatus(tag, err)
+    local msg = "[" .. tostring(tag) .. "] " .. tostring(err)
+    warn("[PullLever] " .. msg)
+    SetStatus(msg)
 end
 
 local function MakeUI()
@@ -109,15 +142,35 @@ end
 -----------------------------------------------------------------------------------
 -- 2. WAIT LOAD + SET TEAM
 -----------------------------------------------------------------------------------
+-- Default config an toan: neu nguoi dung quen config ngoai thi khong loi nil,
+-- neu co config ngoai thi van uu tien config ngoai.
+getgenv().PullLeverConfig = getgenv().PullLeverConfig or {}
+
 local Config = getgenv().PullLeverConfig
 
+Config["Enabled"]           = Config["Enabled"] ~= false
+Config["Team"]              = Config["Team"] or "Pirates"
+Config["Allowed Races"]     = Config["Allowed Races"] or {"Mink", "Human", "Skypiea", "Fishman"}
+Config["Auto Roll Race"]    = Config["Auto Roll Race"] or false
+Config["Use Server API"]    = Config["Use Server API"] ~= false
+Config["Hop Mirage"]        = Config["Hop Mirage"] ~= false
+Config["Use Mirage API"]    = Config["Use Mirage API"] ~= false
+Config["Mirage API"]        = Config["Mirage API"] or "http://fi12.bot-hosting.cloud:20112/api/name=mirage"
+Config["Avoid Full Server"] = Config["Avoid Full Server"] ~= false
+Config["Max Players"]       = Config["Max Players"] or 11
+Config["Boost FPS"]         = Config["Boost FPS"] ~= false
+Config["FPS"]               = Config["FPS"] or 20
+Config["Black Screen"]      = Config["Black Screen"] or false
+
+SetStatus("Waiting game loaded...")
 if not game:IsLoaded() then
-    repeat task.wait() until game:IsLoaded()
+    repeat task.wait(0.5) until game:IsLoaded()
 end
+SetStatus("Game loaded")
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TeleportService   = game:GetService("TeleportService")
+-- (TeleportService da duoc loai bo: hop server dung __ServerBrowser)
 local Workspace         = game:GetService("Workspace")
 local Lighting          = game:GetService("Lighting")
 local RunService        = game:GetService("RunService")
@@ -131,6 +184,19 @@ local StarterPlayer     = game:GetService("StarterPlayer")
 local LocalPlayer = Players.LocalPlayer
 local Character, Humanoid, HumanoidRootPart
 
+-- Tao UI som de moi buoc loading / choose team deu thay status debug
+SetStatus("Creating UI...")
+pcall(MakeUI)
+SetStatus("UI ready")
+
+SetStatus("Waiting PlayerGui...")
+PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 30)
+if not PlayerGui then
+    SetStatus("PlayerGui timeout")
+else
+    SetStatus("PlayerGui ready")
+end
+
 local function RefreshCharacter()
     Character        = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
     Humanoid         = Character:WaitForChild("Humanoid")
@@ -139,18 +205,119 @@ end
 RefreshCharacter()
 LocalPlayer.CharacterAdded:Connect(function() RefreshCharacter() end)
 
--- Set team lap lai den khi co character
-local function SetTeam()
-    pcall(function()
-        ReplicatedStorage.Remotes.CommF_:InvokeServer("SetTeam", Config["Team"] or "Pirates")
-    end)
-end
-repeat
-    SetTeam()
-    task.wait(1)
-until LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+-- Tim nut chon team trong GUI (ho tro ca "Main (minimal)" va "Main")
+local function GetChooseTeamButton(teamName)
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pg then return nil end
 
-repeat task.wait(1) until LocalPlayer:FindFirstChild("Data") and LocalPlayer.Data:FindFirstChild("Race")
+    local mainMinimal = pg:FindFirstChild("Main (minimal)")
+    if mainMinimal
+        and mainMinimal:FindFirstChild("ChooseTeam")
+        and mainMinimal.ChooseTeam:FindFirstChild("Container")
+    then
+        return mainMinimal.ChooseTeam.Container:FindFirstChild(teamName)
+    end
+
+    local main = pg:FindFirstChild("Main")
+    if main
+        and main:FindFirstChild("ChooseTeam")
+        and main.ChooseTeam:FindFirstChild("Container")
+    then
+        return main.ChooseTeam.Container:FindFirstChild(teamName)
+    end
+
+    return nil
+end
+
+-- Choose team chac chan hon: vua goi remote SetTeam vua firesignal nut, retry 20 lan
+local function ChooseTeam()
+    local teamName = tostring(Config["Team"] or "Pirates")
+
+    if LocalPlayer.Team then
+        SetStatus("Team already selected: " .. tostring(LocalPlayer.Team.Name))
+        return true
+    end
+
+    SetStatus("Waiting loading screen...")
+    pcall(function()
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        if pg and pg:FindFirstChild("LoadingScreen") then
+            repeat
+                task.wait(1)
+                SetStatus("Waiting LoadingScreen removed...")
+            until not pg:FindFirstChild("LoadingScreen")
+        end
+    end)
+
+    for attempt = 1, 20 do
+        if LocalPlayer.Team then
+            SetStatus("Team selected: " .. tostring(LocalPlayer.Team.Name))
+            return true
+        end
+
+        SetStatus("Choose team attempt " .. tostring(attempt) .. " -> " .. teamName)
+
+        local okRemote, errRemote = pcall(function()
+            ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_"):InvokeServer("SetTeam", teamName)
+        end)
+
+        if not okRemote then
+            DebugStatus("SetTeam remote error", errRemote)
+        end
+
+        task.wait(0.5)
+
+        if not LocalPlayer.Team then
+            local btn = GetChooseTeamButton(teamName)
+            if btn then
+                local okClick, errClick = pcall(function()
+                    firesignal(btn.Activated)
+                end)
+
+                if not okClick then
+                    okClick, errClick = pcall(function()
+                        firesignal(btn.MouseButton1Click)
+                    end)
+                end
+
+                if not okClick then
+                    DebugStatus("ChooseTeam firesignal error", errClick)
+                else
+                    SetStatus("ChooseTeam button fired")
+                end
+            else
+                SetStatus("ChooseTeam button not found")
+            end
+        end
+
+        task.wait(1)
+    end
+
+    if LocalPlayer.Team then
+        SetStatus("Team selected after retry: " .. tostring(LocalPlayer.Team.Name))
+        return true
+    end
+
+    SetStatus("Choose team failed after retries")
+    return false
+end
+
+if not ChooseTeam() then
+    SetStatus("ChooseTeam failed, script stopped")
+    return
+end
+
+SetStatus("Waiting character...")
+repeat
+    task.wait(0.5)
+until LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+SetStatus("Character ready")
+
+SetStatus("Waiting Data/Race...")
+repeat
+    task.wait(1)
+until LocalPlayer:FindFirstChild("Data") and LocalPlayer.Data:FindFirstChild("Race")
+SetStatus("Data/Race ready: " .. tostring(LocalPlayer.Data.Race.Value))
 
 -----------------------------------------------------------------------------------
 -- 3. REMOTES WRAPPER (CommF_ log warning de debug)
@@ -378,6 +545,10 @@ local function Hop(Reason)
     end)
 end
 
+-- Forward declare de WrapToServer (dinh nghia phia tren) co the goi duoc
+-- Ham that dinh nghia phia duoi (sau WrapToServer).
+local JoinJobIdByServerBrowser
+
 local function WrapToServer(Category, Filter, IgnoreHop)
     print("[PullLever] WrapToServer: " .. tostring(Category))
     local List = AsynclyPullServerDatas(Category)
@@ -387,9 +558,12 @@ local function WrapToServer(Category, Filter, IgnoreHop)
         if Server and not Storage:Get(Server.JobId) and Server.Players ~= "12/12" then
             if (not Filter or Filter(Server)) and Server.PlaceId == game.PlaceId then
                 Storage:Set(Server.JobId, true)
-                TeleportService:TeleportToPlaceInstance(game.PlaceId, Server.JobId, LocalPlayer)
-                task.wait(5)
-                return true
+
+                local joined = JoinJobIdByServerBrowser(Server.JobId)
+                if joined then
+                    task.wait(5)
+                    return true
+                end
             end
         end
     end
@@ -528,7 +702,7 @@ local JoinedMirageJobs = {}
 
 -- Join JobId bang __ServerBrowser (y het file goc sida)
 -- KHONG dung TeleportService vi no se kick player ra menu trong 1 so truong hop.
-local function JoinJobIdByServerBrowser(jobId)
+JoinJobIdByServerBrowser = function(jobId)
     if not jobId or tostring(jobId) == "" then
         warn("[ServerBrowser] JobId rỗng -> bỏ qua")
         return false
@@ -1014,7 +1188,7 @@ function UpgradeRaceV3()
                 repeat
                     task.wait()
                     TweenTo(chest.CFrame + Vector3.new(0, math.random(-2, 2), 0))
-                until (not chest:CanTouch or not chest.Parent)
+                until (not chest.Parent) or (not chest.CanTouch)
                 total = total + 1; task.wait(2)
             else
                 task.wait(1)
@@ -1124,7 +1298,9 @@ local function IsTempleDoorOpened()
     return ok and v == true
 end
 local function IsCurrentRaceV3()
-    local ok, v = pcall(function() return CommF_:InvokeServer("Wenlocktoad", "1") end)
+    local ok, v = pcall(function()
+        return CommF_:InvokeServer("Wenlocktoad", "3")
+    end)
     return ok and v == -2
 end
 local function IsRaceV4ProgressReady()
