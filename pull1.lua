@@ -10,27 +10,6 @@ if not LPH_OBFUSCATED then
     LPH_NO_VIRTUALIZE = LPH_NO_VIRTUALIZE or function(...) return ... end
 end
 
------------------------------------------------------------------------------------
--- 0. CONFIG
------------------------------------------------------------------------------------
-getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
-    ["Enabled"]            = true,
-    ["Team"]               = "Pirates",
-    ["Allowed Races"]      = {"Mink", "Human", "Skypiea", "Fishman"},
-    ["Auto Roll Race"]     = false,
-    ["Use Server API"]     = true,
-    ["Hop Mirage"]         = true,
-    ["Boost FPS"]          = true,
-    ["FPS"]                = 20,
-    ["Black Screen"]       = true,
-
-    -- Mirage API (server noi co Mirage dang spawn)
-    ["Use Mirage API"]     = true,
-    ["Mirage API"]         = "http://fi12.bot-hosting.cloud:20112/api/name=mirage",
-    ["Avoid Full Server"]  = true,
-    ["Max Players"]        = 11,
-}
-
 LPH_NO_VIRTUALIZE(function()
 
 -----------------------------------------------------------------------------------
