@@ -36,7 +36,7 @@ LPH_NO_VIRTUALIZE(function()
 -- 1. STATUS / UI nho
 -----------------------------------------------------------------------------------
 local PlayerGui
-local _statusLabel, _raceLabel, _seaLabel, _mirrorLabel, _valkLabel, _doorLabel, _progressLabel
+local _statusLabel, _raceLabel, _seaLabel, _mirrorLabel, _valkLabel, _doorLabel, _progressLabel, _mirageLabel
 
 local _lastStatus = ""
 
@@ -75,7 +75,7 @@ local function MakeUI()
     gui.Parent = parent
 
     local main = Instance.new("Frame")
-    main.Size = UDim2.new(0, 240, 0, 150)
+    main.Size = UDim2.new(0, 240, 0, 184)
     main.Position = UDim2.new(0, 20, 0, 220)
     main.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
     main.BorderSizePixel = 0
@@ -132,8 +132,9 @@ local function MakeUI()
     _raceLabel    = row(3); _raceLabel.Text    = "Race: ?"
     _mirrorLabel  = row(4); _mirrorLabel.Text  = "Mirror Fractal: ?"
     _valkLabel    = row(5); _valkLabel.Text    = "Valkyrie Helm: ?"
-    _doorLabel    = row(6); _doorLabel.Text    = "Temple Door: ?"
-    _progressLabel = row(7); _progressLabel.Text = "RaceV4 Check: ?"
+    _mirageLabel  = row(6); _mirageLabel.Text  = "Mirage Island: ?"
+    _doorLabel    = row(7); _doorLabel.Text    = "Temple Door: ?"
+    _progressLabel = row(8); _progressLabel.Text = "RaceV4 Check: ?"
 
     _G.__PullLeverUIBuilt = true
 end
@@ -1327,6 +1328,10 @@ function GetBlueGear()
     return nil
 end
 
+-- Detect Mirage (MysticIsland) co spawn tren server hien tai khong (giong sida)
+local function HasMirageIsland()
+    return (workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("MysticIsland")) ~= nil
+end
 local function HasMirrorFractal()
     return ConChoChisiti36.Backpack["Mirror Fractal"] ~= nil
 end
@@ -1461,6 +1466,17 @@ local function UIUpdateTick()
     _raceLabel.Text    = "Race: " .. tostring(ConChoChisiti36.PlayerData.Race or "?")
     _mirrorLabel.Text  = "Mirror Fractal: "  .. (HasMirrorFractal() and "YES" or "NO")
     _valkLabel.Text    = "Valkyrie Helm: "   .. (HasValkyrieHelm()   and "YES" or "NO")
+    do
+        local mi = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("MysticIsland")
+        if mi then
+            local okd, dist = pcall(function()
+                return math.floor(CaculateDistance(mi:GetModelCFrame()))
+            end)
+            _mirageLabel.Text = "Mirage Island: YES (" .. (okd and tostring(dist) or "?") .. " studs)"
+        else
+            _mirageLabel.Text = "Mirage Island: NO"
+        end
+    end
     local ok, door = pcall(function() return CommF_:InvokeServer("CheckTempleDoor") end)
     _doorLabel.Text    = "Temple Door: "     .. (ok and tostring(door) or "?")
     local ok2, prog = pcall(function() return CommF_:InvokeServer("RaceV4Progress", "Check") end)
