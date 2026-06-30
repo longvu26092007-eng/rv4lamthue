@@ -1414,7 +1414,11 @@ do
             pcall(function() Movement.haki() end)
         end
         local hrp = target and target:FindFirstChild("HumanoidRootPart")
-        if hrp then pcall(function() topos(hrp.CFrame * _atkOff) end) end
+        -- CHỈ tween khi mục tiêu trong tầm hợp lý (<=2000). Mục tiêu xa hơn → KHÔNG đuổi,
+        -- tránh topos() chạm ngưỡng tự sát (>2500 & gần đền) làm MAIN tự chết khi tween.
+        if hrp and Movement.getdis(hrp.CFrame) <= 2000 then
+            pcall(function() topos(hrp.CFrame * _atkOff) end)
+        end
     end
 
     -- weapon / spam-skills (File A 2039-2123)
@@ -1645,7 +1649,8 @@ do
             for _, Enemy in pairs(Folder:GetChildren()) do
                 local Head = Enemy:FindFirstChild("Head")
                 if Head and IsAlive(Enemy) and Player:DistanceFromCharacter(Head.Position) < FastAttack.Distance then
-                    if Enemy ~= Player.Character then
+                    -- KHÔNG đánh ally / main của mình (chống FastAttack nền giết ally trong kill-phase)
+                    if Enemy ~= Player.Character and not State.isAlly[Enemy.Name] and not State.isMain[Enemy.Name] then
                         table.insert(OthersEnemies, { Enemy, Head })
                         BasePart = Head
                     end
@@ -1719,12 +1724,50 @@ local function BringMob() return CombatActions.BringMob() end
 ============================================================================ ]]
 local GearManager = {}
 do
+    -- state cho việc tiêu điểm Gear5 (chống spam SpendPoint → tránh kick)
+    local _g5Lock    = false
+    local _g5LastTry = 0
+
     function GearManager.checkGear()
         local _okcg, dt = SafeRemote.invoke(3, "TempleClock", "Check")
         if not (dt and type(dt) == "table") then return end
         if not dt.HadPoint then return end
         local rd = dt.RaceDetails
         if not (rd and rd.Completed ~= nil) then return end
+
+        -- ===== GEAR5 SWAP WINDOW: tiêu điểm thừa để MỞ KHÓA TRIALING =====
+        -- Completed==5 + HadPoint: server bắt chọn lại 1 slot sang Alpha/Omega NGƯỢC với
+        -- hiện tại thì mới tính → hết "báo đỏ" → vào được in_trial. KHÔNG theo Config.
+        -- Thử Gear2=Alpha rồi Gear2=Omega: 1 trong 2 chắc chắn "ngược" → được tính; cái
+        -- trùng giá trị hiện tại bị bỏ qua. Lock + cooldown 5s chống spam, KHÔNG retry vô hạn.
+        if rd.Completed == 5 then
+            if _g5Lock then return end
+            if (tick() - _g5LastTry) < 5 then return end
+            _g5Lock = true
+            _g5LastTry = tick()
+            task.spawn(function()
+                local cleared = false
+                for _, pick in ipairs({ "Alpha", "Omega" }) do
+                    DBG("[GEAR-AUTO] ally=" .. State.myName ..
+                        " state=max_gear5 action=swap slot=2 to=" .. pick ..
+                        " reason=consume_point_unblock_trial", "ok", "gear_auto")
+                    SafeRemote.invoke(3, "TempleClock", "SpendPoint", "Gear2", pick)
+                    task.wait(1.5)
+                    local _ok2, dt2 = SafeRemote.invoke(3, "TempleClock", "Check")
+                    if dt2 and dt2.HadPoint == false then cleared = true; break end
+                end
+                if cleared then
+                    DBG("[GEAR-AUTO] ally=" .. State.myName ..
+                        " state=max_gear5 action=swap reason=success_point_cleared", "ok", "gear_auto_ok")
+                else
+                    DBG("[GEAR-AUTO] ally=" .. State.myName ..
+                        " state=max_gear5 action=skip reason=server_stuck_no_retry", "warn", "gear_auto_stuck")
+                end
+                _g5Lock = false
+            end)
+            return  -- KHÔNG rơi xuống logic claim cũ (đang gọi sai "Gear5"/"Gearnil" cho Gear5)
+        end
+
         local g1, g2, g3 = Config.gear:match("^(.-)%-(.-)%-(.-)$")
         local a23 = { [2] = g1, [3] = g2, [4] = g3 }
         local a24 = { ["A"] = "Alpha", ["B"] = "Omega" }
@@ -2457,10 +2500,18 @@ do
     function PostTrial.resetAllyOnce(roleName)
         if _G.allyKillReset then return "ally_reset" end
         _G.allyKillReset = true
-        status(roleName .. " Kill-player → AUTO RESET (ally)")
+        status(roleName .. " Kill-player → AUTO RESET NGAY (ally)")
         task.spawn(function()
-            pcall(function() LocalPlayer.Character.Humanoid.Health = 0 end)
-            task.wait(1)
+            -- Tự sát NGAY + lặp tối đa 5 lần (0.15s) cho chắc chết trước khi main vào (main chờ 3s).
+            for _ = 1, 5 do
+                pcall(function() LocalPlayer.Character.Humanoid.Health = 0 end)
+                pcall(function() LocalPlayer.Character:BreakJoints() end)
+                local c = LocalPlayer.Character
+                local h = c and c:FindFirstChild("Humanoid")
+                if (not h) or h.Health <= 0 then break end
+                task.wait(0.15)
+            end
+            task.wait(0.5)
             Net.postJSON(B .. "/helpreset", { name = State.myName }, "helpreset")
         end)
         return "ally_reset"
@@ -2500,13 +2551,27 @@ do
 
     -- Main đang turn (current) kill player trong tầm rồi reset (File A 1984-2020)
     function PostTrial.mainKillThenReset(myStt, currentmain)
+        -- DELAY 3s khi MỚI vào kill-phase: cho 2 ally kịp tự reset/rời đi trước,
+        -- main không tween sớm rồi đuổi nhầm/đuổi xa mà chết. (stale >60s tự reset cờ)
+        if (not _G.mainKillStart) or (tick() - _G.mainKillStart) > 60 then
+            _G.mainKillStart = tick()
+        end
+        if (tick() - _G.mainKillStart) < 3 then
+            _G.SHOULDSPAMSKILLS = false
+            status("[MAIN " .. tostring(myStt) .. "] Kill phase → chờ 3s cho ally reset...")
+            return "posttrial_wait_ally"
+        end
         status("[MAIN " .. tostring(myStt) .. "] Kill Players After Trial")
         for plr in pairs(getplayers()) do
             if plr then
-                repeat task.wait() attackTick(plr)
+                repeat
+                    task.wait()
+                    attackTick(plr)
+                    local hrp = plr:FindFirstChild("HumanoidRootPart")
+                    local tooFar = hrp and getdis(hrp.CFrame) > 1500   -- mục tiêu chạy xa → BỎ, không đuổi tới chết
                 until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid")
                     or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0
-                    or templeState() ~= "ffup"
+                    or templeState() ~= "ffup" or tooFar
             end
         end
         _G.SHOULDSPAMSKILLS = false
@@ -2514,8 +2579,10 @@ do
             local isCurrentMain = State.isMain[State.myName] and State.myName == currentmain
             local isOtherMain   = State.isMain[State.myName] and State.myName ~= currentmain
             if isCurrentMain then
+                _G.mainKillStart = nil
                 return PostTrial.currentMainReset(myStt)
             elseif isOtherMain then
+                _G.mainKillStart = nil
                 return PostTrial.otherMainReset()
             end
         end
