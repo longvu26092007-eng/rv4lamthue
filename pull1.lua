@@ -720,6 +720,49 @@ end
 
 local JoinedMirageJobs = {}
 
+-----------------------------------------------------------------------------------
+-- 7c. BLACKLIST JOBID KHONG CO MIRAGE (dung chung 1 file -> moi bot deu doc duoc de ne)
+-- Luu { [jobId] = timestamp }. Het han sau 30 phut. Khong dung UserId -> shared.
+-----------------------------------------------------------------------------------
+local NoMiragePath = "pull_lever_nomirage.json"
+local NO_MIRAGE_TTL = 30 * 60  -- 30 phut
+
+local function LoadNoMirage()
+    local t = {}
+    if type(isfile) == "function" and type(readfile) == "function" then
+        pcall(function()
+            if isfile(NoMiragePath) then
+                local data = HttpService:JSONDecode(readfile(NoMiragePath) or "{}")
+                if type(data) == "table" then t = data end
+            end
+        end)
+    end
+    -- Don entry het han ngay khi load
+    local now = os.time()
+    local cleaned = {}
+    for jobId, ts in pairs(t) do
+        if type(ts) == "number" and (now - ts) < NO_MIRAGE_TTL then
+            cleaned[tostring(jobId)] = ts
+        end
+    end
+    return cleaned
+end
+
+local function SaveNoMirage(t)
+    if type(writefile) == "function" then
+        pcall(function() writefile(NoMiragePath, HttpService:JSONEncode(t)) end)
+    end
+end
+
+-- Danh dau 1 JobId la khong co Mirage (read-merge-write de khong de bot khac ghi de)
+local function MarkJobNoMirage(jobId)
+    if not jobId or tostring(jobId) == "" then return end
+    local t = LoadNoMirage()                 -- doc fresh (gop ca entry bot khac)
+    t[tostring(jobId)] = os.time()
+    SaveNoMirage(t)
+    print("[NoMirage] Mark JobId=" .. tostring(jobId) .. " (ne 30p)")
+end
+
 -- Join JobId bang __ServerBrowser (y het file goc sida)
 -- KHONG dung TeleportService vi no se kick player ra menu trong 1 so truong hop.
 JoinJobIdByServerBrowser = function(jobId)
@@ -765,15 +808,19 @@ local function HopMirageByAPI()
     local maxPlayers = tonumber(cfg["Max Players"] or 11) or 11
     local avoidFull  = cfg["Avoid Full Server"] ~= false
 
+    -- Doc blacklist 1 lan (shared file) -> ne JobId khong co Mirage trong 30p
+    local noMirage = LoadNoMirage()
+
     for _, server in ipairs(servers) do
         local jobId   = server.JobId
         local players = tonumber(server.Players or 0) or 0
 
-        local notSameJob = tostring(jobId) ~= tostring(game.JobId)
-        local notVisited = not JoinedMirageJobs[tostring(jobId)]
-        local notFull    = (not avoidFull) or players <= maxPlayers
+        local notSameJob     = tostring(jobId) ~= tostring(game.JobId)
+        local notVisited     = not JoinedMirageJobs[tostring(jobId)]
+        local notFull        = (not avoidFull) or players <= maxPlayers
+        local notBlacklisted = noMirage[tostring(jobId)] == nil
 
-        if jobId and notSameJob and notVisited and notFull then
+        if jobId and notSameJob and notVisited and notFull and notBlacklisted then
             JoinedMirageJobs[tostring(jobId)] = true
 
             SetStatus(
@@ -1423,6 +1470,8 @@ local function DoMirageBlueGear()
     local mirage = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("MysticIsland")
     if not mirage then
         if Config["Hop Mirage"] then
+            -- Server hien tai khong co Mirage -> ghi JobId vao blacklist chung de moi bot ne 30p
+            MarkJobNoMirage(game.JobId)
             SetStatus("Khong co Mirage -> Hop Mirage API")
             if not HopMirageByAPI() then
                 SetStatus("Mirage API rong -> fallback Hop __ServerBrowser")
