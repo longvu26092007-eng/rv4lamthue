@@ -111,7 +111,7 @@ do
     Config.HEARTBEAT_INTERVAL = 5      -- File A 388-396
     Config.MAIN_TICK          = 0.35   -- File A 1678
     Config.UI_THROTTLE        = 0.2    -- File A live status 0.2s
-    Config.FULLMOON_API       = "http://fi12.bot-hosting.cloud:20112/api/name=fullmoon" -- File A 2159
+    Config.FULLMOON_API       = "http://fi11.bot-hosting.net:20758/api/name=fullmoon" -- File A 2159
     Config.DEAD_JOB_TTL       = 1800   -- File A 2175
     Config.MAIN_TURN_TIMEOUT  = 300    -- File A 1752
     Config.TRAIN_WINDOW       = 300    -- File A 1612
@@ -204,6 +204,122 @@ function FileStore.writeJson(path, tbl)
     local ok = pcall(function() writefile(path, HttpService:JSONEncode(tbl or {})) end)
     if not ok then Logger.err("FileStore write fail: " .. path, "fs_write_" .. path) end
     return ok
+end
+
+--[[ ============================================================================
+[06b] CHANGEFOLDER — gọi getgenv().client:ChangeToFolder khi main DONE.
+     Config ngoài loader:
+         getgenv().change = true|false   (bật/tắt)
+         getgenv().id1 = "..."            (From Folder ID — bắt buộc)
+         getgenv().id2 = "..."            (To Folder ID — bắt buộc)
+         getgenv().id3 = "..." | "........." | "nil"   (Config ID — optional, truyền nil nếu trống)
+     ChangeToFolder(id1, id2, true, id3): arg3=true = change without replace.
+     Lock + cooldown chống spam; success → Disconnect + Shutdown.
+============================================================ ]]
+do
+    -- lock chống gọi ChangeToFolder trùng lặp
+    local _ChangeFolderLock          = false
+    local _LastChangeFolderFailAt    = 0
+    local _ChangeFolderRetryCooldown = 10
+
+    -- id3 optional: bỏ trống / "........." / "nil" → trả về nil THẬT
+    local function NormalizeFolderId(value, allowNil)
+        if value == nil then
+            return (allowNil and nil or nil), false
+        end
+
+        local s = tostring(value)
+        s = s:gsub("^%s+", ""):gsub("%s+$", "")
+
+        if s == "" or s == "........." or s:match("^%.+$") then
+            return (allowNil and nil or nil), false
+        end
+
+        if s:lower() == "nil" then
+            return (allowNil and nil or nil), false
+        end
+
+        return s, true
+    end
+
+    local function ChangeFolderAfterCompleted(reason)
+        if not getgenv().change then return false end
+        if _ChangeFolderLock then return false end
+
+        if _LastChangeFolderFailAt > 0
+            and (tick() - _LastChangeFolderFailAt) < _ChangeFolderRetryCooldown then
+            return false
+        end
+
+        local client = getgenv().client
+        if type(client) ~= "table" and type(client) ~= "userdata" then
+            warn("[ChangeFolder] getgenv().client không tồn tại")
+            _LastChangeFolderFailAt = tick()
+            return false
+        end
+
+        if type(client.ChangeToFolder) ~= "function" then
+            warn("[ChangeFolder] getgenv().client:ChangeToFolder không tồn tại")
+            _LastChangeFolderFailAt = tick()
+            return false
+        end
+
+        local id1, ok1 = NormalizeFolderId(getgenv().id1, false)
+        local id2, ok2 = NormalizeFolderId(getgenv().id2, false)
+        local id3      = NormalizeFolderId(getgenv().id3, true)
+
+        if not ok1 or not ok2 then
+            warn("[ChangeFolder] Thiếu id1/id2, không gọi ChangeToFolder")
+            _LastChangeFolderFailAt = tick()
+            return false
+        end
+
+        _ChangeFolderLock = true
+
+        warn("[ChangeFolder] Completed -> gọi ChangeToFolder, reason=" .. tostring(reason))
+        pcall(function() status("[ChangeFolder] Completed -> changing folder...") end)
+
+        local ok, ret = pcall(function()
+            return client:ChangeToFolder(id1, id2, true, id3)
+        end)
+
+        if not ok then
+            warn("[ChangeFolder] Lỗi khi gọi ChangeToFolder: " .. tostring(ret))
+            pcall(function() status("[ChangeFolder] Failed, retry later") end)
+            _ChangeFolderLock = false
+            _LastChangeFolderFailAt = tick()
+            return false
+        end
+
+        local changed = ret and true or false
+
+        if changed then
+            warn("[ChangeFolder] Successfully changed folder, disconnecting to apply changes...")
+            pcall(function() status("[ChangeFolder] Changed folder -> shutdown") end)
+
+            pcall(function()
+                if getgenv().client and type(getgenv().client.Disconnect) == "function" then
+                    getgenv().client:Disconnect()
+                end
+            end)
+
+            task.wait(5)
+
+            pcall(function() game:Shutdown() end)
+            return true
+        else
+            warn("[ChangeFolder] Failed to change folder")
+            pcall(function() status("[ChangeFolder] Failed, retry later") end)
+            _ChangeFolderLock = false
+            _LastChangeFolderFailAt = tick()
+            task.wait(10)
+            return false
+        end
+    end
+
+    -- expose cho StateMachine gọi (chỉ trong file, không phơi ra ngoài)
+    _G.ChangeFolderAfterCompleted = ChangeFolderAfterCompleted
+    _G.NormalizeFolderId         = NormalizeFolderId
 end
 
 -- File A 1-3: xoá cache module cũ (giờ module nhúng thẳng).
@@ -525,7 +641,11 @@ do
         if not Runtime.alive then return end
         local fm = false
         pcall(function() fm = _G.isfullmoon and _G.isfullmoon() and true or false end)
-        Net.postJSON(B .. "/heartbeat?name=" .. Config.myName, { role = State.myRole, fullmoon = fm }, "heartbeat")
+        -- Kèm player count + số ally cùng server (để /curmain xếp main theo player + demote Main1).
+        local players, allies = 0, 0
+        pcall(function() if _G.countServerInfo then players, allies = _G.countServerInfo() end end)
+        Net.postJSON(B .. "/heartbeat?name=" .. Config.myName,
+            { role = State.myRole, fullmoon = fm, players = players, allies = allies }, "heartbeat")
     end
 
     -- Offline đúng 1 lần, gửi cả POST queue lẫn GET đồng bộ (File A 378-385)
@@ -956,6 +1076,20 @@ local function isfullmoon()
     return Lighting:GetAttribute("MoonPhase") == 5
 end
 _G.isfullmoon = isfullmoon   -- để heartbeat (khai báo trước) gọi được
+-- Đếm tổng player + số ally đang ở server hiện tại (cho heartbeat → server xếp main theo
+-- player và demote Main1 kẹt server full). Đếm distinct ally theo tên (State.isAlly).
+local function countServerInfo()
+    local players = #Players:GetPlayers()
+    local seen, allies = {}, 0
+    for _, p in ipairs(Players:GetPlayers()) do
+        if State.isAlly[p.Name] and not seen[p.Name] then
+            seen[p.Name] = true
+            allies = allies + 1
+        end
+    end
+    return players, allies
+end
+_G.countServerInfo = countServerInfo   -- heartbeat (khai báo trước) gọi qua _G như isfullmoon
 local function isSamePlace(serverEntry)
     return serverEntry ~= nil and tonumber(serverEntry.placeid) == game.PlaceId
 end
