@@ -1582,6 +1582,60 @@ do
         local RegisterAttack = SafeWaitForChild(NetMod, "RE/RegisterAttack")
         local RegisterHit    = SafeWaitForChild(NetMod, "RE/RegisterHit")
         if not (RegisterAttack and RegisterHit) then return end
+
+        -- ===== REMOTE MÃ HÓA (port từ "Farm Fragment change race") =====
+        -- Bản game mới chỉ ăn damage khi gửi kèm remote RE/RegisterHit đã bxor + seed.
+        -- Tự tìm lại remote theo attribute "Id" và lắng nghe ChildAdded để luôn cập nhật.
+        local encSeed = nil
+        pcall(function() encSeed = NetMod:WaitForChild("seed", 10):InvokeServer() end)
+        local remoteAttack, idremote
+        local remoteFolders = {
+            ReplicatedStorage:FindFirstChild("Util"),
+            ReplicatedStorage:FindFirstChild("Common"),
+            ReplicatedStorage:FindFirstChild("Remotes"),
+            ReplicatedStorage:FindFirstChild("Assets"),
+            ReplicatedStorage:FindFirstChild("FX"),
+        }
+        local function GetRemoteAttack()
+            if remoteAttack and remoteAttack.Parent and idremote then return true end
+            remoteAttack, idremote = nil, nil
+            for _, folder in ipairs(remoteFolders) do
+                if folder then
+                    for _, obj in ipairs(folder:GetChildren()) do
+                        if obj:IsA("RemoteEvent") and obj:GetAttribute("Id") then
+                            remoteAttack = obj
+                            idremote = obj:GetAttribute("Id")
+                            return true
+                        end
+                    end
+                end
+            end
+            return false
+        end
+        for _, folder in ipairs(remoteFolders) do
+            if folder then
+                folder.ChildAdded:Connect(function(obj)
+                    if obj:IsA("RemoteEvent") and obj:GetAttribute("Id") then
+                        remoteAttack = obj
+                        idremote = obj:GetAttribute("Id")
+                    end
+                end)
+            end
+        end
+        GetRemoteAttack()
+        local function EncryptedRegisterHit(basePart, others)
+            if not basePart or not others or #others == 0 then return false end
+            if not encSeed then pcall(function() encSeed = NetMod:WaitForChild("seed", 10):InvokeServer() end) end
+            if not GetRemoteAttack() or not encSeed then return false end
+            pcall(function()
+                local encodedName = string.gsub("RE/RegisterHit", ".", function(c)
+                    return string.char(bit32.bxor(string.byte(c), math.floor(workspace:GetServerTimeNow() / 10 % 10) + 1))
+                end)
+                remoteAttack:FireServer(encodedName, bit32.bxor(idremote + 909090, encSeed * 2), basePart, others)
+            end)
+            return true
+        end
+
         local function IsAlive(character)
             return character and character:FindFirstChild("Humanoid") and character.Humanoid.Health > 0
         end
@@ -1603,27 +1657,30 @@ do
             if not BasePart or #OthersEnemies == 0 then return end
             RegisterAttack:FireServer(Settings.ClickDelay or 0)
             RegisterHit:FireServer(BasePart, OthersEnemies)
+            EncryptedRegisterHit(BasePart, OthersEnemies)   -- bắn thêm remote mã hóa (đảm bảo vào damage)
         end
         function FastAttack:AttackNearest()
             local OthersEnemies = {}
             local Part1 = ProcessEnemies(OthersEnemies, workspace:FindFirstChild("Enemies"))
             local Part2 = ProcessEnemies(OthersEnemies, workspace:FindFirstChild("Characters"))
+            if #OthersEnemies == 0 then task.wait(0); return end
             local character = Player.Character
             if not character then return end
+            local basePart = Part1 or Part2
+            -- LUÔN gửi RegisterAttack + RegisterHit + remote mã hóa (đảm bảo vào damage bản game mới)
+            self:Attack(basePart, OthersEnemies)
+            -- Nếu vũ khí có LeftClickRemote (kiếm/melee đời mới) → bắn thêm theo hướng từng quái
             local equippedWeapon = character:FindFirstChildOfClass("Tool")
             if equippedWeapon and equippedWeapon:FindFirstChild("LeftClickRemote") then
+                local pivot = character:GetPivot().Position
                 for _, enemyData in ipairs(OthersEnemies) do
                     local enemy = enemyData[1]
                     local ehrp = enemy:FindFirstChild("HumanoidRootPart")
                     if ehrp then
-                        local direction = (ehrp.Position - character:GetPivot().Position).Unit
+                        local direction = (ehrp.Position - pivot).Unit
                         pcall(function() equippedWeapon.LeftClickRemote:FireServer(direction, 1) end)
                     end
                 end
-            elseif #OthersEnemies > 0 then
-                self:Attack(Part1 or Part2, OthersEnemies)
-            else
-                task.wait(0)
             end
         end
         function FastAttack:BladeHits()
@@ -2051,22 +2108,43 @@ do
             for _, v in ipairs(getmob1(pos__)) do
                 if trainTimeoutHop(tag) then return end
                 local lastY, lastTf, lastTrainPost = 0, nil, 0
+                -- WATCHDOG chống kẹt (áp dụng CHO CẢ MAIN LẪN ALLY — fix "bay trên đầu không đánh"):
+                -- nếu quá lâu không hạ được / máu không tụt → bỏ quái, về điểm farm để thoát kẹt.
+                local mobStart = tick()
+                local lastHp   = (checkmob_(v) and v.Humanoid.Health) or 0
+                local lastHpT  = tick()
                 repeat
                     if trainTimeoutHop(tag) then return end
-                    local c  = LP.Character
-                    local tf = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
+
+                    -- watchdog
+                    do
+                        local nowHp = (checkmob_(v) and v.Humanoid.Health) or 0
+                        if nowHp < (lastHp - 0.5) then lastHp = nowHp; lastHpT = tick() end
+                        local stuckNoDmg = (tick() - lastHpT) > 8     -- 8s không vào damage
+                        local stuckTotal = (tick() - mobStart) > 20    -- 20s tổng cho 1 quái
+                        if stuckNoDmg or stuckTotal then
+                            status(tag .. " ⚠ Kẹt quái → bỏ qua (noDmg=" .. tostring(stuckNoDmg) .. ")")
+                            pcall(function() topos(pos__) end)          -- về điểm farm, hạ độ cao
+                            break
+                        end
+                    end
+
+                    local c   = LP.Character
+                    local tf  = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
+                    local hrp = v:FindFirstChild("HumanoidRootPart")
                     if tf then
+                        -- V4: BÁM LẠI quái mỗi vòng + kéo quái + giữ offset trong tầm đánh (60 < tầm 100)
+                        -- thay vì +150 (ngoài tầm FastAttack → trước đây đứng im không đánh).
                         if lastTf ~= true then
-                            local hrp = v:FindFirstChild("HumanoidRootPart")
-                            if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 150, 0)) end) end
-                            status(tag .. " Training (Wait for end V4)")
+                            status(tag .. " Training (V4 - giữ trên đầu + đánh)")
                             lastTf = true
                         end
+                        Movement.equip(); Movement.haki(); BringMob()
+                        if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 60, 0)) end) end
                         if (tick() - lastTrainPost) > 4 then if reassertFn then reassertFn() end; lastTrainPost = tick() end
-                        task.wait(0.5)
+                        task.wait(0.2)
                     else
                         Movement.equip(); Movement.haki(); BringMob()
-                        local hrp = v:FindFirstChild("HumanoidRootPart")
                         if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 20, 0)) end) end
                         if lastTf ~= false then
                             status(tag .. " Training (Kill Mobs)")
@@ -2832,12 +2910,21 @@ do
         if isMain then
             if AB == "done" then
                 if myStatus ~= "done" then State.setMyMainStatus("done"); myStatus = "done" end
+                -- getgenv().change: ghi file "Completed-<race>" rồi gọi ChangeToFolder(id1,id2,true,id3).
+                -- task.spawn vì ChangeFolderAfterCompleted có task.wait + shutdown → không block main loop.
                 if getgenv().change and not _G.changeFileWritten then
+                    local _okr, _race = pcall(function() return LocalPlayer.Data.Race.Value end)
+                    local raceName = _okr and tostring(_race) or "Unknown"
                     local _okw = pcall(function()
-                        local race = LocalPlayer.Data.Race.Value
-                        writefile(LocalPlayer.Name .. ".txt", "Completed-" .. tostring(race))
+                        writefile(LocalPlayer.Name .. ".txt", "Completed-" .. raceName)
                     end)
-                    if _okw then _G.changeFileWritten = true end
+                    if _okw then
+                        _G.changeFileWritten = true
+                        task.spawn(function() _G.ChangeFolderAfterCompleted("Completed-" .. raceName) end)
+                    end
+                elseif getgenv().change and _G.changeFileWritten then
+                    -- đã ghi file rồi nhưng lần trước fail/chưa đổi → thử lại (lock+cooldown tự chống spam)
+                    task.spawn(function() _G.ChangeFolderAfterCompleted("Completed already written") end)
                 end
             else
                 if myStatus == "done" then State.setMyMainStatus("waiting"); myStatus = "waiting" end
@@ -2911,6 +2998,11 @@ do
         if isMain and myStatus == "done" then
             StateMachine.transition(S.DONE, "full gear")
             status("[MAIN " .. myStt .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
+            -- safety net: nếu nhánh AB=="done" chưa kịp gọi (vd race detect chậm), vẫn ép đổi folder.
+            -- _G.ChangeFolderAfterCompleted tự guard bằng lock + cooldown → không spam.
+            if getgenv().change then
+                task.spawn(function() _G.ChangeFolderAfterCompleted("myStatus=done") end)
+            end
 
         elseif isMain and myStatus == "training" then
             StateMachine.transition(S.TRAINING, "training")
