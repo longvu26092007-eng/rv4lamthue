@@ -1483,38 +1483,28 @@ local function DoMirageBlueGear()
         return
     end
 
-    local hour = math.floor(Lighting.ClockTime)
-    if hour >= 12 or hour < 5 then
-        local blue = GetBlueGear()
-        if blue then
-            SetStatus("Thay Blue Gear -> Tween")
-            TweenTo(blue)
-            return
-        end
-        local top = mirage:GetModelCFrame() + Vector3.new(0, 300, 0)
-        SetStatus("Mirage OK, chua co Blue Gear -> ActivateAbility")
-        TweenTo(top)
-        if CaculateDistance(top) < 20 then
-            pcall(function()
-                LocalPlayer.CameraMaxZoomDistance = 0.5
-                LocalPlayer.CameraMaxZoomDistance = 200
-                workspace.CurrentCamera.CFrame = CFrame.new(
-                    workspace.CurrentCamera.CFrame.Position,
-                    Lighting:GetMoonDirection() + workspace.CurrentCamera.CFrame.Position
-                )
-            end)
-            pcall(function()
-                ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommE"):FireServer("ActivateAbility")
-            end)
-        end
-    else
-        SetStatus("Sai gio trong ngay -> Hop Mirage API")
-        if Config["Hop Mirage"] then
-            if not HopMirageByAPI() then
-                SetStatus("Mirage API rong -> fallback Hop __ServerBrowser")
-                Hop("Mirage API empty")
-            end
-        end
+    -- Co Mirage -> tween ra NGAY, khong can biet buoi nao, KHONG hop server.
+    local blue = GetBlueGear()
+    if blue then
+        SetStatus("Thay Blue Gear -> Tween")
+        TweenTo(blue)
+        return
+    end
+    local top = mirage:GetModelCFrame() + Vector3.new(0, 300, 0)
+    SetStatus("Mirage OK, chua co Blue Gear -> ActivateAbility")
+    TweenTo(top)
+    if CaculateDistance(top) < 20 then
+        pcall(function()
+            LocalPlayer.CameraMaxZoomDistance = 0.5
+            LocalPlayer.CameraMaxZoomDistance = 200
+            workspace.CurrentCamera.CFrame = CFrame.new(
+                workspace.CurrentCamera.CFrame.Position,
+                Lighting:GetMoonDirection() + workspace.CurrentCamera.CFrame.Position
+            )
+        end)
+        pcall(function()
+            ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommE"):FireServer("ActivateAbility")
+        end)
     end
 end
 
