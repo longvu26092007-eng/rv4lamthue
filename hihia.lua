@@ -111,7 +111,7 @@ do
     Config.HEARTBEAT_INTERVAL = 5      -- File A 388-396
     Config.MAIN_TICK          = 0.35   -- File A 1678
     Config.UI_THROTTLE        = 0.2    -- File A live status 0.2s
-    Config.FULLMOON_API       = "http://fi11.bot-hosting.net:20758/api/name=fullmoon" -- File A 2159
+    Config.FULLMOON_API       = "http://fi12.bot-hosting.cloud:20112/api/name=fullmoon" -- File A 2159
     Config.DEAD_JOB_TTL       = 1800   -- File A 2175
     Config.MAIN_TURN_TIMEOUT  = 300    -- File A 1752
     Config.TRAIN_WINDOW       = 300    -- File A 1612
