@@ -795,7 +795,8 @@ do
                         end
                         local curr = data.current
                         if curr and curr ~= State.myName and data.current_jobid and data.current_jobid ~= "" then
-                            State.mainJobCache[curr] = { jobid = data.current_jobid, time = data.current_time or 0, t = tick() }
+                            -- dùng gettimeserver() thay data.current_time để freshness reset mỗi lần poll
+                            State.mainJobCache[curr] = { jobid = data.current_jobid, time = gettimeserver(), t = tick() }
                         end
                     end
                 end)
@@ -2288,6 +2289,10 @@ do
         local curName = getCurrentMainBeingUpgraded()
         if not curName then return false end
         if State.myName == curName then return true end
+        -- shortcut: đang đứng đúng server full moon (fmJobid) → cùng server với main1 chắc chắn
+        if State.fullmoonJobid and State.fullmoonJobid ~= "" and game.JobId == State.fullmoonJobid then
+            _ssCache.t = tick(); _ssCache.v = true; return true
+        end
         local now = tick()
         if now - _ssCache.t < 3 then return _ssCache.v end
         local same = isSameServerAsMain(curName)
@@ -3174,6 +3179,8 @@ do
         if Config.scout then
             local handled = ScoutNavigator.tick({ isMain = isMain, myStatus = myStatus, currentmain = currentmain, myStt = myStt })
             if handled then return end
+            -- re-read sau ScoutNavigator: có thể đã set ready/moon trong cùng tick này
+            if isMain then myStatus = State.getMainStatus(me) end
         end
 
         -- ===== NHÁNH MAIN (File A 1811-1909) =====
@@ -3204,7 +3211,7 @@ do
         elseif isMain and currentmain == me then
             StateMachine.transition(S.GOING_DOOR, "my turn")
             status("[MAIN " .. myStt .. "] My turn to upgrade gear!")
-            if myStatus == "waiting" or myStatus == "" then State.setMyMainStatus("moon") end
+            if (myStatus == "waiting" or myStatus == "") and State.getMainStatus(me) ~= "ready" then State.setMyMainStatus("moon") end
             -- BS-3: ĐÃ XÓA self-hop fullmoon (ScoutNavigator đưa vào FM). Chạy thẳng gear/door/trial.
             do
                 task.spawn(checkgear)
@@ -3272,7 +3279,12 @@ do
             local sameServer = isSameServerAsMain(currentmain)
             -- BS-3: scout ally KHÔNG follow main (server điều phối full moon). Nhánh FOLLOWING_MAIN cũ
             -- ("Hop sang server main" + hop __ServerBrowser) đã XÓA HẲN vì Config.scout luôn = true.
-            if (currentmain and mainActive and sameServer) or Config.vipServer or (isnight() and isfullmoon()) then
+            -- FIX #4: Main1 báo ready → server set trial_phase="trialing" → Ally biết vào trial ngay
+            -- khi đang đứng đúng server full moon (không cần đợi main1 đến cửa/moon-active detect).
+            local trialingSignal = (State.trialPhase == "trialing")
+                and State.fullmoonJobid and State.fullmoonJobid ~= ""
+                and game.JobId == State.fullmoonJobid
+            if (currentmain and mainActive and sameServer) or trialingSignal or Config.vipServer or (isnight() and isfullmoon()) then
                 task.spawn(checkgear)
                 _G.ShouldSendData = true
                 local ts = templeState()
