@@ -125,6 +125,32 @@ do
 end
 
 --[[ ============================================================================
+ [02b] URL / QUERY HELPER — encode query params an toàn (tránh URL sai khi name lạ).
+============================================================================ ]]
+local function urlEncode(v)
+    return HttpService:UrlEncode(tostring(v or ""))
+end
+local function makeQuery(params)
+    local parts = {}
+    for k, v in pairs(params or {}) do
+        table.insert(parts, urlEncode(k) .. "=" .. urlEncode(v))
+    end
+    return table.concat(parts, "&")
+end
+local function endpoint(path, params)
+    if params then
+        return Config.baseUrl .. path .. "?" .. makeQuery(params)
+    end
+    return Config.baseUrl .. path
+end
+-- nonEmpty: chuẩn hoá jobid từ server ("", "nil", "null" → nil)
+local function nonEmpty(v)
+    v = tostring(v or "")
+    if v == "" or v == "nil" or v == "null" then return nil end
+    return v
+end
+
+--[[ ============================================================================
  [03] LOGGER / DEBUG — ring buffer 200 dòng, chống spam cùng key 15s. (File A 1331-1368)
 ============================================================================ ]]
 local Logger = {}
@@ -528,9 +554,16 @@ do
     State.serverCurJobid  = nil    -- _G.srvCurMainJobid
     State._lastCurMainOK  = 0
     -- MODE MỚI "Scout FullMoon": Node trả qua /curmain
-    State.gateOpen        = false  -- Main1 đã vào full moon → cho stt2-6 spam-join
-    State.fullmoonJobid   = nil    -- jobid server full moon (điểm rally cho mọi account)
-    State.rallyTarget     = nil    -- jobid server ứng viên Node giao cho ally đi verify (chưa chốt moon)
+    State.gateOpen        = false  -- Main1 đã vào full moon → cho Main2-6 spam-join
+    State.fullmoonJobid   = nil    -- jobid server full moon ĐÃ chốt (điểm rally cho main)
+    State.rallyTarget     = nil    -- (compat) = ally_target_jobid
+    State.allyTargetJobid = nil    -- server Ally cần tới (candidate khi chưa chốt / fullmoon khi đã chốt)
+    State.main1Name       = nil    -- tên Main1 (current) do Node chốt
+    State.requiredAllies  = 2      -- số ally cần giữ fullmoon
+    State.fullmoonAllyCount  = 0   -- số ally đang giữ fullmoon đã chốt
+    State.candidateAllyCount = 0   -- số ally đang ở candidate
+    State.joinSpamInterval   = 5   -- nhịp Main2-6 spam join
+    State.lastScoutSignalAt  = 0   -- lần cuối nhận tín hiệu scout từ /curmain
 
     for _, v in ipairs(Config.allies) do State.isAlly[v] = true end
 
@@ -545,12 +578,12 @@ do
     function State.setMyMainStatus(statusStr)
         if not State.myMainIndex then return end
         State.statusCache[State.myName] = { t = tick(), status = statusStr }
-        Net.postJSON(Config.baseUrl .. "/mainstatus?name=" .. State.myName, { status = statusStr }, "mainstatus")
+        Net.postJSON(endpoint("/mainstatus", { name = State.myName }), { status = statusStr }, "mainstatus")
     end
     -- Báo status cho BẤT KỲ account (kể cả ALLY — không cần myMainIndex). (File A 330-333)
     function State.reportStatus(statusStr)
         State.statusCache[State.myName] = { t = tick(), status = statusStr }
-        Net.postJSON(Config.baseUrl .. "/mainstatus?name=" .. State.myName, { status = statusStr }, "mainstatus")
+        Net.postJSON(endpoint("/mainstatus", { name = State.myName }), { status = statusStr }, "mainstatus")
     end
 end
 
@@ -617,7 +650,7 @@ do
     function ServerSync.init()
         local allies_str = table.concat(Config.allies, ",")
         local mains_str  = table.concat(Config.mains, ",")
-        local url = B .. "/init?name=" .. Config.myName .. "&allies=" .. allies_str .. "&mains=" .. mains_str
+        local url = endpoint("/init", { name = Config.myName, allies = allies_str, mains = mains_str })
         local data
         for attempt = 1, 8 do
             data = Net.getJSON(url, 0)
@@ -654,7 +687,7 @@ do
         -- Kèm player count + số ally cùng server (để /curmain xếp main theo player + demote Main1).
         local players, allies = 0, 0
         pcall(function() if _G.countServerInfo then players, allies = _G.countServerInfo() end end)
-        Net.postJSON(B .. "/heartbeat?name=" .. Config.myName,
+        Net.postJSON(endpoint("/heartbeat", { name = Config.myName }),
             { role = State.myRole, fullmoon = fm, players = players, allies = allies, scout = Config.scout == true }, "heartbeat")
     end
 
@@ -663,8 +696,8 @@ do
         if Runtime._offlineSent then return end
         Runtime._offlineSent = true
         Runtime.alive = false
-        pcall(function() Net.postJSON(B .. "/offline?name=" .. Config.myName, { role = State.myRole }, "offline") end)
-        pcall(function() Net.getRaw(B .. "/offline?name=" .. Config.myName) end)
+        pcall(function() Net.postJSON(endpoint("/offline", { name = Config.myName }), { role = State.myRole }, "offline") end)
+        pcall(function() Net.getRaw(endpoint("/offline", { name = Config.myName })) end)
     end
 
     -- /curmain = TRỌNG TÀI (File A 477-488): order, current, current_jobid, current_time, mains[]
@@ -703,10 +736,19 @@ do
                         State.serverCurMain   = data.current
                         State.serverCurJobid  = data.current_jobid
                         State._lastCurMainOK  = tick()
-                        -- MODE MỚI "Scout FullMoon": cổng + jobid server full moon + server rally ứng viên
-                        State.gateOpen      = data.gate_open == true
-                        State.fullmoonJobid = (data.fullmoon_jobid and data.fullmoon_jobid ~= "") and data.fullmoon_jobid or nil
-                        State.rallyTarget   = (data.rally_jobid and data.rally_jobid ~= "") and data.rally_jobid or nil
+                        -- MODE MỚI "Scout FullMoon": cổng + jobid full moon + server Ally cần tới + Main1
+                        State.gateOpen         = data.gate_open == true
+                        State.fullmoonJobid    = nonEmpty(data.fullmoon_jobid)
+                        State.allyTargetJobid  = nonEmpty(data.ally_target_jobid)
+                        State.rallyTarget      = nonEmpty(data.rally_jobid) or nonEmpty(data.rally_target)
+                        State.main1Name        = nonEmpty(data.main1_name)
+                        State.requiredAllies   = tonumber(data.required_allies or 2) or 2
+                        State.fullmoonAllyCount  = tonumber(data.fullmoon_ally_count or 0) or 0
+                        State.candidateAllyCount = tonumber(data.candidate_ally_count or 0) or 0
+                        State.joinSpamInterval   = tonumber(data.join_spam_interval or 5) or 5
+                        if State.fullmoonJobid or State.allyTargetJobid or State.rallyTarget then
+                            State.lastScoutSignalAt = tick()
+                        end
                         _G.srvMainOrder    = data.order
                         _G.srvCurMain      = data.current
                         _G.srvCurMainJobid = data.current_jobid
@@ -742,7 +784,7 @@ do
                     local pok, pms = nil, 0
                     if Net.hasReq then
                         local p0 = tick()
-                        pok = Net.raw("POST", B .. "/heartbeat?name=" .. Config.myName, HttpService:JSONEncode({ role = State.myRole }))
+                        pok = Net.raw("POST", endpoint("/heartbeat", { name = Config.myName }), HttpService:JSONEncode({ role = State.myRole }))
                         pms = math.floor((tick() - p0) * 1000)
                     end
                     _G.netGetOk  = gok and true or false
@@ -1158,6 +1200,8 @@ do
     end
 
     function TeleportManager.hopLowPlayer(Reason, MaxPlayers)
+        -- B8: Ally1/Ally2 giữ fullmoon → KHÔNG hop ít người (chỉ main mới train được)
+        if _G.isScoutAlly and _G.isScoutAlly() then return false end
         MaxPlayers = MaxPlayers or HOP_CONFIG.MaxPlayers
         local Servers = TeleportManager.getServers()
         if not Servers then
@@ -1195,6 +1239,8 @@ do
 
     -- ===== HOP FULLMOON (File A 1153-1210) =====
     function TeleportManager.hopFullmoon(reason)
+        -- B8: Ally1/Ally2 giữ fullmoon → KHÔNG tự hop fullmoon API cũ (Node điều phối)
+        if _G.isScoutAlly and _G.isScoutAlly() then return false end
         local hopped = false
         pcall(function()
             local cachedJobs = FileStore.readJson(CACHE_FILE, {})
@@ -1268,14 +1314,16 @@ do
         end)
     end
 
-    -- Hop tới 1 jobid cụ thể (rally) — throttle 5s/jobid, chống spam teleport.
+    -- Hop tới 1 jobid cụ thể (rally/fullmoon) — throttle 5s/jobid, chống spam teleport.
     local _lastJobHop = {}
     function TeleportManager.hopToJob(jobid, reason)
-        if not jobid or jobid == "" or jobid == game.JobId then return false end
+        jobid = tostring(jobid or "")
+        if jobid == "" or jobid == game.JobId then return false end
         if _lastJobHop[jobid] and (tick() - _lastJobHop[jobid]) < Config.RALLY_HOP_THROTTLE then return false end
         _lastJobHop[jobid] = tick()
         _G.rallyHopArmedT = tick()
-        DBG(("[RALLY] %s → teleport %s"):format(tostring(reason), tostring(jobid)), "ok", "rally_hop")
+        _G.lastRallyJob   = jobid
+        DBG(("[RALLY] %s -> teleport %s"):format(tostring(reason), tostring(jobid)), "ok", "rally_hop")
         local ok = pcall(function()
             ReplicatedStorage:WaitForChild("__ServerBrowser", 10):InvokeServer("teleport", jobid)
         end)
@@ -1300,6 +1348,24 @@ do
                     DBG("[FM] Teleport fail (" .. tostring(teleportResult) .. ") jobid chết → blacklist + thử server khác", "err", "fm_dead")
                 end
                 task.delay(2, function() TeleportManager.hopFullmoon("[FM-Retry]") end)
+                return
+            end
+            -- (RALLY) Teleport tới rally/fullmoon job fail → blacklist + reject server lên backend
+            if _G.rallyHopArmedT and (tick() - _G.rallyHopArmedT) < 15 then
+                local failedJob = _G.lastRallyJob
+                _G.rallyHopArmedT = nil
+                _G.lastRallyJob = nil
+                if failedJob and failedJob ~= "" then
+                    TeleportManager.deadJobs[failedJob] = tick()
+                    DBG("[RALLY] Teleport fail jobid=" .. tostring(failedJob) .. " -> reject", "err", "rally_fail")
+                    pcall(function()
+                        Net.postJSON(
+                            endpoint("/rally/reject", { name = State.myName }),
+                            { jobid = failedJob, reason = tostring(teleportResult), message = tostring(message or ""), source = "teleport_fail" },
+                            "rally_reject_" .. tostring(failedJob)
+                        )
+                    end)
+                end
                 return
             end
             -- (2) HOP ÍT NGƯỜI fail
@@ -2822,7 +2888,7 @@ do
             if ok then
                 task.spawn(function()
                     task.wait(10)
-                    Net.postJSON(Config.baseUrl .. "/noguchi?name=" .. me, { jobid = game.JobId }, "noguchi")
+                    Net.postJSON(endpoint("/noguchi", { name = me }), { jobid = game.JobId }, "noguchi")
                 end)
             end
         end)
@@ -3016,6 +3082,131 @@ do
         StateMachine.state = newState
     end
 
+    --[[ ========================================================================
+     MODE MỚI "Scout FullMoon": Node là trọng tài (quét API fullmoon ít player).
+       - Ally1+Ally2 GIỮ server fullmoon (không hop lung tung, không follow main).
+       - Main1/current vào TRƯỚC; gate mở → Main2-6 spam join mỗi 5s.
+       - Main nào cùng jobid Ally được Node xếp STT cao (thứ tự đến).
+       - Main1 trial xong → hop server ít player để training → xuống cuối hàng.
+    ======================================================================== ]]
+    -- Chỉ Ally1+Ally2 (2 ally đầu theo config) mới giữ fullmoon
+    local function isScoutAlly()
+        if not Config.scout then return false end
+        if State.myRole ~= "ally" then return false end
+        for i, nm in ipairs(Config.allies or {}) do
+            if nm == Config.myName and i <= (State.requiredAllies or 2) then return true end
+        end
+        return false
+    end
+    _G.isScoutAlly = isScoutAlly -- cho guard ở các hàm hop ally cũ (B8)
+
+    local _lastAllyHoldHop = 0
+    function StateMachine.scoutAllyHoldFullmoon()
+        if not isScoutAlly() then
+            State.reportStatus("ally")
+            status("[ALLY] Scout standby (không phải Ally1/Ally2)")
+            return
+        end
+        local target = State.allyTargetJobid or State.rallyTarget
+        if not target then
+            State.reportStatus("ally")
+            status("[ALLY-HOLD] Chờ Node quét API fullmoon (ít player)...")
+            return
+        end
+        if game.JobId ~= target then
+            if (tick() - _lastAllyHoldHop) >= 5 then
+                _lastAllyHoldHop = tick()
+                status("[ALLY-HOLD] Join API lowest fullmoon jobid=" .. tostring(target))
+                TeleportManager.hopToJob(target, "[ALLY-HOLD-FULLMOON]")
+            end
+            return
+        end
+        -- ĐÃ ở target → GIỮ server, KHÔNG hop đi đâu (không follow main / training / fullmoon API cũ)
+        State.reportStatus("ally")
+        local cnt = (State.fullmoonJobid == game.JobId) and State.fullmoonAllyCount or State.candidateAllyCount
+        if isfullmoon() then
+            status("[ALLY-HOLD] Holding FullMoon jobid=" .. tostring(target)
+                .. " ally_count=" .. tostring(cnt or 0) .. "/" .. tostring(State.requiredAllies or 2))
+            -- in-server help (KHÔNG hop): đã chốt + ffup → reset để Main hoàn tất trial
+            if State.fullmoonJobid == game.JobId and templeState() == "ffup" then
+                PostTrial.resetAllyOnce("[ALLY]")
+            end
+        else
+            status("[ALLY-HOLD] Ở target nhưng chưa fullmoon, đang giữ/kiểm tra...")
+        end
+    end
+
+    local _lastMainJoinSpam = 0
+    function StateMachine.scoutMainJoinFullmoon(myStatus, currentmain)
+        if State.myRole ~= "main" then return true end
+        local myName = Config.myName
+        local fmJob = State.fullmoonJobid
+        local gateOpen = State.gateOpen == true
+
+        -- DONE → nhường flow cũ (changefolder)
+        if myStatus == "done" then return "ALLOW_TRIAL" end
+
+        -- TRAINING → hop server ít player train (KHÔNG spam join fullmoon)
+        if myStatus == "training" then
+            if fmJob and game.JobId == fmJob and not _G.trainingHopped then
+                _G.trainingHopped = true
+                status("[TRAINING] Trial done -> hop low-player training server")
+                TeleportManager.hopTrainingServer("[AFTER-TRIAL-TRAINING]")
+                return true
+            end
+            return "ALLOW_TRIAL" -- ở server training → flow training cũ chạy
+        end
+        _G.trainingHopped = false
+
+        if not fmJob then
+            status("[MAIN] Waiting Ally1+Ally2 hold FullMoon...")
+            return true
+        end
+
+        -- Main1/current vào TRƯỚC
+        if currentmain == myName then
+            if game.JobId ~= fmJob then
+                if (tick() - _lastMainJoinSpam) >= 5 then
+                    _lastMainJoinSpam = tick()
+                    status("[MAIN1] Join FullMoon with Ally1+Ally2: " .. tostring(fmJob))
+                    TeleportManager.hopToJob(fmJob, "[MAIN1-JOIN-FULLMOON]")
+                end
+                return true
+            end
+            status("[MAIN1] In FullMoon with Ally -> run trial")
+            return "ALLOW_TRIAL"
+        end
+
+        -- Main2-6 chỉ spam join sau khi gate mở (Main1 đã vào)
+        if not gateOpen then
+            status("[MAIN] Waiting Main1 enter FullMoon before spam join")
+            return true
+        end
+        if game.JobId ~= fmJob then
+            if (tick() - _lastMainJoinSpam) >= (State.joinSpamInterval or 5) then
+                _lastMainJoinSpam = tick()
+                status("[GATE] open -> spam join FullMoon every 5s: " .. tostring(fmJob))
+                TeleportManager.hopToJob(fmJob, "[MAIN2-6-SPAM-JOIN-FULLMOON]")
+            end
+            return true
+        end
+        status("[MAIN] Joined same jobid with Ally -> waiting priority")
+        return true
+    end
+
+    function StateMachine.scoutJoinTick(myStatus, currentmain)
+        if State.myRole == "ally" then
+            StateMachine.scoutAllyHoldFullmoon()
+            return true
+        end
+        if State.myRole == "main" then
+            local r = StateMachine.scoutMainJoinFullmoon(myStatus, currentmain)
+            if r == "ALLOW_TRIAL" then return false end -- cho rơi xuống trial/training/done cũ
+            return true
+        end
+        return true
+    end
+
     -- 1 nhịp = bản dịch sạch của main loop File A (giữ nguyên thứ tự nhánh/điều kiện)
     function StateMachine.tick()
         local me = State.myName
@@ -3116,62 +3307,12 @@ do
             _G.inTrial = false
         end
 
-        -- ===== MODE MỚI "Scout FullMoon": điều hướng MAIN (rally vào full moon do Ally tìm) =====
-        if Config.scout and isMain and myStatus ~= "done" then
-            local fmj = State.fullmoonJobid
-            if myStatus == "training" then
-                -- vừa xong trial → rời full moon, hop sang server ít người để training (nhường Main kế)
-                if fmj and fmj == game.JobId and not _G.trainingHopped then
-                    _G.trainingHopped = true
-                    StateMachine.transition(S.TRAINING, "leave fullmoon → train")
-                    status("[MAIN " .. myStt .. "] Xong trial → hop server training riêng")
-                    TeleportManager.hopTrainingServer("[MAIN " .. myStt .. "] training")
-                    return
-                end
-                -- đã ở server training (không phải full moon) → để nhánh training cũ xử lý
-            else
-                _G.trainingHopped = false
-                if currentmain == me then
-                    -- TỚI LƯỢT: phải ở full moon server mới làm trial
-                    if (not fmj) or fmj == "" then
-                        status("[MAIN " .. myStt .. "] Chờ Ally tìm full moon...")
-                        return
-                    elseif fmj ~= game.JobId then
-                        StateMachine.transition(S.WAITING_MOON, "main rally")
-                        status("[MAIN " .. myStt .. "] Rally vào full moon: " .. tostring(fmj))
-                        TeleportManager.hopToJob(fmj, "[MAIN " .. myStt .. "] rally")
-                        return
-                    end
-                    -- đã ở full moon server → rơi xuống nhánh "currentmain == me" cũ (gear/trial/kill)
-                else
-                    -- CHƯA tới lượt
-                    if State.gateOpen and fmj and fmj ~= "" and fmj ~= game.JobId then
-                        StateMachine.transition(S.FOLLOWING_MAIN, "spam join fullmoon")
-                        status("[MAIN " .. myStt .. "] Spam-join full moon (chờ thứ tự đến)")
-                        TeleportManager.hopToJob(fmj, "[MAIN " .. myStt .. "] spam-join")
-                        return
-                    end
-                    if fmj and fmj == game.JobId then
-                        if myStatus == "training" then State.setMyMainStatus("waiting") end
-                        StateMachine.transition(S.WAITING_MAIN, "arrived, waiting turn")
-                        status("[MAIN " .. myStt .. "] Đã vào full moon, chờ lượt (current: " .. tostring(currentmain) .. ")")
-                        return
-                    end
-                    -- cổng chưa mở / chưa có full moon → train song song nếu còn train được
-                    if (not ab) and AB ~= "done" then
-                        if myStatus ~= "training" then State.setMyMainStatus("training") end
-                        StateMachine.transition(S.TRAINING, "train parallel (scout)")
-                        status("[MAIN " .. myStt .. "] Training song song (chờ cổng full moon)")
-                        Training.handleTraining("[MAIN " .. myStt .. "]", AB, function() State.setMyMainStatus("training") end)
-                        return
-                    else
-                        if myStatus == "training" then State.setMyMainStatus("waiting") end
-                        StateMachine.transition(S.WAITING_MAIN, "ready, wait gate")
-                        status("[MAIN " .. myStt .. "] Sẵn sàng, chờ cổng full moon mở")
-                        return
-                    end
-                end
-            end
+        -- ===== MODE MỚI "Scout FullMoon": Node là trọng tài, client chỉ đọc /curmain =====
+        -- Ally luôn được scout handle; Main2-6/Main1-chưa-vào cũng handle; chỉ Main1-đã-vào-FM
+        -- (và done/training-ở-server-train) mới return false để chạy tiếp trial/training/done cũ.
+        if Config.scout then
+            local handled = StateMachine.scoutJoinTick(myStatus, currentmain)
+            if handled then return end
         end
 
         -- ===== NHÁNH MAIN (File A 1811-1909) =====
@@ -3206,7 +3347,7 @@ do
                     StateMachine.transition(S.WAITING_MOON, "hop fullmoon")
                     if hopFullmoonServer("[MAIN " .. myStt .. "]") then
                         task.wait(10)
-                        Net.postJSON(Config.baseUrl .. "/noguchi?name=" .. me, { jobid = game.JobId }, "noguchi")
+                        Net.postJSON(endpoint("/noguchi", { name = me }), { jobid = game.JobId }, "noguchi")
                         skip = true
                     end
                 end
@@ -3252,7 +3393,7 @@ do
                         status("[MAIN " .. myStt .. "] Waiting + Hop Full Moon (chờ: " .. tostring(currentmain) .. ")")
                         if hopFullmoonServer("[MAIN " .. myStt .. "] Waiting →") then
                             task.wait(10)
-                            Net.postJSON(Config.baseUrl .. "/noguchi?name=" .. me, { jobid = game.JobId }, "noguchi")
+                            Net.postJSON(endpoint("/noguchi", { name = me }), { jobid = game.JobId }, "noguchi")
                         end
                     else
                         status("[MAIN " .. myStt .. "] Waiting + Full Moon (chờ: " .. tostring(currentmain) .. ")")
@@ -3265,55 +3406,7 @@ do
         else
             -- ===== NHÁNH ALLY (File A 1910-2029) =====
             local roleName = "[ALLY]"
-
-            -- ===== MODE MỚI "Scout FullMoon": Ally dò server full moon, neo cho Main rally =====
-            if Config.scout then
-                TeleportManager.scanAndUploadPool() -- quét + upload pool (throttle bên trong, task.spawn)
-                -- server cần tới: full moon đã chốt > server rally ứng viên.
-                -- CẢ HAI lấy từ warmer /curmain (State) → KHÔNG gọi HTTP trong tick (tránh block vòng lặp).
-                local target = State.fullmoonJobid or State.rallyTarget
-                if (not target) or target == "" then
-                    StateMachine.transition(S.WAITING_MOON, "ally chờ Node giao server")
-                    status(roleName .. " Chờ Node giao server rally...")
-                    State.reportStatus("ally")
-                    return
-                end
-                if target ~= game.JobId then
-                    StateMachine.transition(S.FOLLOWING_MAIN, "ally → rally server")
-                    status(roleName .. " → tới server rally: " .. tostring(target))
-                    _G.allyHopArmedT = tick()
-                    TeleportManager.hopToJob(target, roleName .. " rally")
-                    return
-                end
-                -- ĐÃ ở ĐÚNG server Node giao → xác minh full moon tại chỗ
-                if not isfullmoon() then
-                    -- không full moon → báo Node loại server này, xin server mới (throttle 5s)
-                    if (not _G.lastRejectT) or (tick() - _G.lastRejectT) > Config.SCOUT_RECHECK then
-                        _G.lastRejectT = tick()
-                        Net.postJSON(Config.baseUrl .. "/rally/reject?name=" .. me, { jobid = game.JobId }, "rally_reject")
-                    end
-                    StateMachine.transition(S.WAITING_MOON, "ally no fullmoon")
-                    status(roleName .. " Server KHÔNG full moon → chờ server mới")
-                    State.reportStatus("ally")
-                    return
-                end
-                -- NEO + FULL MOON: heartbeat tự báo fullmoon=true → Node chốt → Main vào. Vẫn giúp in-server (help/reset).
-                State.reportStatus("ally")
-                local ts = templeState()
-                if ts == "loading" then
-                    status(roleName .. " Đang vào Temple of Time...")
-                elseif ts == "ffup" then
-                    StateMachine.transition(S.POST_TRIAL, "ally ffup")
-                    PostTrial.resetAllyOnce(roleName)
-                else
-                    _G.allyKillReset = false
-                    StateMachine.transition(S.GOING_DOOR, "ally neo full moon")
-                    task.spawn(checkgear)
-                    runTrialPhase(roleName, false)
-                    AbilitySync.reportAtDoor()
-                end
-                return
-            end
+            -- (Scout FullMoon: nhánh ally đã được StateMachine.scoutJoinTick xử lý & return ở trên)
 
             -- Dùng AllyTrainingGate: chỉ train khi confirmed
             local gateState, gateReason, gateI = AllyTrainingGate.tick(roleName)
@@ -3419,7 +3512,7 @@ end
 local function startNoguchiLoop()
     task.spawn(function()
         while Runtime.alive do
-            Net.postJSON(Config.baseUrl .. "/noguchi?name=" .. State.myName, { jobid = game.JobId }, "noguchi")
+            Net.postJSON(endpoint("/noguchi", { name = State.myName }), { jobid = game.JobId }, "noguchi")
             task.wait(1)
         end
     end)
