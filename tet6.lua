@@ -3029,21 +3029,23 @@ do
 
         -- Main2-6: CHỈ spam join khi đủ 4 cờ (Promt.md §6): locked + gate_open + gate_opened_once + fmJob
         -- (gate_open ≈ Main1 đã báo ready + đủ Ally). Trước đó → thả xuống StateMachine = waiting/train song song.
-        if State.fullmoonLocked and State.gateOpen and State.gateOpenedOnce and fmJob then
-            if game.JobId ~= fmJob then
-                -- CHƯA vào server 2 Ally → spam join theo lượt. Báo "waiting" (KHÔNG "moon"):
-                -- chỉ main1/current mới được "moon". Main2-6 đang đi vào = waiting (yêu cầu user 2026-07-02).
-                if (tick() - _lastMainJoinSpam) >= (State.joinSpamInterval or 5) then
-                    _lastMainJoinSpam = tick()
-                    State.setMyMainStatus("waiting")
-                    status("[MAIN] Gate open → spam join full moon: " .. tostring(fmJob))
-                    TeleportManager.hopToJob(fmJob, "[MAIN2-6-SPAM-JOIN]")
-                end
-                return true
-            end
-            -- ĐÃ vào server 2 Ally, CHƯA tới lượt → báo ready (server xếp stt theo thứ tự tới) + giữ chỗ chờ lượt
-            State.setMyMainStatus("ready")
+        -- FIX E (user 2026-07-02): ĐÃ vật lý ở trong FM (game.JobId==fmJob) → LUÔN "ready", KHÔNG phụ thuộc gate.
+        -- Trước đây "ready" bị bọc trong điều kiện gate → khi gate chưa mở (current đang training), main ở
+        -- FM bị skip → rơi xuống StateMachine, status "moon" cũ (set lúc join) kẹt mãi không chuyển ready.
+        if fmJob and game.JobId == fmJob then
+            if myStatus ~= "ready" then State.setMyMainStatus("ready") end
             status("[MAIN " .. tostring(ctx.myStt) .. "] In FullMoon (ready) → chờ tới lượt trial theo thứ tự vào")
+            return true
+        end
+        if State.fullmoonLocked and State.gateOpen and State.gateOpenedOnce and fmJob then
+            -- CHƯA vào server 2 Ally → spam join theo lượt. Báo "waiting" (KHÔNG "moon"):
+            -- chỉ main1/current mới được "moon". Main2-6 đang đi vào = waiting (yêu cầu user 2026-07-02).
+            if (tick() - _lastMainJoinSpam) >= (State.joinSpamInterval or 5) then
+                _lastMainJoinSpam = tick()
+                State.setMyMainStatus("waiting")
+                status("[MAIN] Gate open → spam join full moon: " .. tostring(fmJob))
+                TeleportManager.hopToJob(fmJob, "[MAIN2-6-SPAM-JOIN]")
+            end
             return true
         end
         -- gate chưa mở (Main1 chưa ready) → THẢ xuống nhánh waiting gốc (train song song, status waiting)
