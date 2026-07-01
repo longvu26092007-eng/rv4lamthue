@@ -2976,11 +2976,15 @@ do
         local fmJob = State.fullmoonJobid
 
         -- training → hop server ít người (1 lần) rồi THẢ xuống training gốc; done → thả gốc (changefolder)
+        -- FIX #4 (user 2026-07-02): CHỈ hop training server sau khi ĐÃ thực sự in_trail lượt này
+        -- (_G.didTrialInFM). Nếu chuyển "training" mà CHƯA in_trail (vd cần train i=1/3) → KHÔNG hop,
+        -- train TẠI CHỖ. Tránh "Trial done → hop" khống lúc vừa vào server + cắt loop i=3 hop-ra-join-lại.
         if myStatus == "training" then
-            if fmJob and game.JobId == fmJob and not _G.trainingHopped then
+            if fmJob and game.JobId == fmJob and _G.didTrialInFM and not _G.trainingHopped then
                 _G.trainingHopped = true
+                _G.didTrialInFM = false
                 State.didEnterTrialThisTurn = false -- BS-5: rời fullmoon để training → reset
-                status("[TRAINING] Trial done → hop low-player training server")
+                status("[TRAINING] In_trial xong → hop low-player training server")
                 TeleportManager.hopTrainingServer("[AFTER-TRIAL-TRAINING]")
                 return true
             end
@@ -2988,6 +2992,11 @@ do
         end
         if myStatus == "done" then return false end
         _G.trainingHopped = false
+
+        -- FIX #3 (user 2026-07-02): TRƯỚC khi join full moon phải check còn cần training không.
+        -- Đã xác nhận cần train 3 lần (ctx.trainConfirmed) → KHÔNG join/ready FM, thả xuống StateMachine
+        -- để train trước (chặn lỗi i=3: join FM → phát hiện cần train → hop ra → gate còn mở → join lại → loop).
+        if ctx.trainConfirmed then return false end
 
         -- CHƯA lock full moon (hoặc chưa có fmJob) → current báo moon + "Waiting for Ally"; con khác chờ
         -- FIX stt1: thêm "or not fmJob" (Promt.md §XI dòng 639) → tránh hopToJob(nil) khi lock mà jobid chưa propagate
@@ -3022,11 +3031,12 @@ do
         -- (gate_open ≈ Main1 đã báo ready + đủ Ally). Trước đó → thả xuống StateMachine = waiting/train song song.
         if State.fullmoonLocked and State.gateOpen and State.gateOpenedOnce and fmJob then
             if game.JobId ~= fmJob then
-                -- CHƯA vào server 2 Ally → báo moon + spam join theo lượt (server xếp theo thời điểm tới, không chen hàng)
+                -- CHƯA vào server 2 Ally → spam join theo lượt. Báo "waiting" (KHÔNG "moon"):
+                -- chỉ main1/current mới được "moon". Main2-6 đang đi vào = waiting (yêu cầu user 2026-07-02).
                 if (tick() - _lastMainJoinSpam) >= (State.joinSpamInterval or 5) then
                     _lastMainJoinSpam = tick()
-                    State.setMyMainStatus("moon")
-                    status("[MAIN] Gate open → moon → spam join full moon: " .. tostring(fmJob))
+                    State.setMyMainStatus("waiting")
+                    status("[MAIN] Gate open → spam join full moon: " .. tostring(fmJob))
                     TeleportManager.hopToJob(fmJob, "[MAIN2-6-SPAM-JOIN]")
                 end
                 return true
@@ -3178,6 +3188,8 @@ do
             end
             _G.inTrial = true
             State.didEnterTrialThisTurn = true -- CLEAN JOIN: đã vào trial thật lượt này
+            -- FIX #4: đánh dấu ĐÃ in_trail khi đang ở đúng server full moon → cho phép hop training SAU trial
+            if isMain and State.fullmoonJobid and game.JobId == State.fullmoonJobid then _G.didTrialInFM = true end
             if State.trialStartedAt == 0 then State.trialStartedAt = tick() end
             StateMachine.transition(S.IN_TRIAL, "in trial zone")
             status((isMain and "[MAIN " .. tostring(myStt) .. "]" or "[ALLY]") .. " 🔥 IN-TRIAL → đang làm trial")
@@ -3201,7 +3213,7 @@ do
 
         -- ===== CLEAN JOIN: LỚP ĐIỀU HƯỚNG (chỉ teleport). true=dừng; false=thả xuống trial/training gốc =====
         if Config.scout then
-            local handled = ScoutNavigator.tick({ isMain = isMain, myStatus = myStatus, currentmain = currentmain, myStt = myStt })
+            local handled = ScoutNavigator.tick({ isMain = isMain, myStatus = myStatus, currentmain = currentmain, myStt = myStt, trainConfirmed = trainConfirmed })
             if handled then return end
             -- re-read sau ScoutNavigator: có thể đã set ready/moon trong cùng tick này
             if isMain then myStatus = State.getMainStatus(me) end
