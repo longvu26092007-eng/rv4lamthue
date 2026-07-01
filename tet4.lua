@@ -2883,7 +2883,7 @@ do
     _G.isScoutAlly = isScoutAlly
 
     local _lastGetSeverApi = 0     -- chống spam /getseverapi
-    local _getSeverApiCooldown = 8  -- giây: gọi /getseverapi tối đa 1 lần/8s
+    local _getSeverApiCooldown = 5  -- giây: Ally loop phát hiện hết FM + xin server mới mỗi 5s (yêu cầu user)
     local _joinMoonReported = false -- tránh POST liên tục khi đang hop
 
     local function allyTick()
@@ -3081,6 +3081,30 @@ do
         -- CLEAN JOIN: lượt mới (waiting) → reset cờ đã-vào-trial
         if isMain and (myStatus == "waiting" or myStatus == "") then State.didEnterTrialThisTurn = false end
 
+        -- ===== 3-STRIKE TRAINING CHECK (yêu cầu user 2026-07-02) =====
+        -- DÙ ĐANG Ở STATUS NÀO (kể cả "ready"), main vừa vào phải CHECK training. Chỉ khi
+        -- xác nhận "cần train" 3 LẦN LIÊN TIẾP (mỗi lần cách ≥1.5s = 3 lần đọc remote thật)
+        -- mới thật sự chuyển "training" + DỪNG mọi hành động. Tránh vừa vào full moon đã nhảy
+        -- training khi chưa kịp check. ready vẫn chạy check này song song (priority ready vẫn cao
+        -- nhất — chỉ 3-strike train mới được ghi đè ready). Reset streak ngay khi trialable/done/gear.
+        if isMain then
+            if not _G.trainCheckLastT or (tick() - _G.trainCheckLastT) >= 1.5 then
+                _G.trainCheckLastT = tick()
+                local upg = Training.checkUpgradeForRole("main")
+                if upg and not upg.uncertain then
+                    if upg.needTrain then
+                        _G.trainNeedStreak = (_G.trainNeedStreak or 0) + 1
+                    elseif upg.trialable or upg.done or upg.canBuyGear then
+                        _G.trainNeedStreak = 0
+                    end
+                    -- uncertain (remote fail) → giữ nguyên streak (không cộng, không reset)
+                end
+            end
+        else
+            _G.trainNeedStreak = 0
+        end
+        local trainConfirmed = isMain and (_G.trainNeedStreak or 0) >= 3
+
         -- ===== chuẩn hoá status main (File A 1702-1742) =====
         if isMain then
             if AB == "done" then
@@ -3184,6 +3208,17 @@ do
         end
 
         -- ===== NHÁNH MAIN (File A 1811-1909) =====
+        -- 3-STRIKE: đã xác nhận cần train 3 lần → CHUYỂN training + DỪNG mọi hành động khác
+        -- (ghi đè cả "ready"). Đặt TRƯỚC mọi nhánh main để chặn vào trial/door khi thật sự cần train.
+        if isMain and trainConfirmed and AB ~= "done" then
+            if myStatus ~= "training" then State.setMyMainStatus("training"); myStatus = "training" end
+            State.didEnterTrialThisTurn = false
+            StateMachine.transition(S.TRAINING, "3-strike need train")
+            status("[MAIN " .. myStt .. "] Cần train (xác nhận 3 lần) → training, dừng hành động khác")
+            Training.handleTraining("[MAIN " .. myStt .. "]", AB, function() State.setMyMainStatus("training") end)
+            return
+        end
+
         if isMain and myStatus == "done" then
             StateMachine.transition(S.DONE, "full gear")
             status("[MAIN " .. myStt .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
