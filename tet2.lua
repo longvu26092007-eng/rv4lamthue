@@ -2622,23 +2622,53 @@ end
 
 local function startTeamRecoveryLoop()
     task.spawn(function()
-        task.wait(10)
+        -- FIX hop→team: KHÔNG wait 10s nữa. Ngay sau boot/hop, ChooseTeam có thể xuất hiện trong
+        -- vài giây đầu rồi tự đóng nếu không click kịp. Poll 0.5s trong 60s đầu, sau đó 2s.
+        local startT = tick()
         while Runtime.alive do
-            task.wait(2)
+            local elapsed = tick() - startT
+            task.wait(elapsed < 60 and 0.5 or 2)
             if not TeamManager._started then break end
-            -- kiểm tra ChooseTeam hiện
-            local ok_ct, chooseGui = pcall(function()
-                return LocalPlayer.PlayerGui:FindFirstChild("ChooseTeam", true)
-            end)
-            if ok_ct and chooseGui and chooseGui.Visible then
-                Logger.info("[TEAM] retry ChooseTeam", "team_retry")
-                status("Recovering ChooseTeam...")
-                TeamManager.ensureTeamSelected()
-            elseif not LocalPlayer.Team then
+            if LocalPlayer.Team then
+                -- đã có team, thỉnh thoảng check lại phòng mất team (server reset, hop mới)
+                task.wait(3)
+            else
+                -- chưa có team → thử ngay
                 Logger.info("[TEAM] missing team, retrying", "team_missing")
                 status("Recovering team...")
                 TeamManager.ensureTeamSelected()
             end
+        end
+    end)
+    -- FIX hop→team: lắng nghe ChooseTeam xuất hiện trong PlayerGui (signal-based, không phụ thuộc poll interval)
+    task.spawn(function()
+        while Runtime.alive do
+            local pgui = LocalPlayer:FindFirstChild("PlayerGui")
+            if pgui then
+                pgui.ChildAdded:Connect(function(child)
+                    if not Runtime.alive then return end
+                    if not child:FindFirstChild("ChooseTeam") then return end
+                    -- ChooseTeam screen vừa xuất hiện → chọn team ngay
+                    task.wait(0.1) -- 1 frame để UI init
+                    if not LocalPlayer.Team then
+                        Logger.info("[TEAM] ChooseTeam detected (signal) → ensureTeamSelected", "team_signal")
+                        status("ChooseTeam detected → selecting team...")
+                        TeamManager.ensureTeamSelected()
+                    end
+                end)
+                -- cũng check DescendantAdded phòng ChooseTeam nằm trong ScreenGui con
+                pgui.DescendantAdded:Connect(function(desc)
+                    if not Runtime.alive then return end
+                    if desc.Name ~= "ChooseTeam" then return end
+                    task.wait(0.1)
+                    if not LocalPlayer.Team then
+                        Logger.info("[TEAM] ChooseTeam descendant detected (signal) → ensureTeamSelected", "team_signal_desc")
+                        TeamManager.ensureTeamSelected()
+                    end
+                end)
+                break
+            end
+            task.wait(0.5)
         end
     end)
 end
@@ -2847,6 +2877,10 @@ do
     end
     _G.isScoutAlly = isScoutAlly
 
+    local _lastGetSeverApi = 0     -- chống spam /getseverapi
+    local _getSeverApiCooldown = 8  -- giây: gọi /getseverapi tối đa 1 lần/8s
+    local _joinMoonReported = false -- tránh POST liên tục khi đang hop
+
     local function allyTick()
         if not isScoutAlly() then
             State.reportStatus("moon")
@@ -2855,20 +2889,45 @@ do
         end
         local target = State.allyTargetJobid or State.fullmoonJobid
         if not target then
+            -- Hết FM hoặc chưa có candidate → gọi /getseverapi để xin server mới
+            if (tick() - _lastGetSeverApi) >= _getSeverApiCooldown then
+                _lastGetSeverApi = tick()
+                local placeId = tostring(game.PlaceId)
+                task.spawn(function()
+                    local url = endpoint("/getseverapi", { name = Config.myName, placeid = placeId })
+                    local ok, body = Net.getRaw(url)
+                    if ok and body then
+                        local good, res = pcall(function() return HttpService:JSONDecode(body) end)
+                        if good and res and res.ok and res.jobid and res.jobid ~= "" then
+                            Logger.info("[ALLY-GETSEV] Server gợi ý jobid=" .. tostring(res.jobid), "ally_getsev")
+                            -- server /curmain sẽ cập nhật allyTargetJobid, không cần tự set
+                        else
+                            Logger.info("[ALLY-GETSEV] Không có server phù hợp placeid=" .. placeId, "ally_getsev_nil")
+                        end
+                    end
+                end)
+            end
             State.reportStatus("moon")
             status("[ALLY-HOLD] Chờ server cấp candidate full moon...")
             return true
         end
         if game.JobId ~= target then
-            _allyFmConfirmedAt = 0 -- đang bay tới server khác → không tính grace của server cũ
+            -- ĐANG HOP: báo join_moon (đang trên đường vào) thay vì moon
+            _allyFmConfirmedAt = 0
+            if not _joinMoonReported then
+                _joinMoonReported = true
+                State.reportStatus("join_moon")
+            end
             if (tick() - _lastAllyHoldHop) >= (State.joinSpamInterval or 5) then
                 _lastAllyHoldHop = tick()
-                status("[ALLY-HOLD] Join server full moon: " .. tostring(target))
+                status("[ALLY-HOLD] join_moon → Join server full moon: " .. tostring(target))
+                _G.allyHopArmedT = tick()
                 TeleportManager.hopToJob(target, "[ALLY-HOLD-FULLMOON]")
             end
             return true
         end
-        -- ĐÃ ở target
+        -- ĐÃ ở target → reset cờ join_moon
+        _joinMoonReported = false
         if isfullmoon() then
             -- CÒN full moon → GIỮ server (cấm rời), báo ally, THẢ xuống logic ally gốc (cửa/giúp)
             _allyFmConfirmedAt = tick()
@@ -2878,14 +2937,29 @@ do
             return false
         elseif _allyFmConfirmedAt > 0 and (tick() - _allyFmConfirmedAt) < ALLY_FM_GRACE then
             -- CHỐNG FLICKER: moon vừa "tắt" nhưng chưa quá grace (world có thể chưa load lại sau hop)
-            -- → coi như VẪN full moon, GIỮ server + vẫn báo ally (server không tụt ally-count → không unlock nhầm)
+            -- → coi như VẪN full moon, GIỮ server + vẫn báo ally
             State.reportStatus("ally")
             status("[ALLY-HOLD] moon flicker (" .. string.format("%.1f", tick() - _allyFmConfirmedAt) .. "s) → giữ server")
             return false
         else
-            -- HẾT full moon THẬT (quá grace) → KHÔNG tự hop, chờ server unlock + cấp candidate mới
+            -- HẾT full moon THẬT (quá grace) → gọi /getseverapi để xin server mới, báo moon chờ unlock
+            _allyFmConfirmedAt = 0
+            if (tick() - _lastGetSeverApi) >= _getSeverApiCooldown then
+                _lastGetSeverApi = tick()
+                local placeId = tostring(game.PlaceId)
+                task.spawn(function()
+                    local url = endpoint("/getseverapi", { name = Config.myName, placeid = placeId })
+                    local ok, body = Net.getRaw(url)
+                    if ok and body then
+                        local good, res = pcall(function() return HttpService:JSONDecode(body) end)
+                        if good and res and res.ok and res.jobid and res.jobid ~= "" then
+                            Logger.info("[ALLY-GETSEV] FM ended → server gợi ý jobid=" .. tostring(res.jobid), "ally_getsev_end")
+                        end
+                    end
+                end)
+            end
             State.reportStatus("moon")
-            status("[ALLY-HOLD] FullMoon ended, chờ server unlock...")
+            status("[ALLY-HOLD] FullMoon ended, chờ server unlock + /getseverapi...")
             return true
         end
     end
