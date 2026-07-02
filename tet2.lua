@@ -1372,29 +1372,21 @@ do
     function TeleportManager.hopToJob(jobid, reason)
         jobid = tostring(jobid or "")
         if jobid == "" or jobid == game.JobId then return false end
-        -- HARD LOCK: Ally1 đang GIỮ THẬT locked fullmoon (server lock + đứng đúng jobid + FM còn thật)
-        -- → KHÔNG hop sang server khác. Sau khi unlock (State.fullmoonLocked=false) → hop được phép.
+        -- HARD LOCK: Ally1 đang giữ locked fullmoon → KHÔNG hop sang server khác
         if State.myRole == "ally"
             and State.fullmoonLocked == true
             and State.fullmoonJobid and State.fullmoonJobid ~= ""
             and game.JobId == State.fullmoonJobid
             and jobid ~= State.fullmoonJobid
         then
-            local fmNow = isfullmoon()
-            if fmNow == true or fmNow == nil then
-                DBG("[ALLY1] BLOCK hop: holding locked fullmoon @ " .. tostring(State.fullmoonJobid), "warn", "ally1_block_hop")
-                return false
-            end
-            -- fmNow == false: FM đã mất → AllyFullMoonWatch xử lý /fmlost. Nếu State.fullmoonLocked
-            -- vẫn còn (chưa clear) → KHÔNG block cứng, cho hop tiếp sau khi Watch unlock xong.
-            -- Tránh kẹt: Watch gọi handleFmLostAccepted → State.fullmoonLocked=false → hop được.
+            DBG("[ALLY1] BLOCK hop: holding locked fullmoon @ " .. tostring(State.fullmoonJobid), "warn", "ally1_block_hop")
+            return false
         end
         if _lastJobHop[jobid] and (tick() - _lastJobHop[jobid]) < Config.RALLY_HOP_THROTTLE then return false end
         _lastJobHop[jobid] = tick()
         _G.rallyHopArmedT = tick()
         _G.lastRallyJob   = jobid
         DBG(("[RALLY] %s -> teleport %s"):format(tostring(reason), tostring(jobid)), "ok", "rally_hop")
-        status("[ALLY1] hop new fullmoon job @ " .. tostring(jobid))
         local ok = pcall(function()
             ReplicatedStorage:WaitForChild("__ServerBrowser", 10):InvokeServer("teleport", jobid)
         end)
@@ -3392,59 +3384,6 @@ do
     local _joinMoonReported = false -- tránh POST liên tục khi đang hop
     local _leaderTarget = nil       -- jobid Ally1 tự xin từ /getseverapi (trước khi server chốt)
     local _lastLockMoon = 0         -- chống spam /lockmoon
-
-    -- DEAD FM JOB TTL: chặn reuse job cũ vừa mất full moon
-    local DeadFullmoonJobs = {}
-    local DEAD_FM_JOB_TTL = 120
-    local function markDeadFmJob(jobid)
-        if jobid and jobid ~= "" then
-            DeadFullmoonJobs[jobid] = tick()
-        end
-    end
-    local function isDeadFmJob(jobid)
-        if not jobid or jobid == "" then return false end
-        local t = DeadFullmoonJobs[jobid]
-        if not t then return false end
-        if tick() - t > DEAD_FM_JOB_TTL then
-            DeadFullmoonJobs[jobid] = nil
-            return false
-        end
-        return true
-    end
-
-    -- handleFmLostAccepted: gọi sau khi server accept /fmlost hoặc trả no_fullmoon_lock/stale_jobid
-    -- → clear local state cũ, chuyển sang mode scout FM mới. KHÔNG blacklist old jobid.
-    local function handleFmLostAccepted(oldJobid, reason)
-        -- KHÔNG markDeadFmJob — API ngoài luôn trả server mới nhất, không cần dead-list
-
-        if _leaderTarget == oldJobid then
-            _leaderTarget = nil
-        end
-        if State.fullmoonJobid == oldJobid then
-            State.fullmoonJobid = nil
-        end
-        State.fullmoonLocked = false
-        State.gateOpen = false
-        State.gateOpenedOnce = false
-
-        State.reportStatus("moon")
-        status("[ALLY1] /fmlost accepted @ " .. tostring(oldJobid) .. " reason=" .. tostring(reason) .. " → clear local + request new FM")
-
-        if _G.__leaderOnFmLost then pcall(_G.__leaderOnFmLost) end
-
-        -- reset AllyFullMoonWatch
-        if AllyFullMoonWatch then
-            AllyFullMoonWatch._confirmedReal = false
-            AllyFullMoonWatch._fmConfirmedAt = 0
-            AllyFullMoonWatch._lostFiredForJob = nil
-            AllyFullMoonWatch._watchJob = nil
-        end
-
-        task.spawn(function()
-            task.wait(0.2)
-            leaderRequestServer("fm_lost_accepted")
-        end)
-    end
     -- HOOK: AllyFullMoonWatch (1 authority phá lock) gọi khi đã /fmlost → clear target chết để nhịp
     -- allyLeaderTick sau thấy target=nil → tự /getseverapi xin server mới. Đây là cầu nối để leaderTick
     -- KHÔNG tự quyết rời (chống hop sớm) mà vẫn xin được server mới sau khi Watch xác nhận hết FM.
@@ -3460,45 +3399,27 @@ do
 
     -- Ally1 xin server full moon mới (server lọc đúng placeid của Ally1) → set _leaderTarget để hop.
     local function leaderRequestServer(reasonTag)
-        -- CHỈ skip khi đang THẬT SỰ giữ locked FM hiện tại (server lock + đứng đúng jobid + moon còn thật)
+        -- HARD LOCK: đang giữ locked fullmoon job → KHÔNG xin server mới
         if State.myRole == "ally"
             and State.fullmoonLocked == true
             and State.fullmoonJobid and State.fullmoonJobid ~= ""
             and game.JobId == State.fullmoonJobid
         then
-            local fmNow = isfullmoon()
-            if fmNow == true or fmNow == nil then
-                DBG("[ALLY1] skip getseverapi: locked fullmoon still held @ " .. tostring(State.fullmoonJobid), "info", "ally1_skip_getsev")
-                return
-            end
-            -- fmNow == false: FM đã mất nhưng State.fullmoonLocked chưa clear → cho xin server mới
+            DBG("[ALLY1] skip getseverapi: locked fullmoon still held @ " .. tostring(State.fullmoonJobid), "info", "ally1_skip_getsev")
+            return
         end
         if (tick() - _lastGetSeverApi) < _getSeverApiCooldown then return end
         _lastGetSeverApi = tick()
         local placeId = tostring(game.PlaceId)
-        State.reportStatus("moon")
-        status("[ALLY1] request fullmoon server reason=" .. tostring(reasonTag))
         task.spawn(function()
             local url = endpoint("/getseverapi", { name = Config.myName, placeid = placeId })
             local ok, body = Net.getRaw(url)
             if ok and body then
                 local good, res = pcall(function() return HttpService:JSONDecode(body) end)
                 if good and res and res.ok and res.jobid and res.jobid ~= "" then
-                    local newJob = tostring(res.jobid)
-                    -- KHÔNG check isDeadFmJob nữa — API ngoài luôn trả server mới nhất
-                    -- Chỉ reject khi sai placeid thật sự
-                    if tostring(res.placeid or "") ~= "" and tostring(res.placeid) ~= placeId then
-                        Logger.info("[ALLY1] reject wrong placeid job: got=" .. tostring(res.placeid) .. " current=" .. placeId, "ally1_wrong_placeid")
-                        State.reportStatus("moon")
-                        _lastGetSeverApi = tick()
-                    else
-                        _leaderTarget = newJob
-                        State.allyTargetJobid = newJob
-                        Logger.info("[ALLY1] /getseverapi response jobid=" .. newJob
-                            .. " placeid=" .. tostring(res.placeid or "")
-                            .. " players=" .. tostring(res.players or "?"), "ally1_getsev")
-                        if _G.__leaderSetTarget then pcall(_G.__leaderSetTarget, _leaderTarget) end
-                    end
+                    _leaderTarget = tostring(res.jobid)
+                    Logger.info("[ALLY1-GETSEV] " .. tostring(reasonTag) .. " server cấp jobid=" .. _leaderTarget
+                        .. " (placeid=" .. placeId .. ")", "ally1_getsev")
                 else
                     Logger.info("[ALLY1-GETSEV] không có server phù hợp placeid=" .. placeId, "ally1_getsev_nil")
                 end
@@ -3527,40 +3448,25 @@ do
                     end)
                 end
                 status("[ALLY1] HOLD locked FM @ " .. tostring(lockedFmJob) .. " (fmNow=true)")
-                return true  -- trả true để KHÔNG rơi xuống ally helper
+                return false
             elseif fmNow == nil then
                 -- Sky chưa load → chưa kết luận, giữ nguyên, Watch sẽ phán quyết
                 status("[ALLY1] HOLD locked FM @ " .. tostring(lockedFmJob) .. " (Sky loading, fmNow=nil)")
-                return true  -- trả true để KHÔNG rơi xuống ally helper
+                return false
             else
                 -- fmNow == false: có vẻ hết FM → KHÔNG tự hop, giao AllyFullMoonWatch xử lý qua grace
                 status("[ALLY1] locked FM maybe lost @ " .. tostring(lockedFmJob) .. " → hold, chờ Watch xác nhận")
-                return true  -- trả true để KHÔNG rơi xuống ally helper
-            end
-        end
-
-        -- Case: server không còn lock nhưng _leaderTarget cũ vẫn tồn tại → clear và xin server mới
-        if _leaderTarget and not locked then
-            local fmNow = isfullmoon()
-            if fmNow == false then
-                status("[ALLY1] old target no longer locked and no FM → clear target, request new FM")
-                -- KHÔNG markDeadFmJob — API ngoài luôn trả server mới nhất
-                _leaderTarget = nil
-                State.fullmoonJobid = nil
-                State.reportStatus("moon")
-                leaderRequestServer("old_target_unlocked")
-                return true
+                return false
             end
         end
 
         -- đã có server chốt (fullmoonJobid) → coi đó là đích; chưa có → dùng _leaderTarget tự xin
         local target = State.fullmoonJobid or _leaderTarget
         if not target then
-            -- Không có target: scout mode, xin server mới, KHÔNG chờ current main
+            leaderRequestServer("[no-target]")
             State.reportStatus("moon")
             status("[ALLY1] Xin server full moon (placeid=" .. tostring(game.PlaceId) .. ")...")
-            leaderRequestServer("[no-target]")
-            return true  -- trả true để KHÔNG rơi xuống ally helper "Waiting for current main"
+            return true
         end
         if game.JobId ~= target then
             -- ĐANG HOP tới server candidate
@@ -3594,9 +3500,11 @@ do
             end
             State.reportStatus("ally")
             status("[ALLY1] Holding FullMoon " .. tostring(target) .. " → CHỐT + ally")
-            return true  -- trả true để KHÔNG rơi xuống ally helper
+            return false
         elseif fmState == nil then
             -- Sky chưa load xong (texture rỗng) → chưa kết luận, KHÔNG phải "hết FM".
+            -- Nếu đã từng confirm FM lượt này (_allyFmConfirmedAt>0) → gửi /lockmoon ngay
+            -- để không bị muộn 3 phút do Sky lag. Watch sẽ phán quyết sau khi Sky load.
             if _allyFmConfirmedAt > 0 and State.fullmoonJobid ~= target and (tick() - _lastLockMoon) >= 3 then
                 _lastLockMoon = tick()
                 task.spawn(function()
@@ -3608,12 +3516,30 @@ do
             end
             State.reportStatus("ally")
             status("[ALLY1] Sky đang load @ " .. tostring(target) .. " → giữ chỗ")
-            return true  -- trả true để KHÔNG rơi xuống ally helper
+            return false
         else
-            -- fmState == false: FM CÓ VẺ tắt → giao AllyFullMoonWatch xác nhận, không tự quyết.
+            -- fmState == false: FM CÓ VẺ tắt.
+            -- Tới được đây nghĩa là target KHÔNG phải locked-fullmoon đang-giữ (case đó đã bị chặn ở
+            -- block "HARD LOCK GUARD" đầu hàm). Target ở đây chỉ là _leaderTarget/candidate CHƯA lock
+            -- (hoặc server vừa UNLOCK khiến State.fullmoonJobid=nil). AllyFullMoonWatch KHÔNG can thiệp
+            -- case này (nó early-return khi State.fullmoonJobid==nil hoặc game.JobId~=fullmoonJobid),
+            -- nên nếu ngồi "chờ Watch" thì _leaderTarget dính server chết VĨNH VIỄN → Ally1 kẹt
+            -- "Waiting for current main" (bug user 2026-07-02: server /fmlost + unlock đúng, Ally2 sang
+            -- moon, nhưng Ally1 không xin server mới). PHẢI tự bỏ target chết + /getseverapi.
+            if _allyFmConfirmedAt == 0 then _allyFmConfirmedAt = tick() end
+            if (tick() - _allyFmConfirmedAt) >= ALLY_FM_GRACE then
+                -- quá grace mà vẫn KHÔNG phải full moon → server này chết → bỏ target + xin server mới ngay
+                if _leaderTarget == target then _leaderTarget = nil end
+                _allyFmConfirmedAt = 0
+                State.reportStatus("moon")
+                leaderRequestServer("[candidate-not-fm]")
+                status("[ALLY1] Candidate " .. tostring(target) .. " KHÔNG full moon (quá grace) → bỏ, xin server mới")
+                return true
+            end
+            -- còn trong grace → coi là flicker/world chưa load, giữ tạm
             State.reportStatus("ally")
-            status("[ALLY1] moon pending @ " .. tostring(target) .. " → giữ (chờ AllyFullMoonWatch xác nhận)")
-            return true  -- trả true để KHÔNG rơi xuống ally helper "Waiting for current main"
+            status("[ALLY1] moon pending @ " .. tostring(target) .. " → giữ (grace, tự bỏ nếu quá " .. tostring(ALLY_FM_GRACE) .. "s)")
+            return false
         end
     end
 
@@ -3854,44 +3780,33 @@ do
             AllyFullMoonWatch._fmConfirmedAt = 0
             AllyFullMoonWatch._confirmedReal = false
             AllyFullMoonWatch._watchJob = nil
-            AllyFullMoonWatch._lostFiredForJob = fmJob
             Logger.info("[ALLY-WATCH] HẾT full moon @ " .. tostring(fmJob) .. " → POST /fmlost + xin server mới", "ally_watch_lost")
             status("[ALLY-WATCH] FullMoon ended → phá lock + xin server mới...")
-            -- POST /fmlost và ĐỌC response để quyết định clear local state
+            -- 1) Clear state local NGAY để allyLeaderTick không còn thấy target cũ → không kẹt "waiting current main"
+            if _G.__leaderOnFmLost then pcall(_G.__leaderOnFmLost) end
+            -- Xóa fullmoonJobid local ngay (không đợi /curmain poll) → nhịp tiếp allyLeaderTick thấy nil → tự getseverapi
+            State.fullmoonJobid = nil
+            State.serverCurJobid = nil
+            -- 2) POST /fmlost lên server phá lock
             task.spawn(function()
-                local oldJobid = fmJob
-                local ok, code, body = Net.raw("POST",
-                    endpoint("/fmlost", { name = Config.myName }),
-                    HttpService:JSONEncode({ jobid = oldJobid }))
-                local accepted = false
-                local ignored  = false
-                local reason   = nil
-                if ok and body then
-                    local good, res = pcall(function() return HttpService:JSONDecode(body) end)
-                    if good and type(res) == "table" then
-                        accepted = (res.accepted == true or res.unlocked == true) and (res.ignored ~= true)
-                        ignored  = res.ignored == true
-                        reason   = res.reason
+                pcall(function()
+                    Net.postJSON(endpoint("/fmlost", { name = Config.myName }), { jobid = fmJob }, "fmlost")
+                end)
+            end)
+            -- 3) Xin server full moon mới ngay (không đợi allyLeaderTick nhịp sau)
+            local placeId = tostring(game.PlaceId)
+            task.spawn(function()
+                local url = endpoint("/getseverapi", { name = Config.myName, placeid = placeId })
+                local ok, bodyRes = Net.getRaw(url)
+                if ok and bodyRes then
+                    local good, res = pcall(function() return HttpService:JSONDecode(bodyRes) end)
+                    if good and res and res.ok and res.jobid and res.jobid ~= "" then
+                        -- Set _leaderTarget qua hook nếu ScoutNavigator expose nó
+                        if _G.__leaderSetTarget then pcall(_G.__leaderSetTarget, res.jobid) end
+                        Logger.info("[ALLY-WATCH] server cấp jobid mới=" .. tostring(res.jobid), "ally_watch_newsev")
+                    else
+                        Logger.info("[ALLY-WATCH] không có server mới (getseverapi nil)", "ally_watch_newsev_nil")
                     end
-                end
-                if accepted then
-                    Logger.info("[ALLY-WATCH] /fmlost accepted @ " .. tostring(oldJobid) .. " reason=" .. tostring(reason), "ally_watch_accepted")
-                    handleFmLostAccepted(oldJobid, reason)
-                elseif ignored then
-                    Logger.info("[ALLY-WATCH] /fmlost ignored reason=" .. tostring(reason) .. " @ " .. tostring(oldJobid), "ally_watch_ignored")
-                    if reason == "leader_still_holding_fm" then
-                        -- server vẫn thấy leader giữ FM → tiếp tục hold, KHÔNG clear
-                        status("[ALLY1] /fmlost ignored leader_still_holding_fm → continue holding")
-                    elseif reason == "no_fullmoon_lock" or reason == "stale_jobid" then
-                        -- server đã unlock trước rồi → clear local stale state và xin server mới
-                        Logger.info("[ALLY-WATCH] server already unlocked/stale → clear local + request new FM", "ally_watch_stale")
-                        status("[ALLY1] server already unlocked/stale → clear local + request new FM")
-                        handleFmLostAccepted(oldJobid, reason)
-                    end
-                else
-                    -- request fail hoặc response không rõ → xử lý an toàn như accepted để không kẹt
-                    Logger.warn("[ALLY-WATCH] /fmlost response unclear (ok=" .. tostring(ok) .. ") → clear local anyway", "ally_watch_unclear")
-                    handleFmLostAccepted(oldJobid, "unclear_response")
                 end
             end)
         end
@@ -4287,25 +4202,6 @@ do
             else
                 _G.allyKillReset = false
                 StateMachine.transition(S.WAITING_MAIN, "ally wait main")
-                -- GUARD: Ally leader scout mode KHÔNG được rơi vào "Waiting for current main"
-                -- Nhánh này chỉ dành cho Ally helper thường, không phải Ally1 đang scout FM
-                if _G.isAllyLeader and _G.isAllyLeader() and Config.scout == true then
-                    State.reportStatus("moon")
-                    status("[ALLY1] scout mode active, do not wait current main")
-                    -- Gọi lại allyLeaderTick để xử lý đúng (xin server mới nếu cần)
-                    if _G.isAllyLeader() then
-                        -- allyLeaderTick đã được gọi qua ScoutNavigator.tick ở trên,
-                        -- nhưng nếu vẫn rơi xuống đây → force request server mới
-                        task.spawn(function()
-                            task.wait(0.1)
-                            if not State.fullmoonJobid and not State.fullmoonLocked then
-                                State.reportStatus("moon")
-                                DBG("[ALLY1] force leaderRequestServer from ally-wait guard", "info", "ally1_force_req")
-                            end
-                        end)
-                    end
-                    return
-                end
                 status(roleName .. " Waiting for current main: " .. tostring(currentmain))
             end
         end
