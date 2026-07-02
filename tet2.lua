@@ -3413,9 +3413,9 @@ do
     end
 
     -- handleFmLostAccepted: gọi sau khi server accept /fmlost hoặc trả no_fullmoon_lock/stale_jobid
-    -- → clear local state cũ, chuyển sang mode scout FM mới
+    -- → clear local state cũ, chuyển sang mode scout FM mới. KHÔNG blacklist old jobid.
     local function handleFmLostAccepted(oldJobid, reason)
-        markDeadFmJob(oldJobid)
+        -- KHÔNG markDeadFmJob — API ngoài luôn trả server mới nhất, không cần dead-list
 
         if _leaderTarget == oldJobid then
             _leaderTarget = nil
@@ -3485,12 +3485,18 @@ do
                 local good, res = pcall(function() return HttpService:JSONDecode(body) end)
                 if good and res and res.ok and res.jobid and res.jobid ~= "" then
                     local newJob = tostring(res.jobid)
-                    if isDeadFmJob(newJob) then
-                        Logger.info("[ALLY1] skip dead old FM job @ " .. newJob, "ally1_skip_dead")
+                    -- KHÔNG check isDeadFmJob nữa — API ngoài luôn trả server mới nhất
+                    -- Chỉ reject khi sai placeid thật sự
+                    if tostring(res.placeid or "") ~= "" and tostring(res.placeid) ~= placeId then
+                        Logger.info("[ALLY1] reject wrong placeid job: got=" .. tostring(res.placeid) .. " current=" .. placeId, "ally1_wrong_placeid")
+                        State.reportStatus("moon")
+                        _lastGetSeverApi = tick()
                     else
                         _leaderTarget = newJob
-                        Logger.info("[ALLY1-GETSEV] " .. tostring(reasonTag) .. " server cấp jobid=" .. _leaderTarget
-                            .. " (placeid=" .. placeId .. ")", "ally1_getsev")
+                        State.allyTargetJobid = newJob
+                        Logger.info("[ALLY1] /getseverapi response jobid=" .. newJob
+                            .. " placeid=" .. tostring(res.placeid or "")
+                            .. " players=" .. tostring(res.players or "?"), "ally1_getsev")
                         if _G.__leaderSetTarget then pcall(_G.__leaderSetTarget, _leaderTarget) end
                     end
                 else
@@ -3538,7 +3544,7 @@ do
             local fmNow = isfullmoon()
             if fmNow == false then
                 status("[ALLY1] old target no longer locked and no FM → clear target, request new FM")
-                markDeadFmJob(_leaderTarget)
+                -- KHÔNG markDeadFmJob — API ngoài luôn trả server mới nhất
                 _leaderTarget = nil
                 State.fullmoonJobid = nil
                 State.reportStatus("moon")
