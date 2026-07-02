@@ -574,6 +574,7 @@ do
     State.joinSpamInterval  = 5
     State.mainJoinTimeout   = 45
     State.partyOrder        = {}
+    State.allyLeader        = nil
     State.lastScoutSignalAt = 0
     -- CLEAN JOIN: chống "chưa trial đã done" — chỉ set done/training khi thật sự đã vào trial lượt này
     State.didEnterTrialThisTurn = false
@@ -776,6 +777,7 @@ do
                         State.allyTargetJobid   = nonEmpty(data.ally_target_jobid)
                         State.main1Name         = nonEmpty(data.main1_name)
                         State.requiredAllies    = tonumber(data.required_allies or 2) or 2
+                        State.allyLeader        = nonEmpty(data.ally_leader)
                         State.fullmoonAllyCount = tonumber(data.fullmoon_ally_count or 0) or 0
                         State.candidateAllyCount= tonumber(data.candidate_ally_count or 0) or 0
                         State.joinSpamInterval  = tonumber(data.join_spam_interval or 5) or 5
@@ -1177,7 +1179,26 @@ local function isnight()
     local c = Lighting.ClockTime
     return (c >= 16 or c < 5)
 end
+-- FIX detect full moon (user 2026-07-02): MoonPhase attribute KHÔNG tụt ngay khi moon hết
+-- (game báo "The full moon ends" nhưng attribute vẫn =5) → Ally tưởng còn moon, báo sai, /fmlost
+-- không bao giờ bắn. Dùng Sky.MoonTextureId (asset THẬT, đổi ngay khi hết) như file tham khảo
+-- kickendmoon.txt, + loại "fake moon" ban ngày (texture full nhưng ClockTime 5..12).
+local FULLMOON_TEXTURE = "http://www.roblox.com/asset/?id=9709149431"
+local function moonTextureId()
+    local sky = Lighting:FindFirstChildOfClass("Sky")
+    if sky and sky.MoonTextureId then return sky.MoonTextureId end
+    return ""
+end
 local function isfullmoon()
+    -- ưu tiên texture (chuẩn xác lúc bắt đầu/kết thúc). Sky chưa load → fallback MoonPhase.
+    local tex = moonTextureId()
+    if tex ~= "" then
+        if tex ~= FULLMOON_TEXTURE then return false end
+        -- texture = full moon: loại fake moon ban ngày (ClockTime 5..12 = fake theo kickendmoon.txt)
+        local c = Lighting.ClockTime
+        if c > 5 and c < 12 then return false end
+        return true
+    end
     return Lighting:GetAttribute("MoonPhase") == 5
 end
 _G.isfullmoon = isfullmoon   -- để heartbeat (khai báo trước) gọi được
@@ -2882,9 +2903,153 @@ do
     end
     _G.isScoutAlly = isScoutAlly
 
+    -- Ally1 (LEADER) = ally đầu tiên online do server chốt (ally_leader từ /curmain).
+    -- Fallback: nếu server chưa cấp → dùng ally đầu trong Config online. Ally1 là AUTHORITY:
+    -- tự /getseverapi (đúng placeid) → hop → xác nhận còn FM → /lockmoon. Ally2 chờ jobid đã chốt rồi join.
+    local function isAllyLeader()
+        if not isScoutAlly() then return false end
+        if State.allyLeader and State.allyLeader ~= "" then
+            return State.allyLeader == Config.myName
+        end
+        -- fallback: ally đầu tiên trong Config == mình
+        for _, nm in ipairs(Config.allies or {}) do
+            if State.myRole == "ally" then return nm == Config.myName end
+        end
+        return false
+    end
+    _G.isAllyLeader = isAllyLeader
+
     local _lastGetSeverApi = 0     -- chống spam /getseverapi
-    local _getSeverApiCooldown = 5  -- giây: Ally loop phát hiện hết FM + xin server mới mỗi 5s (yêu cầu user)
+    local _getSeverApiCooldown = 5  -- giây: Ally1 detect hết FM + xin server mới mỗi 5s (yêu cầu user)
     local _joinMoonReported = false -- tránh POST liên tục khi đang hop
+    local _leaderTarget = nil       -- jobid Ally1 tự xin từ /getseverapi (trước khi server chốt)
+    local _lastLockMoon = 0         -- chống spam /lockmoon
+
+    -- Ally1 xin server full moon mới (server lọc đúng placeid của Ally1) → set _leaderTarget để hop.
+    local function leaderRequestServer(reasonTag)
+        if (tick() - _lastGetSeverApi) < _getSeverApiCooldown then return end
+        _lastGetSeverApi = tick()
+        local placeId = tostring(game.PlaceId)
+        task.spawn(function()
+            local url = endpoint("/getseverapi", { name = Config.myName, placeid = placeId })
+            local ok, body = Net.getRaw(url)
+            if ok and body then
+                local good, res = pcall(function() return HttpService:JSONDecode(body) end)
+                if good and res and res.ok and res.jobid and res.jobid ~= "" then
+                    _leaderTarget = tostring(res.jobid)
+                    Logger.info("[ALLY1-GETSEV] " .. tostring(reasonTag) .. " server cấp jobid=" .. _leaderTarget
+                        .. " (placeid=" .. placeId .. ")", "ally1_getsev")
+                else
+                    Logger.info("[ALLY1-GETSEV] không có server phù hợp placeid=" .. placeId, "ally1_getsev_nil")
+                end
+            end
+        end)
+    end
+
+    -- Ally1 báo server HẾT full moon (phá lock để mọi main dừng join) — chỉ khi đang lock đúng jobid.
+    local function leaderReportFmLost(lostJob)
+        task.spawn(function()
+            pcall(function()
+                Net.postJSON(endpoint("/fmlost", { name = Config.myName }),
+                    { jobid = lostJob }, "fmlost_" .. tostring(lostJob))
+            end)
+        end)
+    end
+
+    -- ===== Ally1 (LEADER): tự pick server (đúng placeid) → hop → xác nhận còn FM → /lockmoon → giữ =====
+    local function allyLeaderTick()
+        -- đã có server chốt (fullmoonJobid) → coi đó là đích; chưa có → dùng _leaderTarget tự xin
+        local target = State.fullmoonJobid or _leaderTarget
+        if not target then
+            leaderRequestServer("[no-target]")
+            State.reportStatus("moon")
+            status("[ALLY1] Xin server full moon (placeid=" .. tostring(game.PlaceId) .. ")...")
+            return true
+        end
+        if game.JobId ~= target then
+            -- ĐANG HOP tới server candidate
+            _allyFmConfirmedAt = 0
+            if not _joinMoonReported then _joinMoonReported = true; State.reportStatus("join_moon") end
+            if (tick() - _lastAllyHoldHop) >= (State.joinSpamInterval or 5) then
+                _lastAllyHoldHop = tick()
+                status("[ALLY1] Hop vào server full moon: " .. tostring(target))
+                _G.allyHopArmedT = tick()
+                TeleportManager.hopToJob(target, "[ALLY1-JOIN-FULLMOON]")
+            end
+            return true
+        end
+        -- ĐÃ Ở target
+        _joinMoonReported = false
+        if isfullmoon() then
+            _allyFmConfirmedAt = tick()
+            -- CÒN full moon → CHỐT lên server (/lockmoon) + giữ + báo ally
+            if State.fullmoonJobid ~= target and (tick() - _lastLockMoon) >= 3 then
+                _lastLockMoon = tick()
+                task.spawn(function()
+                    pcall(function()
+                        Net.postJSON(endpoint("/lockmoon", { name = Config.myName }),
+                            { jobid = target }, "lockmoon_" .. tostring(target))
+                    end)
+                end)
+            end
+            State.reportStatus("ally")
+            status("[ALLY1] Holding FullMoon " .. tostring(target) .. " → CHỐT + ally")
+            return false
+        elseif _allyFmConfirmedAt > 0 and (tick() - _allyFmConfirmedAt) < ALLY_FM_GRACE then
+            -- flicker (world chưa load lại sau hop) → coi như vẫn còn
+            State.reportStatus("ally")
+            status("[ALLY1] moon flicker (" .. string.format("%.1f", tick() - _allyFmConfirmedAt) .. "s) → giữ")
+            return false
+        else
+            -- HẾT full moon THẬT → phá lock + xin server mới (check mỗi 5s như user yêu cầu)
+            _allyFmConfirmedAt = 0
+            _leaderTarget = nil
+            if State.fullmoonJobid == target then leaderReportFmLost(target) end
+            leaderRequestServer("[fm-ended]")
+            State.reportStatus("moon")
+            status("[ALLY1] FullMoon HẾT → /fmlost + xin server mới...")
+            return true
+        end
+    end
+
+    -- ===== Ally2 (FOLLOWER): CHỜ Ally1 chốt (fullmoonJobid) rồi join theo. KHÔNG tự pick server. =====
+    local function allyFollowerTick()
+        local target = State.fullmoonJobid   -- chỉ join khi ĐÃ chốt (không dùng candidate/allyTarget mơ hồ)
+        if not target then
+            _allyFmConfirmedAt = 0
+            State.reportStatus("moon")
+            status("[ALLY2] Chờ Ally1 chốt server full moon...")
+            return true
+        end
+        if game.JobId ~= target then
+            _allyFmConfirmedAt = 0
+            if not _joinMoonReported then _joinMoonReported = true; State.reportStatus("join_moon") end
+            if (tick() - _lastAllyHoldHop) >= (State.joinSpamInterval or 5) then
+                _lastAllyHoldHop = tick()
+                status("[ALLY2] Join server full moon Ally1 đã chốt: " .. tostring(target))
+                _G.allyHopArmedT = tick()
+                TeleportManager.hopToJob(target, "[ALLY2-JOIN-FULLMOON]")
+            end
+            return true
+        end
+        _joinMoonReported = false
+        if isfullmoon() then
+            _allyFmConfirmedAt = tick()
+            State.reportStatus("ally")
+            status("[ALLY2] Holding FullMoon " .. tostring(target) .. " → ally")
+            return false
+        elseif _allyFmConfirmedAt > 0 and (tick() - _allyFmConfirmedAt) < ALLY_FM_GRACE then
+            State.reportStatus("ally")
+            status("[ALLY2] moon flicker → giữ")
+            return false
+        else
+            -- Ally2 thấy hết FM → KHÔNG tự xin server (để Ally1 quyết). Chờ server đổi fullmoonJobid.
+            _allyFmConfirmedAt = 0
+            State.reportStatus("moon")
+            status("[ALLY2] FullMoon hết, chờ Ally1 chốt server mới...")
+            return true
+        end
+    end
 
     local function allyTick()
         if not isScoutAlly() then
@@ -2892,81 +3057,8 @@ do
             status("[ALLY] Scout standby (không phải Ally1/Ally2)")
             return true
         end
-        local target = State.allyTargetJobid or State.fullmoonJobid
-        if not target then
-            -- Hết FM hoặc chưa có candidate → gọi /getseverapi để xin server mới
-            if (tick() - _lastGetSeverApi) >= _getSeverApiCooldown then
-                _lastGetSeverApi = tick()
-                local placeId = tostring(game.PlaceId)
-                task.spawn(function()
-                    local url = endpoint("/getseverapi", { name = Config.myName, placeid = placeId })
-                    local ok, body = Net.getRaw(url)
-                    if ok and body then
-                        local good, res = pcall(function() return HttpService:JSONDecode(body) end)
-                        if good and res and res.ok and res.jobid and res.jobid ~= "" then
-                            Logger.info("[ALLY-GETSEV] Server gợi ý jobid=" .. tostring(res.jobid), "ally_getsev")
-                            -- server /curmain sẽ cập nhật allyTargetJobid, không cần tự set
-                        else
-                            Logger.info("[ALLY-GETSEV] Không có server phù hợp placeid=" .. placeId, "ally_getsev_nil")
-                        end
-                    end
-                end)
-            end
-            State.reportStatus("moon")
-            status("[ALLY-HOLD] Chờ server cấp candidate full moon...")
-            return true
-        end
-        if game.JobId ~= target then
-            -- ĐANG HOP: báo join_moon (đang trên đường vào) thay vì moon
-            _allyFmConfirmedAt = 0
-            if not _joinMoonReported then
-                _joinMoonReported = true
-                State.reportStatus("join_moon")
-            end
-            if (tick() - _lastAllyHoldHop) >= (State.joinSpamInterval or 5) then
-                _lastAllyHoldHop = tick()
-                status("[ALLY-HOLD] join_moon → Join server full moon: " .. tostring(target))
-                _G.allyHopArmedT = tick()
-                TeleportManager.hopToJob(target, "[ALLY-HOLD-FULLMOON]")
-            end
-            return true
-        end
-        -- ĐÃ ở target → reset cờ join_moon
-        _joinMoonReported = false
-        if isfullmoon() then
-            -- CÒN full moon → GIỮ server (cấm rời), báo ally, THẢ xuống logic ally gốc (cửa/giúp)
-            _allyFmConfirmedAt = tick()
-            State.reportStatus("ally")
-            status("[ALLY-HOLD] Holding FullMoon " .. tostring(target)
-                .. " (" .. tostring(State.fullmoonAllyCount or 0) .. "/" .. tostring(State.requiredAllies or 2) .. ") → ally")
-            return false
-        elseif _allyFmConfirmedAt > 0 and (tick() - _allyFmConfirmedAt) < ALLY_FM_GRACE then
-            -- CHỐNG FLICKER: moon vừa "tắt" nhưng chưa quá grace (world có thể chưa load lại sau hop)
-            -- → coi như VẪN full moon, GIỮ server + vẫn báo ally
-            State.reportStatus("ally")
-            status("[ALLY-HOLD] moon flicker (" .. string.format("%.1f", tick() - _allyFmConfirmedAt) .. "s) → giữ server")
-            return false
-        else
-            -- HẾT full moon THẬT (quá grace) → gọi /getseverapi để xin server mới, báo moon chờ unlock
-            _allyFmConfirmedAt = 0
-            if (tick() - _lastGetSeverApi) >= _getSeverApiCooldown then
-                _lastGetSeverApi = tick()
-                local placeId = tostring(game.PlaceId)
-                task.spawn(function()
-                    local url = endpoint("/getseverapi", { name = Config.myName, placeid = placeId })
-                    local ok, body = Net.getRaw(url)
-                    if ok and body then
-                        local good, res = pcall(function() return HttpService:JSONDecode(body) end)
-                        if good and res and res.ok and res.jobid and res.jobid ~= "" then
-                            Logger.info("[ALLY-GETSEV] FM ended → server gợi ý jobid=" .. tostring(res.jobid), "ally_getsev_end")
-                        end
-                    end
-                end)
-            end
-            State.reportStatus("moon")
-            status("[ALLY-HOLD] FullMoon ended, chờ server unlock + /getseverapi...")
-            return true
-        end
+        if isAllyLeader() then return allyLeaderTick() end
+        return allyFollowerTick()
     end
 
     local function mainTick(ctx)
@@ -3093,8 +3185,9 @@ do
 
     function AllyFullMoonWatch.check()
         if not Runtime.alive or Runtime.teleporting then return end
-        -- chỉ Ally1/Ally2 (scout ally) mới canh giữ full moon
-        if not (_G.isScoutAlly and _G.isScoutAlly()) then return end
+        -- chỉ Ally1 (LEADER) mới phá lock: nó là authority giữ FM. Ally2 canh nhưng KHÔNG /fmlost
+        -- (tránh phá lock sai khi Ally1 vẫn đang giữ). Ally2 chờ server đổi fullmoonJobid.
+        if not (_G.isAllyLeader and _G.isAllyLeader()) then return end
         local fmJob = State.fullmoonJobid
         -- chưa chốt FM hoặc mình chưa đứng đúng server FM → không phải việc của watch này (allyTick lo join)
         if not fmJob or game.JobId ~= fmJob then
@@ -3954,35 +4047,42 @@ if not Runtime._started then
     Runtime._started = true
     _G[State.myName] = true
 
-    -- cache_v4.json: ghi mốc thời gian jobid hiện tại (File A 34-44)
-    TeleportManager.markVisited(game.JobId)
+    -- Helper: start module an toàn — 1 module lỗi KHÔNG được kéo sập cả startup (root cause "không load").
+    local function safeStart(label, fn)
+        local ok, err = pcall(fn)
+        if not ok then
+            pcall(function() Net.log("ERR", "startup '" .. label .. "' lỗi: " .. tostring(err)) end)
+            pcall(function() Logger.warn("[BOOT] '" .. label .. "' fail: " .. tostring(err), "boot_fail_" .. label) end)
+        end
+    end
 
-    -- network/role/warmer
-    ServerSync.init()
-    ServerSync.startWarmers()
-    ServerSync.startNetProbe()
+    -- ========== ƯU TIÊN 1: THỨ NGƯỜI DÙNG THẤY — chạy TRƯỚC, KHÔNG phụ thuộc network ==========
+    -- Trước đây ServerSync.init() (HTTP retry 8 lần, block ~8-10s / throw) chạy ĐẦU → nếu chậm/lỗi thì
+    -- UI + choose team + main loop phía dưới KHÔNG BAO GIỜ chạy → "không load UI, không chọn team, không load script".
+    -- Giờ: UI + TeamManager lên trước, vô điều kiện; init đẩy xuống thread nền.
+    safeStart("ui", UIManager.start)                 -- UI hiện ngay (kể cả khi mọi thứ khác fail)
+    safeStart("ui_recovery", startUIRecoveryLoop)
+    safeStart("team", TeamManager.start)             -- chọn team ngay (có recovery loop riêng)
+    safeStart("sea", SeaManager.start)
 
-    -- world/move
-    Movement.enableNoclip("return true")
-    CombatActions.startSpamSkills()
-    CombatActions.startFastAttack()
-    CombatActions.startHakiLoop()
+    -- ========== ƯU TIÊN 2: NETWORK / ROLE — chạy NỀN, không block UI/team ==========
+    task.spawn(function()
+        safeStart("markVisited", function() TeleportManager.markVisited(game.JobId) end)
+        safeStart("serversync_init", ServerSync.init)       -- /init retry 8 lần → nền, không treo startup
+        safeStart("warmers", ServerSync.startWarmers)
+        safeStart("netprobe", ServerSync.startNetProbe)
+        safeStart("noguchi", startNoguchiLoop)
+        safeStart("ability_sync", AbilitySync.startLoops)
+    end)
 
-    -- team/sea/gates (TeamManager đã có guard + recovery + ensureTeamSelected)
-    TeamManager.start()
-    SeaManager.start()
-    -- AllyTrainingGate init
-    AllyTrainingGate.start()
-
-    -- ability sync (3 loop file-based) + noguchi
-    AbilitySync.startLoops()
-    startNoguchiLoop()
-
-    -- UI + main loop (UIManager đã có guard + recovery)
-    UIManager.start()
-    startUIRecoveryLoop()
-    AllyFullMoonWatch.start()   -- loop nền Ally1/Ally2 canh hết full moon → /fmlost + /getseverapi
-    MainLoop.start()
+    -- ========== ƯU TIÊN 3: WORLD / COMBAT / VÒNG CHÍNH ==========
+    safeStart("noclip", function() Movement.enableNoclip("return true") end)
+    safeStart("spam_skills", CombatActions.startSpamSkills)
+    safeStart("fast_attack", CombatActions.startFastAttack)
+    safeStart("haki", CombatActions.startHakiLoop)
+    safeStart("ally_train_gate", AllyTrainingGate.start)
+    safeStart("ally_fm_watch", AllyFullMoonWatch.start)  -- loop nền Ally1/Ally2 canh hết full moon
+    safeStart("main_loop", MainLoop.start)               -- vòng chính — LUÔN chạy dù init nền chưa xong
 
     Logger.ok("KaitunV4 bản 2 (modular, port từ File A) khởi động xong. role=" .. tostring(State.myRole))
 end
