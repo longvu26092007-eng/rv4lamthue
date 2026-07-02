@@ -487,9 +487,12 @@ do
     end
 
     -- POST: hàng đợi VÒNG O(1) qHead/qTail + worker + retry + coalesce (File A 191-252)
-    local postQ = {}
-    local qHead = 1   -- vị trí job kế tiếp sẽ lấy
-    local qTail = 0   -- vị trí job cuối đã thêm
+    -- FIX 4b (user 2026-07-02): mainstatus có hàng đợi RIÊNG + 1 worker DUY NHẤT → gửi FIFO tuần tự,
+    -- không còn 4 worker chạy đua ghi đè lệch thứ tự. Các POST khác vẫn dùng postQ + 4 worker chung.
+    local postQ  = {}  -- hàng đợi chung (mọi key trừ "mainstatus")
+    local statusQ = {} -- hàng đợi riêng CHỈ cho mainstatus (1 worker tuần tự)
+    local qHead = 1;  local qTail = 0
+    local sqHead = 1; local sqTail = 0
     local keyed = {}  -- key -> job mới nhất
     local MAX_Q = 800
     local POST_RETRIES = 6
@@ -502,7 +505,19 @@ do
         local job = postQ[qHead]
         postQ[qHead] = nil
         qHead = qHead + 1
-        if qHead > qTail then qHead, qTail = 1, 0 end -- reset index khi rỗng → không phình
+        if qHead > qTail then qHead, qTail = 1, 0 end
+        return job
+    end
+    local function sqPush(job)
+        sqTail = sqTail + 1
+        statusQ[sqTail] = job
+    end
+    local function sqPop()
+        if sqHead > sqTail then return nil end
+        local job = statusQ[sqHead]
+        statusQ[sqHead] = nil
+        sqHead = sqHead + 1
+        if sqHead > sqTail then sqHead, sqTail = 1, 0 end
         return job
     end
     function Net.postJSON(url, tbl, key)
@@ -512,42 +527,57 @@ do
         local job = { url = url, body = bodyStr, key = key, attempts = 0 }
         if key then
             local old = keyed[key]
-            if old then old.replaced = true end -- bỏ job cũ cùng key → chỉ gửi dữ liệu mới nhất
+            if old then old.replaced = true end
             keyed[key] = job
         end
-        if (qTail - qHead + 1) >= MAX_Q then
-            qPop()
-            Net.log("WARN", "postQ tràn, bỏ job cũ nhất")
+        if key == "mainstatus" then
+            -- hàng đợi riêng: 1 worker tuần tự → không out-of-order
+            if (sqTail - sqHead + 1) >= MAX_Q then sqPop() end
+            sqPush(job)
+        else
+            if (qTail - qHead + 1) >= MAX_Q then
+                qPop()
+                Net.log("WARN", "postQ tràn, bỏ job cũ nhất")
+            end
+            qPush(job)
         end
-        qPush(job)
     end
 
-    local function worker()
-        while Runtime.alive do
-            local job = qPop()
-            if not job or job.replaced then
-                task.wait(0.05)
-            else
-                acquirePost()
-                local sok, _, _, err = rawRequest("POST", job.url, job.body)
-                releasePost()
-                if sok then
-                    if job.key and keyed[job.key] == job then keyed[job.key] = nil end
-                else
-                    job.attempts = job.attempts + 1
-                    if (not job.replaced) and job.attempts < POST_RETRIES then
-                        Net.log("WARN", ("POST retry %d/%d %s : %s"):format(job.attempts, POST_RETRIES, job.url, tostring(err)))
-                        task.wait(0.3 * job.attempts)
-                        qPush(job)
-                    elseif not job.replaced then
-                        Net.log("ERR", ("POST bỏ sau %d lần: %s"):format(job.attempts, job.url))
-                        if job.key and keyed[job.key] == job then keyed[job.key] = nil end
-                    end
-                end
+    local function runJob(job, popKeyed)
+        acquirePost()
+        local sok, _, _, err = rawRequest("POST", job.url, job.body)
+        releasePost()
+        if sok then
+            if job.key and keyed[job.key] == job then keyed[job.key] = nil end
+        else
+            job.attempts = job.attempts + 1
+            if (not job.replaced) and job.attempts < POST_RETRIES then
+                Net.log("WARN", ("POST retry %d/%d %s : %s"):format(job.attempts, POST_RETRIES, job.url, tostring(err)))
+                task.wait(0.3 * job.attempts)
+                popKeyed(job)
+            elseif not job.replaced then
+                Net.log("ERR", ("POST bỏ sau %d lần: %s"):format(job.attempts, job.url))
+                if job.key and keyed[job.key] == job then keyed[job.key] = nil end
             end
         end
     end
+    local function worker()
+        while Runtime.alive do
+            local job = qPop()
+            if not job or job.replaced then task.wait(0.05)
+            else runJob(job, qPush) end
+        end
+    end
+    -- 1 worker tuần tự DUY NHẤT cho mainstatus → đảm bảo FIFO, không race
+    local function statusWorker()
+        while Runtime.alive do
+            local job = sqPop()
+            if not job or job.replaced then task.wait(0.05)
+            else runJob(job, sqPush) end
+        end
+    end
     for _ = 1, 4 do task.spawn(worker) end
+    task.spawn(statusWorker)
 
     Net.log("INFO", "Net init — hasReq=" .. tostring(Net.hasReq))
 end
@@ -600,15 +630,29 @@ do
     end
 
     -- POST mainstatus qua queue (retry). Cập nhật cache NGAY để logic dùng giá trị mới (File A 322-326).
+    -- DEDUP (user 2026-07-02): chỉ POST khi status ĐỔI so với lần POST gần nhất; cùng giá trị → chỉ
+    -- cập nhật cache local, KHÔNG spam job (cắt loạn khi tick 0.35s gọi lại cùng status). Vẫn re-POST
+    -- mỗi STATUS_REPOST_MS để chống mất gói (server prune 50s → 5s re-sync vẫn thừa an toàn).
+    State._lastPostedStatus = nil
+    State._lastPostedAt     = 0
+    local STATUS_REPOST_MS  = 5
+    local function pushStatus(statusStr)
+        State.statusCache[State.myName] = { t = tick(), status = statusStr }
+        local changed = statusStr ~= State._lastPostedStatus
+        local stale   = (tick() - State._lastPostedAt) >= STATUS_REPOST_MS
+        if changed or stale then
+            State._lastPostedStatus = statusStr
+            State._lastPostedAt = tick()
+            Net.postJSON(endpoint("/mainstatus", { name = State.myName }), { status = statusStr }, "mainstatus")
+        end
+    end
     function State.setMyMainStatus(statusStr)
         if not State.myMainIndex then return end
-        State.statusCache[State.myName] = { t = tick(), status = statusStr }
-        Net.postJSON(endpoint("/mainstatus", { name = State.myName }), { status = statusStr }, "mainstatus")
+        pushStatus(statusStr)
     end
     -- Báo status cho BẤT KỲ account (kể cả ALLY — không cần myMainIndex). (File A 330-333)
     function State.reportStatus(statusStr)
-        State.statusCache[State.myName] = { t = tick(), status = statusStr }
-        Net.postJSON(endpoint("/mainstatus", { name = State.myName }), { status = statusStr }, "mainstatus")
+        pushStatus(statusStr)
     end
 end
 
@@ -1201,25 +1245,15 @@ local function moonTextureId()
     return ""
 end
 local function isfullmoon()
-    -- ưu tiên texture (chuẩn xác lúc bắt đầu/kết thúc). Sky chưa load → fallback MoonPhase.
+    -- CHỈ 1 CÁCH (user 2026-07-02): texture moon5 THẬT + gate ĐÊM, đúng theo kickendmoon.txt.
+    --   • Sky.MoonTextureId phải = FULLMOON_TEXTURE (asset đổi NGAY khi moon hết → chuẩn xác).
+    --   • Chỉ tính FM khi BAN ĐÊM: ClockTime c<=5 hoặc c>=18 (đúng ngưỡng file tham khảo).
+    -- Bỏ hẳn fallback MoonPhase (attribute không tụt khi moon hết → khoá server vĩnh viễn) và
+    -- ngưỡng c>=16 (chốt sớm ~2 phút gây fake-moon). Texture rỗng (Sky chưa load) → false, chờ load.
     local tex = moonTextureId()
-    if tex ~= "" then
-        if tex ~= FULLMOON_TEXTURE then return false end
-        -- FIX detect full moon (user 2026-07-02): texture moon5 xuất hiện SỚM (cả ban ngày trước đêm FM)
-        -- → trước đây c>=12 đã báo true = chốt server sớm ~6 phút. Theo kickendmoon.txt: FM ACTIVE khi
-        -- ClockTime c<=5 hoặc c>=18 (ban đêm); còn tới FM tính = mmbs(18,c) → c=16 ra đúng "2 Minutes".
-        -- User OK chốt sớm nhưng CHỈ khi còn ≤2 phút. Gộp: chỉ true khi c<=5 (đang/vừa FM) HOẶC c>=16
-        -- (≤2 phút tới FM, gồm cả lúc đang FM 18..24). Khoảng 5<c<16 (fake moon + còn xa) → false.
-        local c = Lighting.ClockTime
-        if c <= 5 or c >= 16 then return true end
-        return false
-    end
-    -- FALLBACK khi texture rỗng (Sky chưa load / MoonTextureId nil): MoonPhase attribute KHÔNG tụt khi
-    -- moon hết (game báo ends nhưng attribute vẫn =5) → nếu trả true trần sẽ khoá server vĩnh viễn (ally
-    -- không bao giờ thấy false → không bắn /fmlost). GATE thêm ClockTime theo đúng luật ≤2 phút để nhất
-    -- quán với nhánh texture: chỉ true khi MoonPhase==5 VÀ (c<=5 hoặc c>=16).
-    local mc = Lighting.ClockTime
-    return Lighting:GetAttribute("MoonPhase") == 5 and (mc <= 5 or mc >= 16)
+    if tex ~= FULLMOON_TEXTURE then return false end
+    local c = Lighting.ClockTime
+    return c <= 5 or c >= 18
 end
 _G.isfullmoon = isfullmoon   -- để heartbeat (khai báo trước) gọi được
 -- Đếm tổng player + số ally đang ở server hiện tại (cho heartbeat → server xếp main theo
@@ -3155,6 +3189,13 @@ do
     local _joinMoonReported = false -- tránh POST liên tục khi đang hop
     local _leaderTarget = nil       -- jobid Ally1 tự xin từ /getseverapi (trước khi server chốt)
     local _lastLockMoon = 0         -- chống spam /lockmoon
+    -- HOOK: AllyFullMoonWatch (1 authority phá lock) gọi khi đã /fmlost → clear target chết để nhịp
+    -- allyLeaderTick sau thấy target=nil → tự /getseverapi xin server mới. Đây là cầu nối để leaderTick
+    -- KHÔNG tự quyết rời (chống hop sớm) mà vẫn xin được server mới sau khi Watch xác nhận hết FM.
+    _G.__leaderOnFmLost = function()
+        _leaderTarget = nil
+        _allyFmConfirmedAt = 0
+    end
 
     -- Ally1 xin server full moon mới (server lọc đúng placeid của Ally1) → set _leaderTarget để hop.
     local function leaderRequestServer(reasonTag)
@@ -3174,16 +3215,6 @@ do
                     Logger.info("[ALLY1-GETSEV] không có server phù hợp placeid=" .. placeId, "ally1_getsev_nil")
                 end
             end
-        end)
-    end
-
-    -- Ally1 báo server HẾT full moon (phá lock để mọi main dừng join) — chỉ khi đang lock đúng jobid.
-    local function leaderReportFmLost(lostJob)
-        task.spawn(function()
-            pcall(function()
-                Net.postJSON(endpoint("/fmlost", { name = Config.myName }),
-                    { jobid = lostJob }, "fmlost_" .. tostring(lostJob))
-            end)
         end)
     end
 
@@ -3226,20 +3257,14 @@ do
             State.reportStatus("ally")
             status("[ALLY1] Holding FullMoon " .. tostring(target) .. " → CHỐT + ally")
             return false
-        elseif _allyFmConfirmedAt > 0 and (tick() - _allyFmConfirmedAt) < ALLY_FM_GRACE then
-            -- flicker (world chưa load lại sau hop) → coi như vẫn còn
-            State.reportStatus("ally")
-            status("[ALLY1] moon flicker (" .. string.format("%.1f", tick() - _allyFmConfirmedAt) .. "s) → giữ")
-            return false
         else
-            -- HẾT full moon THẬT → phá lock + xin server mới (check mỗi 5s như user yêu cầu)
-            _allyFmConfirmedAt = 0
-            _leaderTarget = nil
-            if State.fullmoonJobid == target then leaderReportFmLost(target) end
-            leaderRequestServer("[fm-ended]")
-            State.reportStatus("moon")
-            status("[ALLY1] FullMoon HẾT → /fmlost + xin server mới...")
-            return true
+            -- FM CÓ VẺ tắt: Ally1 KHÔNG tự quyết rời/phá lock ở nhịp 0.35s này nữa (gây hop sớm loạn).
+            -- 1 AUTHORITY DUY NHẤT = AllyFullMoonWatch (loop nền, seed-grace) mới phá lock (/fmlost) +
+            -- xin server mới; khi nó phá lock sẽ gọi _G.__leaderOnFmLost() để clear _leaderTarget → nhịp
+            -- sau target=nil → mình tự xin server mới. Ở đây chỉ GIỮ CHỖ + báo ally, không nhả sớm.
+            State.reportStatus("ally")
+            status("[ALLY1] moon pending @ " .. tostring(target) .. " → giữ (chờ AllyFullMoonWatch xác nhận)")
+            return false
         end
     end
 
@@ -3404,10 +3429,13 @@ local AllyFullMoonWatch = {}
 do
     AllyFullMoonWatch.CHECK_INTERVAL = 5
     AllyFullMoonWatch.GRACE = 8          -- moon "tắt" dưới ngưỡng này = flicker (world chưa load) → bỏ qua
+    AllyFullMoonWatch.ARRIVE_GRACE = 15  -- grace KHỞI ĐỘNG khi vừa tới server (world chưa load xong Sky/moon)
     AllyFullMoonWatch.POST_COOLDOWN = 5  -- chống spam /fmlost + /getseverapi
     AllyFullMoonWatch.started = false
     AllyFullMoonWatch._fmConfirmedAt = 0
     AllyFullMoonWatch._lastPostAt = 0
+    AllyFullMoonWatch._confirmedReal = false -- đã có ÍT NHẤT 1 lần isfullmoon()==true THẬT tại server này chưa
+    AllyFullMoonWatch._watchJob = nil        -- jobid đang canh (đổi server → seed lại grace khởi động)
 
     function AllyFullMoonWatch.start()
         if AllyFullMoonWatch.started then return end
@@ -3429,20 +3457,38 @@ do
         -- chưa chốt FM hoặc mình chưa đứng đúng server FM → không phải việc của watch này (allyTick lo join)
         if not fmJob or game.JobId ~= fmJob then
             AllyFullMoonWatch._fmConfirmedAt = 0
+            AllyFullMoonWatch._confirmedReal = false
+            AllyFullMoonWatch._watchJob = nil
             return
+        end
+        -- VỪA TỚI server này (đổi jobid đang canh) → SEED grace khởi động: coi như vừa xác nhận FM để guard
+        -- chống-flicker luôn hoạt động (không còn kẽ hở "_fmConfirmedAt=0 → hop ngay nhịp đầu khi Sky chưa
+        -- load"). _confirmedReal=false cho tới khi isfullmoon() thật → dùng ARRIVE_GRACE dài ở giai đoạn này.
+        if AllyFullMoonWatch._watchJob ~= fmJob then
+            AllyFullMoonWatch._watchJob = fmJob
+            AllyFullMoonWatch._fmConfirmedAt = tick()
+            AllyFullMoonWatch._confirmedReal = false
         end
         if isfullmoon() then
             AllyFullMoonWatch._fmConfirmedAt = tick()
+            AllyFullMoonWatch._confirmedReal = true -- đã thấy FM THẬT → từ giờ dùng GRACE thường
             return
         end
-        -- moon vừa tắt: dưới GRACE coi là flicker (world chưa load lại) → chờ
+        -- moon "tắt": chưa xác nhận FM thật lần nào tại server này → dùng ARRIVE_GRACE (world đang load);
+        -- đã từng thấy FM thật → dùng GRACE thường. Dưới ngưỡng = flicker → chờ.
+        local grace = AllyFullMoonWatch._confirmedReal and AllyFullMoonWatch.GRACE or AllyFullMoonWatch.ARRIVE_GRACE
         if AllyFullMoonWatch._fmConfirmedAt > 0
-            and (tick() - AllyFullMoonWatch._fmConfirmedAt) < AllyFullMoonWatch.GRACE then
+            and (tick() - AllyFullMoonWatch._fmConfirmedAt) < grace then
             return
         end
         -- HẾT full moon THẬT (quá grace) → phá lock + xin server mới (throttle)
         if (tick() - AllyFullMoonWatch._lastPostAt) < AllyFullMoonWatch.POST_COOLDOWN then return end
         AllyFullMoonWatch._lastPostAt = tick()
+        AllyFullMoonWatch._fmConfirmedAt = 0
+        AllyFullMoonWatch._confirmedReal = false
+        AllyFullMoonWatch._watchJob = nil
+        -- clear _leaderTarget chết trong ScoutNavigator → nhịp allyLeaderTick sau tự /getseverapi xin server mới
+        if _G.__leaderOnFmLost then pcall(_G.__leaderOnFmLost) end
         Logger.info("[ALLY-WATCH] HẾT full moon @ " .. tostring(fmJob) .. " → POST /fmlost (phá lock) + /getseverapi", "ally_watch_lost")
         status("[ALLY-WATCH] FullMoon ended → phá lock + xin server mới...")
         -- 1) phá lock + đóng gate trên server NGAY
@@ -3674,11 +3720,18 @@ do
                 if not isMain then
                     State.reportStatus("ally")
                 else
-                    local fresh_ab, fresh_AB = trialable()
-                    if not fresh_ab then
-                        if fresh_AB == "done" then State.setMyMainStatus("done")
-                        else State.setMyMainStatus("training") end
-                        State.didEnterTrialThisTurn = false -- BS-5: rời trial + chuyển done/training → reset
+                    -- inOwnFFA: trial VỪA xong + đang ở FFA của mình (ffup, gần temple) → KHÔNG flip training/done
+                    -- vội. Giữ in_trail + didEnterTrialThisTurn để nhánh ffup dưới (3745) chạy KILL PLAYER.
+                    -- Trước đây flip ngay → status clobber "ready"/"training" → check in_trail trượt → bay ra cửa.
+                    local inOwnFFA = (templeState() == "ffup")
+                        and (getdis(CFrame.new(TEMPLE_ENTRY_POS)) < 2000)
+                    if not inOwnFFA then
+                        local fresh_ab, fresh_AB = trialable()
+                        if not fresh_ab then
+                            if fresh_AB == "done" then State.setMyMainStatus("done")
+                            else State.setMyMainStatus("training") end
+                            State.didEnterTrialThisTurn = false -- BS-5: rời trial + chuyển done/training → reset
+                        end
                     end
                 end
             end
@@ -3742,7 +3795,11 @@ do
                     status("[MAIN " .. myStt .. "] Đang vào Temple of Time...")
                 elseif ts == "ffup" then
                     StateMachine.transition(S.POST_TRIAL, "ffup")
-                    if myStatus == "in_trail" then
+                    -- FIX kill-after-trial (user 2026-07-02): dùng cờ BỀN didEnterTrialThisTurn thay vì
+                    -- myStatus=="in_trail". myStatus là biến local bị ScoutNavigator ghi đè "ready" trong
+                    -- cùng tick → check "in_trail" trượt → bay ra cửa không kill. Cờ bền chỉ true khi ĐÃ vào
+                    -- trial thật lượt này (reset khi done/training/rời) → phản ánh đúng "vừa trial xong".
+                    if State.didEnterTrialThisTurn then
                         PostTrial.mainKillThenReset(myStt, currentmain)
                     else
                         status("[MAIN " .. myStt .. "] Chờ ở cửa (chưa in_trail → KHÔNG kill)")
