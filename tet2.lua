@@ -749,14 +749,23 @@ do
     end
 
     -- Heartbeat kèm cờ fullmoon (File A 368-373). isfullmoon là global khai báo dưới → pcall.
+    -- NIL-SAFE: isfullmoon() có thể trả nil khi Sky/Moon texture chưa load → KHÔNG gửi fullmoon field
+    -- để tránh overwrite STORE.fullmoon[leader]=true thành false trên server khi Sky đang lag load.
     function ServerSync.sendHeartbeat()
         if not Runtime.alive then return end
-        local fm = false
-        pcall(function() fm = _G.isfullmoon and _G.isfullmoon() and true or false end)
+        -- Lấy fmRaw mà không ép nil → false
+        local fmRaw = nil
+        pcall(function()
+            if _G.isfullmoon then fmRaw = _G.isfullmoon() end
+        end)
         local players, allies = 0, 0
         pcall(function() if _G.countServerInfo then players, allies = _G.countServerInfo() end end)
-        Net.postJSON(endpoint("/heartbeat", { name = Config.myName }),
-            { role = State.myRole, fullmoon = fm, players = players, allies = allies, scout = Config.scout == true }, "heartbeat")
+        local body = { role = State.myRole, players = players, allies = allies, scout = Config.scout == true }
+        -- Chỉ gửi fullmoon khi là boolean thật. nil = Sky chưa load → bỏ qua field, server giữ giá trị cũ.
+        if fmRaw == true then body.fullmoon = true
+        elseif fmRaw == false then body.fullmoon = false
+        end
+        Net.postJSON(endpoint("/heartbeat", { name = Config.myName }), body, "heartbeat")
     end
 
     -- Offline đúng 1 lần, gửi cả POST queue lẫn GET đồng bộ (File A 378-385)
@@ -1363,6 +1372,16 @@ do
     function TeleportManager.hopToJob(jobid, reason)
         jobid = tostring(jobid or "")
         if jobid == "" or jobid == game.JobId then return false end
+        -- HARD LOCK: Ally1 đang giữ locked fullmoon → KHÔNG hop sang server khác
+        if State.myRole == "ally"
+            and State.fullmoonLocked == true
+            and State.fullmoonJobid and State.fullmoonJobid ~= ""
+            and game.JobId == State.fullmoonJobid
+            and jobid ~= State.fullmoonJobid
+        then
+            DBG("[ALLY1] BLOCK hop: holding locked fullmoon @ " .. tostring(State.fullmoonJobid), "warn", "ally1_block_hop")
+            return false
+        end
         if _lastJobHop[jobid] and (tick() - _lastJobHop[jobid]) < Config.RALLY_HOP_THROTTLE then return false end
         _lastJobHop[jobid] = tick()
         _G.rallyHopArmedT = tick()
@@ -1976,50 +1995,16 @@ do
     local _g5LastTry = 0
 
     function GearManager.checkGear()
+        -- Main dùng checkGear bình thường (không clearAllyUnspentPoint)
+        if State.myRole == "ally" then
+            -- Ally: dùng clearAllyUnspentPoint thay thế (AllyGearLoop gọi)
+            return GearManager.clearAllyUnspentPoint()
+        end
         local _okcg, dt = SafeRemote.invoke(3, "TempleClock", "Check")
         if not (dt and type(dt) == "table") then return end
-        if not dt.HadPoint then
-            -- Không có điểm unspend → log nhẹ chỉ khi đang chạy từ AllyGearLoop
-            if State.myRole == "ally" then
-                DBG("[GEAR-AUTO] ally=" .. State.myName .. " HadPoint=false → skip (no unspent point)", "info", "gear_no_point")
-            end
-            return
-        end
+        if not dt.HadPoint then return end
         local rd = dt.RaceDetails
         if not (rd and rd.Completed ~= nil) then return end
-
-        -- ===== GEAR5 SWAP WINDOW: tiêu điểm thừa để MỞ KHÓA TRIALING =====
-        -- Completed==5 + HadPoint: server bắt chọn lại 1 slot sang Alpha/Omega NGƯỢC với
-        -- hiện tại thì mới tính → hết "báo đỏ" → vào được in_trial. KHÔNG theo Config.
-        -- Thử Gear2=Alpha rồi Gear2=Omega: 1 trong 2 chắc chắn "ngược" → được tính; cái
-        -- trùng giá trị hiện tại bị bỏ qua. Lock + cooldown 5s chống spam, KHÔNG retry vô hạn.
-        if rd.Completed == 5 then
-            if _g5Lock then return end
-            if (tick() - _g5LastTry) < 5 then return end
-            _g5Lock = true
-            _g5LastTry = tick()
-            task.spawn(function()
-                local cleared = false
-                for _, pick in ipairs({ "Alpha", "Omega" }) do
-                    DBG("[GEAR-AUTO] ally=" .. State.myName ..
-                        " state=max_gear5 action=swap slot=2 to=" .. pick ..
-                        " reason=consume_point_unblock_trial", "ok", "gear_auto")
-                    SafeRemote.invoke(3, "TempleClock", "SpendPoint", "Gear2", pick)
-                    task.wait(1.5)
-                    local _ok2, dt2 = SafeRemote.invoke(3, "TempleClock", "Check")
-                    if dt2 and dt2.HadPoint == false then cleared = true; break end
-                end
-                if cleared then
-                    DBG("[GEAR-AUTO] ally=" .. State.myName ..
-                        " state=max_gear5 action=swap reason=success_point_cleared", "ok", "gear_auto_ok")
-                else
-                    DBG("[GEAR-AUTO] ally=" .. State.myName ..
-                        " state=max_gear5 action=skip reason=server_stuck_no_retry", "warn", "gear_auto_stuck")
-                end
-                _g5Lock = false
-            end)
-            return  -- KHÔNG rơi xuống logic claim cũ (đang gọi sai "Gear5"/"Gearnil" cho Gear5)
-        end
 
         local g1, g2, g3 = Config.gear:match("^(.-)%-(.-)%-(.-)$")
         local a23 = { [2] = g1, [3] = g2, [4] = g3 }
@@ -2036,12 +2021,188 @@ do
             SafeRemote.invoke(3, "TempleClock", "SpendPoint", "Gear" .. tostring(rd.Completed), choosegear)
         end
     end
+
+    -- ===== ALLY ONLY: clear unspent point thông minh — tính đúng slot theo installedCount =====
+    -- Tách hoàn toàn khỏi checkGear của Main. Main KHÔNG bao giờ gọi function này.
+    -- Lý do: khi Ally i=8 (Completed==5) vẫn còn HadPoint, cần swap Gear2/3/4 Alpha/Omega
+    -- thay vì cố định Gear2. Dùng bestGearForRace để chọn đúng theo race.
+    GearManager._allyUnspentLock   = false
+    GearManager._lastAllyUnspentAt = 0
+    GearManager._allyClearCursor   = 1
+    GearManager._allyDtLogAt       = 0
+
+    local _bestGearForRace = {
+        Ghoul = "B-B-A", Cyborg = "A-B-B", Mink = "B-B-A",
+        Skypiea = "B-B-A", Human = "B-A-A", Fishman = "B-A-A"
+    }
+
+    local function _countInstalledAB(gears)
+        local a, b = 0, 0
+        for _, slot in ipairs({ "Gear2", "Gear3", "Gear4" }) do
+            local g = gears and gears[slot]
+            if type(g) == "table" then
+                if g.A == true or g.Alpha == true then a = a + 1 end
+                if g.B == true or g.Omega == true then b = b + 1 end
+            end
+        end
+        return a, b
+    end
+
+    function GearManager.clearAllyUnspentPoint()
+        if State.myRole ~= "ally" then
+            DBG("[ALLY-GEAR] skip because not ally", "info", "ally_gear_skip")
+            return
+        end
+        if GearManager._allyUnspentLock then return end
+        if (tick() - GearManager._lastAllyUnspentAt) < 5 then return end
+
+        GearManager._allyUnspentLock   = true
+        GearManager._lastAllyUnspentAt = tick()
+
+        task.spawn(function()
+            local function finish() GearManager._allyUnspentLock = false end
+
+            local _ok, dt = SafeRemote.invoke(3, "TempleClock", "Check")
+            if not (dt and type(dt) == "table") then return finish() end
+
+            local hadPoint  = dt.HadPoint == true
+            local completed = dt.Completed or 0
+            local race      = ""
+            pcall(function() race = tostring(LocalPlayer.Data.Race.Value) end)
+
+            -- RaceDetails bên trong dt (key tên race)
+            local rd = nil
+            if dt.RaceDetails then
+                rd = dt.RaceDetails[race]
+            end
+
+            DBG(("[ALLY-GEAR] Check HadPoint=%s Completed=%s Race=%s"):format(
+                tostring(hadPoint), tostring(completed), tostring(race)), "info", "ally_gear_check")
+
+            if not hadPoint then return finish() end
+
+            -- Log dt đầy đủ 1 lần / 30s để debug cấu trúc lạ
+            if (tick() - GearManager._allyDtLogAt) >= 30 then
+                GearManager._allyDtLogAt = tick()
+                local ok2, js = pcall(function() return game:GetService("HttpService"):JSONEncode(dt) end)
+                if ok2 then DBG("[ALLY-GEAR] dt=" .. tostring(js):sub(1, 300), "info", "ally_gear_dt") end
+            end
+
+            if not rd then
+                DBG("[ALLY-GEAR] RaceDetails[" .. race .. "] not found → fallback", "warn", "ally_gear_no_rd")
+                rd = {}
+            end
+
+            -- Tính slot theo số gear đã cài
+            local rdA, rdB = _countInstalledAB(rd.Gears)
+            local installedCount = rdA + rdB
+            local slotIndex = installedCount + 2
+            if slotIndex < 2 then slotIndex = 2 end
+
+            -- Chọn pattern gear
+            local pattern = nil
+            local cfgGear = tostring(Config.gear or "")
+            if cfgGear and #cfgGear == 5 and cfgGear:match("^[AB]%-[AB]%-[AB]$") then
+                pattern = cfgGear
+            end
+            if not pattern then pattern = _bestGearForRace[race] end
+            if not pattern then pattern = "A-B-B" end
+
+            local parts = {}
+            for p in pattern:gmatch("[AB]") do table.insert(parts, p) end
+            if #parts ~= 3 then parts = { "A", "B", "B" } end
+            local convert = { A = "Alpha", B = "Omega" }
+
+            local letter = parts[installedCount + 1] or parts[#parts] or "A"
+            local choose = convert[letter] or "Alpha"
+
+            DBG(("[ALLY-GEAR] calculated slot=Gear%d choose=%s installedCount=%d"):format(
+                slotIndex, choose, installedCount), "info", "ally_gear_calc")
+
+            local cleared = false
+
+            -- ===== Bước 1: thử slot tính được =====
+            if slotIndex <= 4 then
+                local slotName = "Gear" .. tostring(slotIndex)
+                DBG("[ALLY-GEAR] try SpendPoint " .. slotName .. " " .. choose, "ok", "ally_gear_try")
+                SafeRemote.invoke(3, "TempleClock", "SpendPoint", slotName, choose)
+                task.wait(1)
+                local _ok2, dt2 = SafeRemote.invoke(3, "TempleClock", "Check")
+                if dt2 and dt2.HadPoint ~= true then
+                    DBG("[ALLY-GEAR] cleared unspent point via " .. slotName .. " " .. choose, "ok", "ally_gear_ok")
+                    cleared = true
+                end
+            end
+
+            -- ===== Bước 2: fallback quét Gear2/3/4 cả Alpha/Omega =====
+            if not cleared then
+                local slots = { "Gear2", "Gear3", "Gear4" }
+                local picks = { choose, choose == "Alpha" and "Omega" or "Alpha" }
+                for _, sl in ipairs(slots) do
+                    if cleared then break end
+                    for _, pk in ipairs(picks) do
+                        DBG("[ALLY-GEAR] fallback try slot=" .. sl .. " pick=" .. pk, "info", "ally_gear_fb")
+                        SafeRemote.invoke(3, "TempleClock", "SpendPoint", sl, pk)
+                        task.wait(1)
+                        local _ok3, dt3 = SafeRemote.invoke(3, "TempleClock", "Check")
+                        if dt3 and dt3.HadPoint ~= true then
+                            DBG("[ALLY-GEAR] cleared unspent point via fallback " .. sl .. " " .. pk, "ok", "ally_gear_fb_ok")
+                            cleared = true
+                            break
+                        end
+                    end
+                end
+            end
+
+            -- ===== Bước 3: thử các action thay thế (cursor, không spam toàn bộ mỗi vòng) =====
+            if not cleared then
+                local actions = { "ReplacePoint", "Replace", "SwapPoint", "SwitchPoint" }
+                local slots   = { "Gear2", "Gear3", "Gear4" }
+                local picks   = { choose, choose == "Alpha" and "Omega" or "Alpha" }
+                -- chỉ thử 4 attempt mỗi vòng, dùng cursor tiếp tục vòng sau
+                local attempts = 0
+                local totalActions = #actions * #slots * #picks
+                for i = 1, 4 do
+                    local cursor = ((GearManager._allyClearCursor - 1 + i - 1) % totalActions) + 1
+                    local ai = math.ceil(cursor / (#slots * #picks))
+                    local rest = cursor - (ai - 1) * #slots * #picks
+                    local si = math.ceil(rest / #picks)
+                    local pi = rest - (si - 1) * #picks
+                    ai = math.clamp(ai, 1, #actions)
+                    si = math.clamp(si, 1, #slots)
+                    pi = math.clamp(pi, 1, #picks)
+                    local action = actions[ai]
+                    local sl = slots[si]
+                    local pk = picks[pi]
+                    DBG("[ALLY-GEAR] fallback try action=" .. action .. " slot=" .. sl .. " pick=" .. pk, "info", "ally_gear_act")
+                    SafeRemote.invoke(3, "TempleClock", action, sl, pk)
+                    task.wait(1)
+                    local _ok4, dt4 = SafeRemote.invoke(3, "TempleClock", "Check")
+                    if dt4 and dt4.HadPoint ~= true then
+                        DBG("[ALLY-GEAR] cleared via action=" .. action, "ok", "ally_gear_act_ok")
+                        cleared = true
+                        GearManager._allyClearCursor = cursor + 1
+                        break
+                    end
+                    attempts = attempts + 1
+                end
+                GearManager._allyClearCursor = ((GearManager._allyClearCursor - 1 + attempts) % totalActions) + 1
+            end
+
+            if not cleared then
+                DBG("[ALLY-GEAR] still HadPoint=true after attempts", "warn", "ally_gear_stuck")
+            end
+
+            finish()
+        end)
+    end
 end
 local function checkgear() return GearManager.checkGear() end
 
 --[[ ============================================================================
- [19b] ALLYGEARLOOP — loop nền riêng cho Ally: check + unspend Gear5 mỗi 8s.
-   Chạy xuyên suốt (kể cả khi đang trial), không cần tick FSM mới gọi checkgear.
+ [19b] ALLYGEARLOOP — loop nền riêng cho Ally: clear unspent point mỗi 5s.
+   Chạy xuyên suốt (kể cả khi đang trial). Main KHÔNG được gọi loop này.
+   Đổi từ checkGear/8s → clearAllyUnspentPoint/5s theo yêu cầu.
 ============================================================================ ]]
 local AllyGearLoop = {}
 do
@@ -2051,9 +2212,9 @@ do
         if State.myRole ~= "ally" then return end
         AllyGearLoop.started = true
         task.spawn(function()
-            while Runtime.alive do
-                task.wait(8)
-                pcall(GearManager.checkGear)
+            while Runtime.alive and State.myRole == "ally" do
+                GearManager.clearAllyUnspentPoint()
+                task.wait(5)
             end
         end)
     end
@@ -3238,6 +3399,15 @@ do
 
     -- Ally1 xin server full moon mới (server lọc đúng placeid của Ally1) → set _leaderTarget để hop.
     local function leaderRequestServer(reasonTag)
+        -- HARD LOCK: đang giữ locked fullmoon job → KHÔNG xin server mới
+        if State.myRole == "ally"
+            and State.fullmoonLocked == true
+            and State.fullmoonJobid and State.fullmoonJobid ~= ""
+            and game.JobId == State.fullmoonJobid
+        then
+            DBG("[ALLY1] skip getseverapi: locked fullmoon still held @ " .. tostring(State.fullmoonJobid), "info", "ally1_skip_getsev")
+            return
+        end
         if (tick() - _lastGetSeverApi) < _getSeverApiCooldown then return end
         _lastGetSeverApi = tick()
         local placeId = tostring(game.PlaceId)
@@ -3259,6 +3429,37 @@ do
 
     -- ===== Ally1 (LEADER): tự pick server (đúng placeid) → hop → xác nhận còn FM → /lockmoon → giữ =====
     local function allyLeaderTick()
+        -- HARD LOCK GUARD: đang ở đúng server đã chốt → KHÔNG hop, KHÔNG getseverapi, KHÔNG clear target
+        local lockedFmJob = State.fullmoonJobid
+        local locked = State.fullmoonLocked == true and lockedFmJob and lockedFmJob ~= ""
+        if locked and game.JobId == lockedFmJob then
+            local fmNow = isfullmoon()
+            _leaderTarget = lockedFmJob
+            State.reportStatus("ally")
+            if fmNow == true then
+                -- CÒN full moon: gửi /lockmoon theo cooldown để giữ chốt
+                if (tick() - _lastLockMoon) >= 3 then
+                    _lastLockMoon = tick()
+                    task.spawn(function()
+                        pcall(function()
+                            Net.postJSON(endpoint("/lockmoon", { name = Config.myName }),
+                                { jobid = lockedFmJob }, "lockmoon_" .. tostring(lockedFmJob))
+                        end)
+                    end)
+                end
+                status("[ALLY1] HOLD locked FM @ " .. tostring(lockedFmJob) .. " (fmNow=true)")
+                return false
+            elseif fmNow == nil then
+                -- Sky chưa load → chưa kết luận, giữ nguyên, Watch sẽ phán quyết
+                status("[ALLY1] HOLD locked FM @ " .. tostring(lockedFmJob) .. " (Sky loading, fmNow=nil)")
+                return false
+            else
+                -- fmNow == false: có vẻ hết FM → KHÔNG tự hop, giao AllyFullMoonWatch xử lý qua grace
+                status("[ALLY1] locked FM maybe lost @ " .. tostring(lockedFmJob) .. " → hold, chờ Watch xác nhận")
+                return false
+            end
+        end
+
         -- đã có server chốt (fullmoonJobid) → coi đó là đích; chưa có → dùng _leaderTarget tự xin
         local target = State.fullmoonJobid or _leaderTarget
         if not target then
@@ -3549,6 +3750,14 @@ do
             end
             -- HẾT full moon THẬT (quá grace) → phá lock + xin server mới
             if (tick() - AllyFullMoonWatch._lastPostAt) < AllyFullMoonWatch.POST_COOLDOWN then return end
+            -- FINAL DOUBLE-CHECK: check lại 1 lần nữa trước khi /fmlost để tránh false-positive
+            local final = isfullmoon()
+            if final == true or final == nil then
+                -- FM vẫn còn hoặc Sky chưa load → KHÔNG /fmlost, seed lại confirmed
+                AllyFullMoonWatch._fmConfirmedAt = tick()
+                Logger.info("[ALLY-WATCH] /fmlost aborted: final check=" .. tostring(final) .. " @ " .. tostring(fmJob), "ally_watch_abort")
+                return
+            end
             AllyFullMoonWatch._lastPostAt = tick()
             AllyFullMoonWatch._fmConfirmedAt = 0
             AllyFullMoonWatch._confirmedReal = false
