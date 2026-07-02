@@ -1244,13 +1244,12 @@ local function moonTextureId()
     if sky and sky.MoonTextureId then return sky.MoonTextureId end
     return ""
 end
+-- true = đang full moon THẬT, false = không phải FM, nil = Sky chưa load (unknown, chưa kết luận).
+-- Tách "chưa load" khỏi "không phải FM" để allyLeaderTick không bị kẹt pending khi Sky lag load.
 local function isfullmoon()
-    -- CHỈ 1 CÁCH (user 2026-07-02): texture moon5 THẬT + gate ĐÊM, đúng theo kickendmoon.txt.
-    --   • Sky.MoonTextureId phải = FULLMOON_TEXTURE (asset đổi NGAY khi moon hết → chuẩn xác).
-    --   • Chỉ tính FM khi BAN ĐÊM: ClockTime c<=5 hoặc c>=18 (đúng ngưỡng file tham khảo).
-    -- Bỏ hẳn fallback MoonPhase (attribute không tụt khi moon hết → khoá server vĩnh viễn) và
-    -- ngưỡng c>=16 (chốt sớm ~2 phút gây fake-moon). Texture rỗng (Sky chưa load) → false, chờ load.
+    -- CHỈ 1 CÁCH: texture moon5 THẬT + gate ĐÊM, đúng theo kickendmoon.txt.
     local tex = moonTextureId()
+    if tex == "" then return nil end            -- Sky chưa load → chưa kết luận, KHÔNG phải false
     if tex ~= FULLMOON_TEXTURE then return false end
     local c = Lighting.ClockTime
     return c <= 5 or c >= 18
@@ -1979,7 +1978,13 @@ do
     function GearManager.checkGear()
         local _okcg, dt = SafeRemote.invoke(3, "TempleClock", "Check")
         if not (dt and type(dt) == "table") then return end
-        if not dt.HadPoint then return end
+        if not dt.HadPoint then
+            -- Không có điểm unspend → log nhẹ chỉ khi đang chạy từ AllyGearLoop
+            if State.myRole == "ally" then
+                DBG("[GEAR-AUTO] ally=" .. State.myName .. " HadPoint=false → skip (no unspent point)", "info", "gear_no_point")
+            end
+            return
+        end
         local rd = dt.RaceDetails
         if not (rd and rd.Completed ~= nil) then return end
 
@@ -2033,6 +2038,26 @@ do
     end
 end
 local function checkgear() return GearManager.checkGear() end
+
+--[[ ============================================================================
+ [19b] ALLYGEARLOOP — loop nền riêng cho Ally: check + unspend Gear5 mỗi 8s.
+   Chạy xuyên suốt (kể cả khi đang trial), không cần tick FSM mới gọi checkgear.
+============================================================================ ]]
+local AllyGearLoop = {}
+do
+    AllyGearLoop.started = false
+    function AllyGearLoop.start()
+        if AllyGearLoop.started then return end
+        if State.myRole ~= "ally" then return end
+        AllyGearLoop.started = true
+        task.spawn(function()
+            while Runtime.alive do
+                task.wait(8)
+                pcall(GearManager.checkGear)
+            end
+        end)
+    end
+end
 
 --[[ ============================================================================
  [20] TRIALACTIONS — doTrialForMyRace + runTrialPhase. (File A 982-1128)
@@ -2796,19 +2821,14 @@ do
         return "ally_reset"
     end
 
-    -- Current main chờ helpreset đủ rồi tự sát + chuyển training (File A 1992-2010)
+    -- Current main tự reset sau khi kill xong.
+    -- Chỉ reset khi đã thắng trial lượt này (didEnterTrialThisTurn), tránh reset oan.
     function PostTrial.currentMainReset(myStt)
-        local allies_str = table.concat(Config.allies, ",")
-        if allies_str ~= "" then
-            status("[MAIN " .. tostring(myStt) .. "] Waiting for help accs to reset first...")
-            local timeout = 0
-            repeat
-                task.wait(1)
-                timeout = timeout + 1
-                local res = Net.getJSON(B .. "/helpreset?allies=" .. allies_str, 0)
-                if res and res.all_done then break end
-            until timeout >= Config.HELPRESET_TIMEOUT
+        if not State.didEnterTrialThisTurn then
+            status("[MAIN " .. tostring(myStt) .. "] Chưa thắng trial → KHÔNG reset")
+            return "posttrial_skip"
         end
+        status("[MAIN " .. tostring(myStt) .. "] Trial done → tự reset")
         pcall(function() LocalPlayer.Character.Humanoid.Health = 0 end)
         task.wait(3)
         State.setMyMainStatus("training")
@@ -2828,8 +2848,20 @@ do
         return "other_main_reset"
     end
 
-    -- Main đang turn (current) kill player trong tầm rồi reset (File A 1984-2020)
+    -- Main đang turn (current) kill player trong tầm rồi reset
+    -- 3s đầu đứng im để ally kịp reset trước, tránh main reset theo trước ally.
+    -- Sau 3s mới đi kill; chỉ reset khi đã thắng trial (didEnterTrialThisTurn).
     function PostTrial.mainKillThenReset(myStt, currentmain)
+        -- Guard 3s: seed _G.mainKillStart lần đầu (hoặc nếu quá 60s → coi là cycle mới)
+        if not _G.mainKillStart or (tick() - _G.mainKillStart) > 60 then
+            _G.mainKillStart = tick()
+        end
+        if (tick() - _G.mainKillStart) < 3 then
+            _G.SHOULDSPAMSKILLS = false
+            status("[MAIN " .. tostring(myStt) .. "] Kill phase → đứng im 3s cho ally reset trước...")
+            return "posttrial_wait_ally"
+        end
+        -- Sau 3s: chủ động đi kill player theo tọa độ
         status("[MAIN " .. tostring(myStt) .. "] Kill Players After Trial")
         for plr in pairs(getplayers()) do
             if plr then
@@ -2844,8 +2876,10 @@ do
             local isCurrentMain = State.isMain[State.myName] and State.myName == currentmain
             local isOtherMain   = State.isMain[State.myName] and State.myName ~= currentmain
             if isCurrentMain then
+                _G.mainKillStart = nil
                 return PostTrial.currentMainReset(myStt)
             elseif isOtherMain then
+                _G.mainKillStart = nil
                 return PostTrial.otherMainReset()
             end
         end
@@ -3196,6 +3230,11 @@ do
         _leaderTarget = nil
         _allyFmConfirmedAt = 0
     end
+    -- HOOK: AllyFullMoonWatch gọi sau khi getseverapi trả jobid mới → set _leaderTarget ngay,
+    -- không phải chờ nhịp leaderTick gọi leaderRequestServer (tránh kẹt "waiting current main").
+    _G.__leaderSetTarget = function(jobid)
+        _leaderTarget = jobid and jobid ~= "" and jobid or nil
+    end
 
     -- Ally1 xin server full moon mới (server lọc đúng placeid của Ally1) → set _leaderTarget để hop.
     local function leaderRequestServer(reasonTag)
@@ -3242,10 +3281,14 @@ do
         end
         -- ĐÃ Ở target
         _joinMoonReported = false
-        if isfullmoon() then
+        local fmState = isfullmoon()  -- true=FM, false=không phải FM, nil=Sky chưa load
+        if fmState == true then
+            local justConfirmed = _allyFmConfirmedAt == 0  -- lần đầu confirm FM lượt này
             _allyFmConfirmedAt = tick()
-            -- CÒN full moon → CHỐT lên server (/lockmoon) + giữ + báo ally
-            if State.fullmoonJobid ~= target and (tick() - _lastLockMoon) >= 3 then
+            -- CÒN full moon → CHỐT lên server (/lockmoon) ngay lần đầu confirm, sau đó throttle 3s
+            local shouldLock = State.fullmoonJobid ~= target
+                and (justConfirmed or (tick() - _lastLockMoon) >= 3)
+            if shouldLock then
                 _lastLockMoon = tick()
                 task.spawn(function()
                     pcall(function()
@@ -3257,11 +3300,24 @@ do
             State.reportStatus("ally")
             status("[ALLY1] Holding FullMoon " .. tostring(target) .. " → CHỐT + ally")
             return false
+        elseif fmState == nil then
+            -- Sky chưa load xong (texture rỗng) → chưa kết luận, KHÔNG phải "hết FM".
+            -- Nếu đã từng confirm FM lượt này (_allyFmConfirmedAt>0) → gửi /lockmoon ngay
+            -- để không bị muộn 3 phút do Sky lag. Watch sẽ phán quyết sau khi Sky load.
+            if _allyFmConfirmedAt > 0 and State.fullmoonJobid ~= target and (tick() - _lastLockMoon) >= 3 then
+                _lastLockMoon = tick()
+                task.spawn(function()
+                    pcall(function()
+                        Net.postJSON(endpoint("/lockmoon", { name = Config.myName }),
+                            { jobid = target }, "lockmoon_" .. tostring(target))
+                    end)
+                end)
+            end
+            State.reportStatus("ally")
+            status("[ALLY1] Sky đang load @ " .. tostring(target) .. " → giữ chỗ")
+            return false
         else
-            -- FM CÓ VẺ tắt: Ally1 KHÔNG tự quyết rời/phá lock ở nhịp 0.35s này nữa (gây hop sớm loạn).
-            -- 1 AUTHORITY DUY NHẤT = AllyFullMoonWatch (loop nền, seed-grace) mới phá lock (/fmlost) +
-            -- xin server mới; khi nó phá lock sẽ gọi _G.__leaderOnFmLost() để clear _leaderTarget → nhịp
-            -- sau target=nil → mình tự xin server mới. Ở đây chỉ GIỮ CHỖ + báo ally, không nhả sớm.
+            -- fmState == false: FM CÓ VẺ tắt → giao AllyFullMoonWatch xác nhận, không tự quyết.
             State.reportStatus("ally")
             status("[ALLY1] moon pending @ " .. tostring(target) .. " → giữ (chờ AllyFullMoonWatch xác nhận)")
             return false
@@ -3464,47 +3520,69 @@ do
         -- VỪA TỚI server này (đổi jobid đang canh) → SEED grace khởi động: coi như vừa xác nhận FM để guard
         -- chống-flicker luôn hoạt động (không còn kẽ hở "_fmConfirmedAt=0 → hop ngay nhịp đầu khi Sky chưa
         -- load"). _confirmedReal=false cho tới khi isfullmoon() thật → dùng ARRIVE_GRACE dài ở giai đoạn này.
+        -- VỪA TỚI server này (đổi jobid đang canh) → seed grace khởi động
         if AllyFullMoonWatch._watchJob ~= fmJob then
             AllyFullMoonWatch._watchJob = fmJob
             AllyFullMoonWatch._fmConfirmedAt = tick()
             AllyFullMoonWatch._confirmedReal = false
         end
-        if isfullmoon() then
+        local fmNow = isfullmoon()
+        if fmNow == true then
+            -- CÒN full moon: cập nhật xác nhận thật + cập nhật _fmConfirmedAt liên tục
             AllyFullMoonWatch._fmConfirmedAt = tick()
-            AllyFullMoonWatch._confirmedReal = true -- đã thấy FM THẬT → từ giờ dùng GRACE thường
-            return
-        end
-        -- moon "tắt": chưa xác nhận FM thật lần nào tại server này → dùng ARRIVE_GRACE (world đang load);
-        -- đã từng thấy FM thật → dùng GRACE thường. Dưới ngưỡng = flicker → chờ.
-        local grace = AllyFullMoonWatch._confirmedReal and AllyFullMoonWatch.GRACE or AllyFullMoonWatch.ARRIVE_GRACE
-        if AllyFullMoonWatch._fmConfirmedAt > 0
-            and (tick() - AllyFullMoonWatch._fmConfirmedAt) < grace then
-            return
-        end
-        -- HẾT full moon THẬT (quá grace) → phá lock + xin server mới (throttle)
-        if (tick() - AllyFullMoonWatch._lastPostAt) < AllyFullMoonWatch.POST_COOLDOWN then return end
-        AllyFullMoonWatch._lastPostAt = tick()
-        AllyFullMoonWatch._fmConfirmedAt = 0
-        AllyFullMoonWatch._confirmedReal = false
-        AllyFullMoonWatch._watchJob = nil
-        -- clear _leaderTarget chết trong ScoutNavigator → nhịp allyLeaderTick sau tự /getseverapi xin server mới
-        if _G.__leaderOnFmLost then pcall(_G.__leaderOnFmLost) end
-        Logger.info("[ALLY-WATCH] HẾT full moon @ " .. tostring(fmJob) .. " → POST /fmlost (phá lock) + /getseverapi", "ally_watch_lost")
-        status("[ALLY-WATCH] FullMoon ended → phá lock + xin server mới...")
-        -- 1) phá lock + đóng gate trên server NGAY
-        Net.postJSON(endpoint("/fmlost", { name = Config.myName }), { jobid = fmJob }, "fmlost")
-        -- 2) xin server full moon mới đúng placeid
-        local placeId = tostring(game.PlaceId)
-        task.spawn(function()
-            local url = endpoint("/getseverapi", { name = Config.myName, placeid = placeId })
-            local ok, bodyRes = Net.getRaw(url)
-            if ok and bodyRes then
-                local good, res = pcall(function() return HttpService:JSONDecode(bodyRes) end)
-                if good and res and res.ok and res.jobid and res.jobid ~= "" then
-                    Logger.info("[ALLY-WATCH] server gợi ý jobid mới=" .. tostring(res.jobid), "ally_watch_newsev")
-                end
+            if not AllyFullMoonWatch._confirmedReal then
+                AllyFullMoonWatch._confirmedReal = true
+                Logger.info("[ALLY-WATCH] FM xác nhận THẬT lần đầu @ " .. tostring(fmJob), "ally_watch_confirm")
             end
-        end)
+            -- không cần làm gì thêm — allyLeaderTick lo /lockmoon + reportStatus("ally")
+            return
+        elseif fmNow == nil then
+            -- Sky chưa load xong → chưa kết luận, giữ nguyên grace
+            return
+        else
+            -- fmNow == false: moon có vẻ tắt → kiểm tra grace trước khi /fmlost
+            -- Chưa confirm thật lần nào → dùng ARRIVE_GRACE (world còn load); đã confirm → GRACE thường
+            local grace = AllyFullMoonWatch._confirmedReal and AllyFullMoonWatch.GRACE or AllyFullMoonWatch.ARRIVE_GRACE
+            if AllyFullMoonWatch._fmConfirmedAt > 0
+                and (tick() - AllyFullMoonWatch._fmConfirmedAt) < grace then
+                return  -- chưa quá grace → flicker, bỏ qua
+            end
+            -- HẾT full moon THẬT (quá grace) → phá lock + xin server mới
+            if (tick() - AllyFullMoonWatch._lastPostAt) < AllyFullMoonWatch.POST_COOLDOWN then return end
+            AllyFullMoonWatch._lastPostAt = tick()
+            AllyFullMoonWatch._fmConfirmedAt = 0
+            AllyFullMoonWatch._confirmedReal = false
+            AllyFullMoonWatch._watchJob = nil
+            Logger.info("[ALLY-WATCH] HẾT full moon @ " .. tostring(fmJob) .. " → POST /fmlost + xin server mới", "ally_watch_lost")
+            status("[ALLY-WATCH] FullMoon ended → phá lock + xin server mới...")
+            -- 1) Clear state local NGAY để allyLeaderTick không còn thấy target cũ → không kẹt "waiting current main"
+            if _G.__leaderOnFmLost then pcall(_G.__leaderOnFmLost) end
+            -- Xóa fullmoonJobid local ngay (không đợi /curmain poll) → nhịp tiếp allyLeaderTick thấy nil → tự getseverapi
+            State.fullmoonJobid = nil
+            State.serverCurJobid = nil
+            -- 2) POST /fmlost lên server phá lock
+            task.spawn(function()
+                pcall(function()
+                    Net.postJSON(endpoint("/fmlost", { name = Config.myName }), { jobid = fmJob }, "fmlost")
+                end)
+            end)
+            -- 3) Xin server full moon mới ngay (không đợi allyLeaderTick nhịp sau)
+            local placeId = tostring(game.PlaceId)
+            task.spawn(function()
+                local url = endpoint("/getseverapi", { name = Config.myName, placeid = placeId })
+                local ok, bodyRes = Net.getRaw(url)
+                if ok and bodyRes then
+                    local good, res = pcall(function() return HttpService:JSONDecode(bodyRes) end)
+                    if good and res and res.ok and res.jobid and res.jobid ~= "" then
+                        -- Set _leaderTarget qua hook nếu ScoutNavigator expose nó
+                        if _G.__leaderSetTarget then pcall(_G.__leaderSetTarget, res.jobid) end
+                        Logger.info("[ALLY-WATCH] server cấp jobid mới=" .. tostring(res.jobid), "ally_watch_newsev")
+                    else
+                        Logger.info("[ALLY-WATCH] không có server mới (getseverapi nil)", "ally_watch_newsev_nil")
+                    end
+                end
+            end)
+        end
     end
 end
 _G.AllyFullMoonWatch = AllyFullMoonWatch
@@ -3519,8 +3597,13 @@ do
 
     local S = {
         BOOTING = "BOOTING", WAITING_ROLE = "WAITING_ROLE", WAITING_MAIN = "WAITING_MAIN",
-        WAITING_MOON = "WAITING_MOON", GOING_DOOR = "GOING_DOOR", -- BS-3: FOLLOWING_MAIN đã xóa (ally không follow main)
-        IN_TRIAL = "IN_TRIAL", POST_TRIAL = "POST_TRIAL", TRAINING = "TRAINING",
+        WAITING_MOON = "WAITING_MOON", GOING_DOOR = "GOING_DOOR",
+        IN_TRIAL = "IN_TRIAL", POST_TRIAL = "POST_TRIAL",
+        POST_TRIAL_WAIT    = "POST_TRIAL_WAIT",    -- 3s đứng im sau ffup
+        POST_TRIAL_KILL    = "POST_TRIAL_KILL",    -- đang tìm/kill player
+        POST_TRIAL_CONFIRM = "POST_TRIAL_CONFIRM", -- xác nhận thắng trial
+        POST_TRIAL_RESET   = "POST_TRIAL_RESET",   -- reset + hop server
+        TRAINING = "TRAINING",
         DONE = "DONE", ERROR_RECOVER = "ERROR_RECOVER",
     }
     StateMachine.S = S
@@ -3794,15 +3877,22 @@ do
                 if ts == "loading" then
                     status("[MAIN " .. myStt .. "] Đang vào Temple of Time...")
                 elseif ts == "ffup" then
-                    StateMachine.transition(S.POST_TRIAL, "ffup")
-                    -- FIX kill-after-trial (user 2026-07-02): dùng cờ BỀN didEnterTrialThisTurn thay vì
-                    -- myStatus=="in_trail". myStatus là biến local bị ScoutNavigator ghi đè "ready" trong
-                    -- cùng tick → check "in_trail" trượt → bay ra cửa không kill. Cờ bền chỉ true khi ĐÃ vào
-                    -- trial thật lượt này (reset khi done/training/rời) → phản ánh đúng "vừa trial xong".
+                    -- Dùng state chi tiết hơn trong post-trial FSM
                     if State.didEnterTrialThisTurn then
-                        PostTrial.mainKillThenReset(myStt, currentmain)
+                        local killResult = PostTrial.mainKillThenReset(myStt, currentmain)
+                        if killResult == "posttrial_wait_ally" then
+                            StateMachine.transition(S.POST_TRIAL_WAIT, "ffup_wait")
+                        elseif killResult == "posttrial_running" then
+                            StateMachine.transition(S.POST_TRIAL_KILL, "ffup_kill")
+                        elseif killResult == "posttrial_skip" then
+                            StateMachine.transition(S.POST_TRIAL_CONFIRM, "ffup_confirm")
+                        else
+                            StateMachine.transition(S.POST_TRIAL_RESET, "ffup_reset")
+                        end
                     else
-                        status("[MAIN " .. myStt .. "] Chờ ở cửa (chưa in_trail → KHÔNG kill)")
+                        -- Chưa vào trial lượt này → chờ ở cửa, KHÔNG kill, KHÔNG reset
+                        StateMachine.transition(S.POST_TRIAL, "ffup_no_trial")
+                        status("[MAIN " .. myStt .. "] ffup nhưng chưa vào trial lượt này → đứng cửa")
                         goToMyDoor()
                     end
                 else
@@ -4420,6 +4510,7 @@ if not Runtime._started then
     safeStart("haki", CombatActions.startHakiLoop)
     safeStart("ally_train_gate", AllyTrainingGate.start)
     safeStart("ally_fm_watch", AllyFullMoonWatch.start)  -- loop nền Ally1/Ally2 canh hết full moon
+    safeStart("ally_gear_loop", AllyGearLoop.start)      -- loop nền gear5 unspend cho ally (8s/lần)
     safeStart("main_loop", MainLoop.start)               -- vòng chính — LUÔN chạy dù init nền chưa xong
 
     Logger.ok("KaitunV4 bản 2 (modular, port từ File A) khởi động xong. role=" .. tostring(State.myRole))
