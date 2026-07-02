@@ -1205,12 +1205,21 @@ local function isfullmoon()
     local tex = moonTextureId()
     if tex ~= "" then
         if tex ~= FULLMOON_TEXTURE then return false end
-        -- texture = full moon: loại fake moon ban ngày (ClockTime 5..12 = fake theo kickendmoon.txt)
+        -- FIX detect full moon (user 2026-07-02): texture moon5 xuất hiện SỚM (cả ban ngày trước đêm FM)
+        -- → trước đây c>=12 đã báo true = chốt server sớm ~6 phút. Theo kickendmoon.txt: FM ACTIVE khi
+        -- ClockTime c<=5 hoặc c>=18 (ban đêm); còn tới FM tính = mmbs(18,c) → c=16 ra đúng "2 Minutes".
+        -- User OK chốt sớm nhưng CHỈ khi còn ≤2 phút. Gộp: chỉ true khi c<=5 (đang/vừa FM) HOẶC c>=16
+        -- (≤2 phút tới FM, gồm cả lúc đang FM 18..24). Khoảng 5<c<16 (fake moon + còn xa) → false.
         local c = Lighting.ClockTime
-        if c > 5 and c < 12 then return false end
-        return true
+        if c <= 5 or c >= 16 then return true end
+        return false
     end
-    return Lighting:GetAttribute("MoonPhase") == 5
+    -- FALLBACK khi texture rỗng (Sky chưa load / MoonTextureId nil): MoonPhase attribute KHÔNG tụt khi
+    -- moon hết (game báo ends nhưng attribute vẫn =5) → nếu trả true trần sẽ khoá server vĩnh viễn (ally
+    -- không bao giờ thấy false → không bắn /fmlost). GATE thêm ClockTime theo đúng luật ≤2 phút để nhất
+    -- quán với nhánh texture: chỉ true khi MoonPhase==5 VÀ (c<=5 hoặc c>=16).
+    local mc = Lighting.ClockTime
+    return Lighting:GetAttribute("MoonPhase") == 5 and (mc <= 5 or mc >= 16)
 end
 _G.isfullmoon = isfullmoon   -- để heartbeat (khai báo trước) gọi được
 -- Đếm tổng player + số ally đang ở server hiện tại (cho heartbeat → server xếp main theo
@@ -1616,6 +1625,158 @@ do
         end
     end
 
+    -- ===== V3 COMBAT (port từ V3.txt) — CHỈ DÙNG KHI TRAINING =====
+    -- Lý do: FastAttack V4 (LeftClickRemote:FireServer) đôi lúc lơ lửng trên đầu quái mà KHÔNG gây damage
+    -- (đứng bãi quái không đánh được sau vài bãi). V3 dùng RE/RegisterAttack + RE/RegisterHit + remote mã hoá
+    -- (remoteAttack có attribute "Id", XOR theo GetServerTimeNow + seed) → đánh ăn chắc. Gom quái kiểu V3
+    -- (BringMonster): kéo quái về 1 điểm để đánh gọn. Chỉ gọi trong doTrainGrind (training/raiding).
+    local _v3 = { seed = nil, remoteAttack = nil, idremote = nil, ready = false, lastTry = 0, lastFA = 0, seedFetching = false }
+    local _cloneref = (cloneref or clonereference or function(x) return x end)
+    local _v3Names = { "Util", "Common", "Remotes", "Assets", "FX" }
+    local function _v3ScanRemote()
+        for _, nm in ipairs(_v3Names) do
+            local container = ReplicatedStorage:FindFirstChild(nm)
+            if container then
+                for _, n in ipairs(container:GetChildren()) do
+                    if n:IsA("RemoteEvent") and n:GetAttribute("Id") then
+                        _v3.remoteAttack, _v3.idremote = n, n:GetAttribute("Id")
+                    end
+                end
+            end
+        end
+    end
+    local function _v3Init()
+        if _v3.ready then return true end
+        if (tick() - _v3.lastTry) < 1 then return false end
+        _v3.lastTry = tick()
+        pcall(_v3ScanRemote)
+        -- FIX (user 2026-07-02): seed:InvokeServer() là RemoteFunction ĐỒNG BỘ, không timeout — gọi thẳng
+        -- trên hot-path (đầu doTrainGrind + trong v3FastAttack, cả 2 chạy trong StateMachine.tick) → server
+        -- chậm/không trả sẽ YIELD treo cả main loop. Fetch seed 1 lần ở THREAD NỀN, cache lại; _v3Init được
+        -- gọi lại mỗi ~1s nên khi seed về thì ready bật, không block nhịp tick nào.
+        if _v3.seed == nil and not _v3.seedFetching then
+            _v3.seedFetching = true
+            task.spawn(function()
+                local ok, s = pcall(function()
+                    return ReplicatedStorage.Modules.Net.seed:InvokeServer()
+                end)
+                if ok then _v3.seed = s end
+                _v3.seedFetching = false
+            end)
+        end
+        _v3.ready = (_v3.seed ~= nil and _v3.remoteAttack ~= nil and _v3.idremote ~= nil)
+        return _v3.ready
+    end
+    CombatActions.initV3Combat = _v3Init
+
+    -- watcher: remoteAttack có thể xuất hiện/đổi sau khi load → bám ChildAdded để cập nhật id
+    function CombatActions.startV3CombatWatch()
+        _v3Init()
+        for _, nm in ipairs(_v3Names) do
+            local container = ReplicatedStorage:FindFirstChild(nm)
+            if container then
+                container.ChildAdded:Connect(function(n)
+                    if n:IsA("RemoteEvent") and n:GetAttribute("Id") then
+                        _v3.remoteAttack, _v3.idremote = n, n:GetAttribute("Id")
+                        _v3.ready = (_v3.seed ~= nil and _v3.remoteAttack ~= nil and _v3.idremote ~= nil)
+                    end
+                end)
+            end
+        end
+    end
+
+    -- v3FastAttack: RE/RegisterAttack + RE/RegisterHit + remote mã hoá (đánh mọi quái trong 65 studs)
+    function CombatActions.v3FastAttack(onlyName)
+        if not _v3.ready and not _v3Init() then return end
+        local char = LP.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildWhichIsA("Humanoid")
+        -- FIX (user 2026-07-02): KHÔNG bắt buộc phải cầm Tool. Acc train bằng FIGHTING STYLE (vd Dragon
+        -- Talon) hoặc fist thì Character KHÔNG có Tool instance → guard cũ return sớm → đứng trên đầu bãi
+        -- quái mà không đánh (nhất là sau khi V4 transform tắt, tool bị unequip). RegisterHit vẫn ăn với
+        -- đòn M1 fighting style. Chỉ cần còn sống là đánh.
+        if not (hrp and hum and hum.Health > 0) then return end
+        if (tick() - _v3.lastFA) <= 0.01 then return end
+        local t = {}
+        for _, folderName in ipairs({ "Characters", "Enemies" }) do
+            local u = workspace:FindFirstChild(folderName)
+            if u then
+                for _, e in ipairs(u:GetChildren()) do
+                    local eh = e:FindFirstChildWhichIsA("Humanoid")
+                    local ehrp = e:FindFirstChild("HumanoidRootPart")
+                    if e ~= char and (not onlyName or e.Name == onlyName)
+                        and eh and ehrp and eh.Health > 0
+                        and (ehrp.Position - hrp.Position).Magnitude <= 65 then
+                        t[#t + 1] = e
+                    end
+                end
+            end
+        end
+        if #t == 0 then return end
+        local hitTbl = { [2] = {} }
+        for i = 1, #t do
+            local v = t[i]
+            local part = v:FindFirstChild("Head") or v:FindFirstChild("HumanoidRootPart")
+            if not hitTbl[1] then hitTbl[1] = part end
+            hitTbl[2][#hitTbl[2] + 1] = { v, part }
+        end
+        pcall(function()
+            local n = ReplicatedStorage.Modules.Net
+            n:FindFirstChild("RE/RegisterAttack"):FireServer()
+            n:FindFirstChild("RE/RegisterHit"):FireServer(unpack(hitTbl))
+            _cloneref(_v3.remoteAttack):FireServer(string.gsub("RE/RegisterHit", ".", function(c)
+                return string.char(bit32.bxor(string.byte(c), math.floor(workspace:GetServerTimeNow() / 10 % 10) + 1))
+            end), bit32.bxor(_v3.idremote + 909090, _v3.seed * 2), unpack(hitTbl))
+        end)
+        _v3.lastFA = tick()
+    end
+
+    -- v3BringMob: gom quái về 1 điểm (anchorCF nếu có, mặc định vị trí quái đầu tiên) trong tầm count*250
+    function CombatActions.v3BringMob(onlyName, count, anchorCF)
+        count = count or 3
+        if count < 2 then return end
+        local char = LP.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        pcall(function() setscriptable(LP, "SimulationRadius", true) end)
+        pcall(function() sethiddenproperty(LP, "SimulationRadius", math.huge) end)
+        pcall(function()
+            local mob, anchor = {}, anchorCF
+            for _, v in ipairs(workspace.Enemies:GetChildren()) do
+                local h = v:FindFirstChildWhichIsA("Humanoid")
+                local vhrp = v:FindFirstChild("HumanoidRootPart")
+                if h and vhrp and h.Health > 0 and (not onlyName or v.Name == onlyName)
+                    and (hrp.Position - vhrp.Position).Magnitude <= (count * 250) then
+                    local dup = false
+                    for _, chosen in ipairs(mob) do
+                        local chrp = chosen:FindFirstChild("HumanoidRootPart")
+                        if chrp and (vhrp.Position - chrp.Position).Magnitude <= 5 then dup = true; break end
+                    end
+                    if not dup then
+                        mob[#mob + 1] = v
+                        anchor = anchor or vhrp.CFrame
+                    end
+                    if #mob >= count then break end
+                end
+            end
+            if not anchor then return end
+            for i = 1, #mob do
+                local vhrp = mob[i]:FindFirstChild("HumanoidRootPart")
+                -- FIX (user 2026-07-02): select(1,pcall) = success bool, KHÔNG phải kết quả isnetworkowner
+                -- → guard cũ thành no-op, teleport CẢ mob không sở hữu → server revert (rubber-band) +
+                -- mất network-owner → RegisterHit không ăn = GHOST QUÁI. select(2) đọc đúng giá trị trả về;
+                -- chỉ teleport khi ta THẬT sở hữu network của mob (khớp V3: if isnetworkowner(hrp)).
+                local owned = true
+                if isnetworkowner then owned = (select(2, pcall(isnetworkowner, vhrp)) == true) end
+                if vhrp and owned then
+                    vhrp.AssemblyLinearVelocity = Vector3.zero
+                    vhrp.AssemblyAngularVelocity = Vector3.zero
+                    vhrp.CFrame = anchor * CFrame.new((i - 1) * 2, 0, 0)
+                end
+            end
+        end)
+    end
+
     -- spam-skills loop: BẬT theo _G.SHOULDSPAMSKILLS, 1 instance, check Runtime.alive (File A 2071-2123)
     function CombatActions.startSpamSkills()
         task.spawn(function()
@@ -1768,6 +1929,9 @@ local function attackTick(t) return CombatActions.attackTick(t) end
 local function getmob1(pos) return CombatActions.getmob1(pos) end
 local function checkmob_(v) return CombatActions.checkmob_(v) end
 local function BringMob() return CombatActions.BringMob() end
+-- V3 combat alias (chỉ dùng khi training)
+local function v3FastAttack(n) return CombatActions.v3FastAttack(n) end
+local function v3BringMob(n, c, cf) return CombatActions.v3BringMob(n, c, cf) end
 
 --[[ ============================================================================
  [19] GEARMANAGER — checkGear qua SafeRemote (File A 1435-1455)
@@ -2173,15 +2337,25 @@ do
     local pos__ = CFrame.new(214.688675, 126.626984, -12600.2236, -0.180400655, -1.09679892e-08, 0.983593225, 1.94620693e-08, 1, 1.47204746e-08, -0.983593225, 2.17983427e-08, -0.180400655)
 
     -- doTrainGrind (File A 1583-1672)
+    -- FIX (user 2026-07-02): khi TRAINING dùng attack + gom quái kiểu V3 (v3FastAttack/v3BringMob) — đánh
+    -- ăn chắc bằng RE/RegisterHit + remote mã hoá, thay FastAttack nền (LeftClickRemote) hay lơ lửng không
+    -- gây damage. THÊM timeout per-mob (chống lỗi đứng trên đầu bãi quái không đánh được sau vài bãi:
+    -- quái không chết → repeat until checkmob_ kẹt vĩnh viễn). Status "Training" gửi TRƯỚC vòng grind.
     function Training.doTrainGrind(tag, AB, reassertFn)
         if reassertFn then reassertFn() end
+        CombatActions.initV3Combat()   -- đảm bảo seed/remoteAttack sẵn sàng trước khi grind
         if AB == "raiding" then
             local boss = workspace.Enemies:FindFirstChild("Cake Prince") or workspace.Enemies:FindFirstChild("Dough King")
             if boss then
-                status(tag .. " Raiding for fragment")
+                status(tag .. " Raiding for fragment")   -- status TRƯỚC loop
+                local rt0 = tick()
                 repeat task.wait()
-                    pcall(function() topos(boss.HumanoidRootPart.CFrame * CFrame.new(0, 25, 0)) end)
-                    Movement.equip(); Movement.haki(); BringMob()
+                    if (tick() - rt0) > 60 then break end   -- timeout raiding 60s → thoát, tick sau check lại
+                    local bhrp = boss:FindFirstChild("HumanoidRootPart")
+                    if bhrp then pcall(function() topos(bhrp.CFrame * CFrame.new(0, 25, 0)) end) end
+                    Movement.equip(); Movement.haki()
+                    v3BringMob(boss.Name, 3)
+                    v3FastAttack(boss.Name)
                 until not checkmob_(boss)
             end
             return
@@ -2198,11 +2372,26 @@ do
         end
 
         if getdis(pos__) < 1500 then
+            status(tag .. " Training (Kill Mobs)")   -- status TRƯỚC vòng grind (tránh kẹt status trước loop stall)
             for _, v in ipairs(getmob1(pos__)) do
                 if trainTimeoutHop(tag) then return end
                 local lastY, lastTf, lastTrainPost = 0, nil, 0
+                local mobT0 = tick()   -- timeout per-mob (backstop): chống kẹt đứng trên đầu quái không đánh được
+                local mobTimedOut = false
+                -- GHOST DETECT: mob còn trong workspace.Enemies + Health>0 ở CLIENT nhưng server đã xoá/đã
+                -- chết (hoặc v3BringMob teleport HRP làm mất network-owner → RegisterHit không ăn). checkmob_
+                -- chỉ đọc Health client → true mãi → repeat kẹt trên xác. Bám HP: đánh mà HP KHÔNG tụt trong
+                -- GHOST_TTL giây (chỉ tính lúc đang đánh, không tính lúc chờ V4) → coi là ghost → bỏ ngay.
+                local GHOST_TTL = 6
+                local lastHp, lastHpDropT = nil, tick()
                 repeat
                     if trainTimeoutHop(tag) then return end
+                    -- ANTI-STUCK backstop: quá 20s mà quái chưa chết → bỏ con này, sang con kế
+                    if (tick() - mobT0) > 20 then
+                        status(tag .. " Training (mob stuck >20s → next)")
+                        mobTimedOut = true
+                        break
+                    end
                     local c  = LP.Character
                     local tf = (c and c:FindFirstChild("RaceTransformed") and c.RaceTransformed.Value) or false
                     if tf then
@@ -2212,21 +2401,48 @@ do
                             status(tag .. " Training (Wait for end V4)")
                             lastTf = true
                         end
+                        lastHpDropT = tick()   -- đang chờ V4 (không đánh) → không tính vào ghost timer
                         if (tick() - lastTrainPost) > 4 then if reassertFn then reassertFn() end; lastTrainPost = tick() end
                         task.wait(0.5)
                     else
-                        Movement.equip(); Movement.haki(); BringMob()
+                        Movement.equip(); Movement.haki()
                         local hrp = v:FindFirstChild("HumanoidRootPart")
-                        if hrp then pcall(function() topos(hrp.CFrame * CFrame.new(0, 20, 0)) end) end
+                        -- V3: gom quái quanh con này + đánh trực tiếp (ăn chắc). Đứng NGANG tầm (offset 20) để trong 65 studs.
+                        if hrp then
+                            v3BringMob(nil, 3, hrp.CFrame)
+                            pcall(function() topos(hrp.CFrame * CFrame.new(0, 20, 0)) end)
+                        end
+                        -- FALLBACK tường minh: nếu V3 chưa tìm được remote (initV3Combat còn false) thì bật
+                        -- background FastAttack + spam skill để VẪN gây damage, tránh đứng im nếu v3 chết.
+                        -- V3 ready hay không đều spam skill (Z/X/C/V/F) — trước đây loop mới không bật cờ này.
+                        _G.SHOULDSPAMSKILLS = true
+                        if CombatActions.initV3Combat() then
+                            v3FastAttack()
+                        end
+                        -- theo dõi HP: có tụt thì reset mốc; đứng yên quá GHOST_TTL → ghost → bỏ
+                        local hp = (v:FindFirstChild("Humanoid") and v.Humanoid.Health) or nil
+                        if hp then
+                            if lastHp == nil or hp < lastHp - 0.5 then lastHpDropT = tick() end
+                            lastHp = hp
+                        end
+                        if (tick() - lastHpDropT) > GHOST_TTL then
+                            status(tag .. " Training (ghost mob HP đứng " .. GHOST_TTL .. "s → next)")
+                            mobTimedOut = true
+                            break
+                        end
                         if lastTf ~= false then
                             status(tag .. " Training (Kill Mobs)")
                             lastTf = false
                         end
+                        -- reassert định kỳ trong nhánh kill (giữ status training không bị đá khi grind lâu)
+                        if (tick() - lastTrainPost) > 4 then if reassertFn then reassertFn() end; lastTrainPost = tick() end
                         if (tick() - lastY > 0.4) then lastY = tick(); Training.pressV4() end
                         task.wait()
                     end
                 until not checkmob_(v)
-                if State.isMain[State.myName] then _G.trainKills = (_G.trainKills or 0) + 1 end
+                -- CHỈ đếm kill khi quái THẬT chết. Timeout/ghost (mobTimedOut) = đánh không ăn → KHÔNG đếm,
+                -- nếu không trainKills phồng >10 → trainTimeoutHop tưởng "năng suất" → không hop → kẹt bãi.
+                if not mobTimedOut and State.isMain[State.myName] then _G.trainKills = (_G.trainKills or 0) + 1 end
             end
         else
             topos(pos__)
@@ -3266,17 +3482,43 @@ do
         local isMain = State.isMain[me] == true
         _G.ShouldSendData = false
 
-        -- ===== CHECKING GATE (user 2026-07-02): 5s ĐẦU sau khi load team xong chỉ CHECK giai đoạn =====
-        -- Mốc _G.teamReadyAt = lần đầu thấy LocalPlayer.Team (sau ChooseTeam). Reset mỗi lần mất team
-        -- (hop server mới → chọn team lại → check lại từ đầu). Trong CHECK_WINDOW: KHÔNG join/trial/train,
-        -- chỉ để 3-strike đọc remote xác định phase; xong 5s tự chạy tiếp theo status thật của acc.
+        -- ===== CHECKING GATE (user 2026-07-02): giai đoạn ĐẦU sau khi load team xong chỉ CHECK phase =====
+        -- Mốc _G.teamReadyAt = lần đầu thấy LocalPlayer.Team (sau ChooseTeam). Trong CHECK_WINDOW: KHÔNG
+        -- join/trial/train, chỉ để 3-strike đọc remote xác định phase; xong window tự chạy tiếp status thật.
+        --
+        -- FIX checking-vĩnh-viễn (user 2026-07-02):
+        --  (1) LATCH per-JobId: xong window 1 lần cho server này thì THÔI, đổi server (JobId) mới check lại.
+        --      Tránh Team nhấp nháy (mất/nối lại) làm teamReadyAt reset → window restart mỗi tick → kẹt
+        --      "checking" vĩnh viễn + current-main kẹt window không bao giờ chạm self-demote → chặn cả queue.
+        --  (2) GRACE khi Team==nil: KHÔNG xoá teamReadyAt ngay 1 nhịp nil (respawn/anti-cheat) — chỉ coi là
+        --      mất team nếu nil liên tục > TEAM_GRACE. Team về lại KHÔNG restart window (đã latch theo JobId).
+        --  (3) Đổi JobId (hop server) → reset latch + streak + trainCheckLastT để check lại từ đầu, sạch state.
+        local TEAM_GRACE = 3
+        if _G.checkJobId ~= game.JobId then
+            _G.checkJobId = game.JobId
+            _G.teamReadyAt = nil
+            _G.checkDoneForJob = nil
+            _G.teamLostAt = nil
+            _G.trainNeedStreak = 0; _G.trialableStreak = 0; _G.trainCheckLastT = nil
+            _G.uncertainStreak = 0
+        end
         if LocalPlayer.Team then
+            _G.teamLostAt = nil
             if not _G.teamReadyAt then _G.teamReadyAt = tick() end
         else
-            _G.teamReadyAt = nil
+            if not _G.teamLostAt then _G.teamLostAt = tick() end
+            if (tick() - _G.teamLostAt) > TEAM_GRACE then _G.teamReadyAt = nil end
         end
-        local CHECK_WINDOW = 5
-        local inCheckWindow = _G.teamReadyAt ~= nil and (tick() - _G.teamReadyAt) < CHECK_WINDOW
+        -- FIX checking (user 2026-07-02): 3-strike cần 3×1.5s = 4.5s remote reads; CHECK_WINDOW=5s quá sát
+        -- → con nào remote trả chậm/uncertain 1 lần là KHÔNG đủ 3 strike trong 5s → ra window với streak sai
+        -- (con lỗi con không). Nâng 8s cho đủ biên 3 lần đọc ổn định.
+        local CHECK_WINDOW = 8
+        local inCheckWindow = (not _G.checkDoneForJob) and _G.teamReadyAt ~= nil
+            and (tick() - _G.teamReadyAt) < CHECK_WINDOW
+        -- window đã trôi hết cho server này → latch lại, không bao giờ vào lại cho tới khi đổi JobId
+        if (not _G.checkDoneForJob) and _G.teamReadyAt ~= nil and (tick() - _G.teamReadyAt) >= CHECK_WINDOW then
+            _G.checkDoneForJob = game.JobId
+        end
 
         local ab, AB = cachedTrialable()
         local currentmain = getCurrentMainBeingUpgraded()
@@ -3297,6 +3539,7 @@ do
                 _G.trainCheckLastT = tick()
                 local upg = Training.checkUpgradeForRole("main")
                 if upg and not upg.uncertain then
+                    _G.uncertainStreak = 0
                     if upg.needTrain then
                         _G.trainNeedStreak = (_G.trainNeedStreak or 0) + 1
                         _G.trialableStreak = 0
@@ -3304,12 +3547,23 @@ do
                         _G.trainNeedStreak = 0
                         _G.trialableStreak = (_G.trialableStreak or 0) + 1
                     end
-                    -- uncertain (remote fail) → giữ nguyên streak (không cộng, không reset)
+                else
+                    -- FIX deadlock [i=?] (user 2026-07-02): remote UpgradeRace fail/timeout (uncertain) MỌI lần
+                    -- đọc → streak đứng yên ở 0 → trainConfirmed=false VÀ trialConfirmed=false → acc kẹt limbo
+                    -- (không train, không trial, dashboard "checking"/"chờ current main" mãi; nếu là current
+                    -- main thì chặn cả queue). Sau N lần uncertain liên tiếp → FALLBACK coi như cần train
+                    -- (an toàn: chỉ grind tại chỗ, KHÔNG join full moon) để thoát limbo + để remote tự hồi.
+                    _G.uncertainStreak = (_G.uncertainStreak or 0) + 1
+                    if _G.uncertainStreak >= 5 then
+                        _G.trainNeedStreak = (_G.trainNeedStreak or 0) + 1
+                        _G.trialableStreak = 0
+                    end
                 end
             end
         else
             _G.trainNeedStreak = 0
             _G.trialableStreak = 0
+            _G.uncertainStreak = 0
         end
         local trainConfirmed = isMain and (_G.trainNeedStreak or 0) >= 3
         -- FIX (user 2026-07-02): CHỈ open gate + join full moon SAU khi xác nhận TRIALABLE 3 lần liên tiếp
@@ -3322,7 +3576,8 @@ do
         -- phase), nhưng CHƯA hành động (join/trial/train). Báo status "checking" để dashboard thấy đang dò.
         -- Hết 5s tick sau tự chạy tiếp theo status thật. CHỈ áp main (ally có loop hold/getsever riêng).
         if isMain and inCheckWindow then
-            if AB ~= "done" then State.reportStatus("checking") end
+            -- chỉ POST khi status server chưa phải "checking" (tránh spam ~20 POST/lần vào server suốt 8s)
+            if AB ~= "done" and State.getMainStatus(me) ~= "checking" then State.reportStatus("checking") end
             status("[MAIN " .. tostring(myStt) .. "] Checking phase (" .. string.format("%.1f", tick() - _G.teamReadyAt) .. "/" .. tostring(CHECK_WINDOW) .. "s)...")
             return
         end
@@ -3497,6 +3752,11 @@ do
         elseif isMain then
             -- MAIN CHƯA TỚI LƯỢT: còn train được → train song song; sẵn sàng → waiting (+ stt2-4 bám fullmoon)
             _G.allyKillReset = false
+            -- FIX checking-kẹt (user 2026-07-02): sau khi ra khỏi CHECK_WINDOW với streak<3 (con lỗi remote),
+            -- status BÁO SERVER vẫn là "checking" cũ (reportStatus("checking") set trong window) mà nhánh này
+            -- KHÔNG có path nào xoá khi myStatus=="checking" → dashboard kẹt "checking" vĩnh viễn dù acc đang
+            -- grind/chờ lượt. Chuẩn hoá "checking"→"waiting" NGAY để status server phản ánh đúng.
+            if myStatus == "checking" then State.setMyMainStatus("waiting"); myStatus = "waiting" end
             if (not ab) and AB ~= "done" then
                 -- FIX flap i=: theo Promt.md §XIII — CHỈ set status "training" khi ĐÃ vào trial lượt này.
                 -- Chưa vào trial (main2-6 đang chờ lượt) → giữ "waiting", vẫn grind tại chỗ, KHÔNG để
@@ -4092,6 +4352,7 @@ if not Runtime._started then
     safeStart("noclip", function() Movement.enableNoclip("return true") end)
     safeStart("spam_skills", CombatActions.startSpamSkills)
     safeStart("fast_attack", CombatActions.startFastAttack)
+    safeStart("v3_combat_watch", CombatActions.startV3CombatWatch)  -- V3 attack/gom quái (chỉ dùng khi training)
     safeStart("haki", CombatActions.startHakiLoop)
     safeStart("ally_train_gate", AllyTrainingGate.start)
     safeStart("ally_fm_watch", AllyFullMoonWatch.start)  -- loop nền Ally1/Ally2 canh hết full moon
