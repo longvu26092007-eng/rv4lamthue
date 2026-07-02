@@ -127,6 +127,7 @@ do
     -- CLEAN JOIN: fullmoon-join LUÔN do server + 2 Ally điều phối (bỏ tự-hop). Method chỉ là hành vi sau trial.
     Config.scout              = true
     Config.RALLY_HOP_THROTTLE = 5      -- giây: chống spam teleport tới 1 jobid
+    Config.FM_JOIN_BACKOFF    = 8      -- giây: sau khi hop vào FM gặp GameFull (server đầy) → ngừng spam join, chờ slot
 end
 
 --[[ ============================================================================
@@ -1408,6 +1409,25 @@ do
                 local failedJob = _G.lastRallyJob
                 _G.rallyHopArmedT = nil
                 _G.lastRallyJob = nil
+                -- FIX (user 2026-07-02) — GameFull = CHỜ SLOT, KHÔNG phá FullMoon:
+                -- Main2-6 (hoặc Main1) hop vào full moon ĐÃ LOCK mà Roblox báo server ĐẦY (GameFull) →
+                -- server chỉ đầy chứ KHÔNG chết. Nếu POST /rally/reject thì server sẽ XÓA fullmoonJobid +
+                -- blacklist server FM tốt (index.js /rally/reject) → nuke cả lock Ally1 đang giữ. PHẢI:
+                --   1) KHÔNG reject (giữ nguyên lock).
+                --   2) Hạ status "waiting" ngay (setMyMainStatus: main-only, ally no-op) → gỡ kẹt "moon"
+                --      (trước đây con này vòng nào cũng bị nhánh spam-join set lại "moon" → kẹt current mãi).
+                --   3) Bật backoff FM_JOIN_BACKOFF giây → nhánh spam-join ngừng hop, chờ có người rời rồi thử lại.
+                if teleportResult == Enum.TeleportResult.GameFull
+                    and failedJob and failedJob ~= ""
+                    and State.fullmoonJobid and failedJob == State.fullmoonJobid
+                then
+                    _G.fmJoinBackoffUntil = tick() + Config.FM_JOIN_BACKOFF
+                    State.setMyMainStatus("waiting")
+                    DBG("[FM-JOIN] Server FULL @ " .. tostring(failedJob)
+                        .. " → chờ slot (waiting + backoff " .. tostring(Config.FM_JOIN_BACKOFF)
+                        .. "s), KHÔNG reject/nuke FM", "warn", "fm_full_wait")
+                    return
+                end
                 if failedJob and failedJob ~= "" then
                     TeleportManager.deadJobs[failedJob] = tick()
                     DBG("[RALLY] Teleport fail jobid=" .. tostring(failedJob) .. " -> reject", "err", "rally_fail")
@@ -3574,7 +3594,16 @@ do
             status("[ALLY2] moon flicker → giữ")
             return false
         else
-            -- Ally2 thấy hết FM → KHÔNG tự xin server (để Ally1 quyết). Chờ server đổi fullmoonJobid.
+            -- LỚP 1 (user 2026-07-02): đứng đúng server ĐÃ LOCK mà isfullmoon() đọc hụt 1 nhịp (Sky/texture
+            -- load lệch giữa các client) → KHÔNG flip "moon". Tin server + Ally1/AllyFullMoonWatch làm trọng
+            -- tài quyết FM mất (grace 8s + /fmlost). Nếu FM thật sự hết → Ally1 /fmlost → server UNLOCK →
+            -- State.fullmoonJobid=nil → nhịp sau rơi vào nhánh "not target" ở trên → tự về "moon". KHÔNG kẹt.
+            if State.fullmoonLocked == true and target and game.JobId == target then
+                State.reportStatus("ally")
+                status("[ALLY2] isfullmoon() hụt nhưng server ĐÃ LOCK @ " .. tostring(target) .. " → giữ ally (chờ Ally1/Watch quyết)")
+                return false
+            end
+            -- Server CHƯA lock (hoặc đã unlock) → thật sự hết FM → KHÔNG tự xin server (để Ally1 quyết).
             _allyFmConfirmedAt = 0
             State.reportStatus("moon")
             status("[ALLY2] FullMoon hết, chờ Ally1 chốt server mới...")
@@ -3641,6 +3670,13 @@ do
                 -- FIX (user 2026-07-02): CHỈ join full moon khi ĐÃ xác nhận trial được 3 lần (trialConfirmed).
                 -- Chưa xác nhận (mới vào server, _G streak reset) → return false, train/grind tại chỗ, KHÔNG join.
                 if not ctx.trialConfirmed then return false end
+                -- FIX GameFull (user 2026-07-02): vừa hop gặp server ĐẦY → backoff, ngừng spam + tụt "waiting"
+                -- (không kẹt "moon"/current). Hết backoff mới thử join lại (chờ có người rời server FM).
+                if _G.fmJoinBackoffUntil and tick() < _G.fmJoinBackoffUntil then
+                    if myStatus ~= "waiting" then State.setMyMainStatus("waiting") end
+                    status("[MAIN1] Server FM đầy → chờ slot (" .. tostring(math.ceil(_G.fmJoinBackoffUntil - tick())) .. "s)")
+                    return true
+                end
                 if (tick() - _lastMainJoinSpam) >= (State.joinSpamInterval or 5) then
                     _lastMainJoinSpam = tick()
                     State.setMyMainStatus("moon")
@@ -3669,6 +3705,13 @@ do
             -- FIX (user 2026-07-02): CHỈ join full moon khi ĐÃ xác nhận trial được 3 lần (trialConfirmed).
             -- Chưa xác nhận (mới vào server, _G streak reset) → return false, train/grind tại chỗ, KHÔNG join.
             if not ctx.trialConfirmed then return false end
+            -- FIX GameFull (user 2026-07-02): vừa hop gặp server ĐẦY → backoff, ngừng spam + tụt "waiting"
+            -- (không kẹt "moon"). Con này rơi về rank waiting → KHÔNG lọt lên current. Hết backoff mới thử lại.
+            if _G.fmJoinBackoffUntil and tick() < _G.fmJoinBackoffUntil then
+                if myStatus ~= "waiting" then State.setMyMainStatus("waiting") end
+                status("[MAIN " .. tostring(ctx.myStt) .. "] Server FM đầy → chờ slot (" .. tostring(math.ceil(_G.fmJoinBackoffUntil - tick())) .. "s)")
+                return true
+            end
             -- SPEC MỚI (user 2026-07-02): gate mở → Main2-6 spam join = status "moon"
             -- (moon = "đang làm open gate + spam full moon"). "waiting" chỉ dành cho lúc CHỜ Main1 ready.
             if (tick() - _lastMainJoinSpam) >= (State.joinSpamInterval or 5) then
@@ -4095,7 +4138,11 @@ do
         elseif isMain and currentmain == me then
             StateMachine.transition(S.GOING_DOOR, "my turn")
             status("[MAIN " .. myStt .. "] My turn to upgrade gear!")
-            if (myStatus == "waiting" or myStatus == "") and State.getMainStatus(me) ~= "ready" then State.setMyMainStatus("moon") end
+            -- LỚP 1 (user 2026-07-02): CHẶN tụt "moon" khi đang vật lý ở server FM ĐÃ LOCK. Đứng đúng
+            -- fullmoonJobid = đã "ready" (ScoutNavigator set) → KHÔNG bao giờ báo "moon" nữa (moon chỉ dành
+            -- cho lúc ĐI TÌM/CHỜ full moon, ngoài FM). Server unlock → game.JobId ~= fmJob → về logic cũ.
+            local inLockedFM = State.fullmoonLocked == true and State.fullmoonJobid and game.JobId == State.fullmoonJobid
+            if (myStatus == "waiting" or myStatus == "") and State.getMainStatus(me) ~= "ready" and not inLockedFM then State.setMyMainStatus("moon") end
             -- BS-3: ĐÃ XÓA self-hop fullmoon (ScoutNavigator đưa vào FM). Chạy thẳng gear/door/trial.
             do
                 task.spawn(checkgear)
