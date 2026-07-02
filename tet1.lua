@@ -2304,22 +2304,18 @@ do
         return 1e9
     end
 
-    -- cùng server với main đang turn (cache 3s) (File A 2520-2531)
+    -- SAME = mình đang ở ĐÚNG server full moon Ally1 đã chốt (fullmoonJobid) — điểm hẹn chung
+    -- của Main + 2 Ally (user 2026-07-02). Trước đây trả true vô điều kiện khi myName==curName,
+    -- hoặc auto-true khi đứng fullmoonJobid mà main1 chưa chắc ở đó → SAME giả. Giờ CHỈ dựa vào
+    -- game.JobId == fullmoonJobid: main1 và ally cùng so với 1 mốc → "same" chỉ khi thật sự tụ đúng chỗ.
     local _ssCache = { t = -1e9, v = false }
     function AbilitySync.sameServerAsCurrentMain()
-        local curName = getCurrentMainBeingUpgraded()
-        if not curName then return false end
-        if State.myName == curName then return true end
-        -- shortcut: đang đứng đúng server full moon (fmJobid) → cùng server với main1 chắc chắn
-        if State.fullmoonJobid and State.fullmoonJobid ~= "" and game.JobId == State.fullmoonJobid then
-            _ssCache.t = tick(); _ssCache.v = true; return true
+        local fm = State.fullmoonJobid
+        if fm and fm ~= "" then
+            return game.JobId == fm
         end
-        local now = tick()
-        if now - _ssCache.t < 3 then return _ssCache.v end
-        local same = isSameServerAsMain(curName)
-        _ssCache.t = now
-        _ssCache.v = same and true or false
-        return _ssCache.v
+        -- chưa chốt full moon → chưa có điểm hẹn → không thể "same"
+        return false
     end
 
     function AbilitySync.allyIndexOf(nm)
@@ -3097,6 +3093,8 @@ do
                 State.setMyMainStatus("moon")
                 status("[MAIN] Waiting for Ally (chờ 2 Ally giữ full moon)...")
             else
+                -- SPEC MỚI (user 2026-07-02): Main2-6 chờ = "waiting" (KHÔNG để kẹt "checking" từ check window)
+                if myStatus ~= "waiting" then State.setMyMainStatus("waiting") end
                 status("[MAIN] Waiting for Ally...")
             end
             return true
@@ -3136,17 +3134,21 @@ do
             -- FIX (user 2026-07-02): CHỈ join full moon khi ĐÃ xác nhận trial được 3 lần (trialConfirmed).
             -- Chưa xác nhận (mới vào server, _G streak reset) → return false, train/grind tại chỗ, KHÔNG join.
             if not ctx.trialConfirmed then return false end
-            -- CHƯA vào server 2 Ally → spam join theo lượt. Báo "waiting" (KHÔNG "moon"):
-            -- chỉ main1/current mới được "moon". Main2-6 đang đi vào = waiting (yêu cầu user 2026-07-02).
+            -- SPEC MỚI (user 2026-07-02): gate mở → Main2-6 spam join = status "moon"
+            -- (moon = "đang làm open gate + spam full moon"). "waiting" chỉ dành cho lúc CHỜ Main1 ready.
             if (tick() - _lastMainJoinSpam) >= (State.joinSpamInterval or 5) then
                 _lastMainJoinSpam = tick()
-                State.setMyMainStatus("waiting")
+                State.setMyMainStatus("moon")
                 status("[MAIN] Gate open → spam join full moon: " .. tostring(fmJob))
                 TeleportManager.hopToJob(fmJob, "[MAIN2-6-SPAM-JOIN]")
             end
             return true
         end
-        -- gate chưa mở (Main1 chưa ready) → THẢ xuống nhánh waiting gốc (train song song, status waiting)
+        -- gate chưa mở (Main1 chưa ready) → CHỜ → status "waiting" (SPEC MỚI: waiting = đợi Main1 ready)
+        if myStatus ~= "waiting" then
+            State.setMyMainStatus("waiting")
+            status("[MAIN " .. tostring(ctx.myStt) .. "] Waiting Main1 ready (gate chưa mở)...")
+        end
         return false
     end
 
