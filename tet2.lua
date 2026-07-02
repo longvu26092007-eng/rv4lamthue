@@ -128,6 +128,7 @@ do
     Config.scout              = true
     Config.RALLY_HOP_THROTTLE = 5      -- giây: chống spam teleport tới 1 jobid
     Config.FM_JOIN_BACKOFF    = 8      -- giây: sau khi hop vào FM gặp GameFull (server đầy) → ngừng spam join, chờ slot
+    Config.MOON_CONCURRENT_MAX = 5     -- stt tối đa được "moon"/spam-join cùng lúc (stt1=Main1 ready; stt2-5 moon). >5 → waiting chờ slot
 end
 
 --[[ ============================================================================
@@ -3685,9 +3686,21 @@ do
                 end
                 return true
             end
-            -- ĐÃ ở FM cùng Ally → ready → THẢ xuống my-turn gốc (door/trial/kill)
+            -- ĐÃ ở FM cùng Ally. FIX ready-sớm (user 2026-07-02): CHỈ báo "ready" khi ĐỦ requiredAllies
+            -- (2) ally ĐANG giữ FM cùng jobid này (State.fullmoonAllyCount do server tính = allyFullmoonNamesAt).
+            -- LÝ DO: ready → server mở gate → Main2-6 flood spam-join → server ĐẦY 12 người → ally thứ 2
+            -- (join_moon) DÍNH Error 772 KHÔNG vào nổi → FM chỉ có 1 ally, cả đàn kẹt. Chưa đủ ally → giữ
+            -- "moon" (đang chờ ally vào), gate CHƯA mở, Main2-6 còn "waiting" → CHỪA slot cho ally thứ 2.
+            local needAllies = State.requiredAllies or 2
+            local haveAllies = State.fullmoonAllyCount or 0
+            if haveAllies < needAllies then
+                if myStatus ~= "moon" then State.setMyMainStatus("moon") end
+                status("[MAIN1] In FullMoon, chờ đủ ally (" .. tostring(haveAllies) .. "/" .. tostring(needAllies) .. ") mới ready → chừa slot cho ally")
+                return true
+            end
+            -- Đủ ally → ready → THẢ xuống my-turn gốc (door/trial/kill)
             State.setMyMainStatus("ready")
-            status("[MAIN1] In FullMoon with Ally → Ready for trialing")
+            status("[MAIN1] In FullMoon với đủ " .. tostring(haveAllies) .. " ally → Ready for trialing")
             return false
         end
 
@@ -3705,6 +3718,17 @@ do
             -- FIX (user 2026-07-02): CHỈ join full moon khi ĐÃ xác nhận trial được 3 lần (trialConfirmed).
             -- Chưa xác nhận (mới vào server, _G streak reset) → return false, train/grind tại chỗ, KHÔNG join.
             if not ctx.trialConfirmed then return false end
+            -- FIX moon-đồng-loạt (user 2026-07-02): GIỚI HẠN số main "moon"/spam-join cùng lúc = MOON_CONCURRENT_MAX.
+            -- Trước đây Main1 ready → gate mở → TẤT CẢ main2-9 đồng loạt moon spam-join → flood server đầy 12.
+            -- Giờ chỉ stt <= MOON_CONCURRENT_MAX (stt1=Main1 ready; stt2-5 moon) được vào; stt còn lại giữ
+            -- "waiting" chờ slot. Window TỰ TRƯỢT theo order server: con trước xong (done/training rời order)
+            -- thì con sau lọt vào top → được moon. → không bao giờ có quá 4 con đập cùng lúc.
+            local myStt = ctx.myStt
+            if myStt and myStt > (Config.MOON_CONCURRENT_MAX or 5) then
+                if myStatus ~= "waiting" then State.setMyMainStatus("waiting") end
+                status("[MAIN " .. tostring(myStt) .. "] Chờ slot moon (stt>" .. tostring(Config.MOON_CONCURRENT_MAX or 5) .. ") → waiting")
+                return true
+            end
             -- FIX GameFull (user 2026-07-02): vừa hop gặp server ĐẦY → backoff, ngừng spam + tụt "waiting"
             -- (không kẹt "moon"). Con này rơi về rank waiting → KHÔNG lọt lên current. Hết backoff mới thử lại.
             if _G.fmJoinBackoffUntil and tick() < _G.fmJoinBackoffUntil then
