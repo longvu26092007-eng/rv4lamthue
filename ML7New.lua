@@ -745,6 +745,72 @@ task.spawn(function()
 end)
 
 -- ==========================================
+-- [ CHANGE FOLDER AFTER COMPLETED ]
+-- ==========================================
+getgenv().ChangeFolderOnCompleted = getgenv().ChangeFolderOnCompleted ~= false
+getgenv().id1 = getgenv().id1 or "........."
+getgenv().id2 = getgenv().id2 or "........."
+
+local CompletedFolderLock = false
+
+local function NormalizeFolderId(value, allowNil)
+    if value == nil then return nil, allowNil end
+    local s = tostring(value):gsub("^%s+", ""):gsub("%s+$", "")
+    if s == "" or s == "........." or s:match("^%.+$") or s:lower() == "nil" then
+        return nil, allowNil
+    end
+    return s, true
+end
+
+local function ChangeFolderAfterCompleted(reason)
+    if CompletedFolderLock then return false end
+    if getgenv().ChangeFolderOnCompleted == false then
+        warn("[Completed] ChangeFolderOnCompleted = false - bỏ qua")
+        return false
+    end
+    if not getgenv().client then
+        warn("[Completed] getgenv().client chưa set - bỏ qua")
+        return false
+    end
+    if typeof(getgenv().client.ChangeToFolder) ~= "function" then
+        warn("[Completed] ChangeToFolder không tồn tại - bỏ qua")
+        return false
+    end
+    local id1, ok1 = NormalizeFolderId(getgenv().id1, false)
+    local id2, ok2 = NormalizeFolderId(getgenv().id2, false)
+    local id3, _   = NormalizeFolderId(getgenv().id3, true)
+    if not ok1 or not ok2 then
+        warn("[Completed] id1/id2 rỗng - bỏ qua")
+        return false
+    end
+    CompletedFolderLock = true
+    warn(("[Completed] %s -> ChangeToFolder id1=%s id2=%s id3=%s"):format(
+        tostring(reason or "Completed"), tostring(id1), tostring(id2),
+        id3 == nil and "nil" or tostring(id3)
+    ))
+    local ok, changed = pcall(function()
+        return getgenv().client:ChangeToFolder(id1, id2, true, id3)
+    end)
+    if not ok then
+        warn("[Completed] Lỗi ChangeToFolder: " .. tostring(changed))
+        CompletedFolderLock = false
+        return false
+    end
+    if changed then
+        warn("[Completed] Đổi folder OK → disconnect + shutdown...")
+        pcall(function() getgenv().client:Disconnect() end)
+        task.wait(5)
+        pcall(function() game:Shutdown() end)
+        return true
+    else
+        warn("[Completed] Đổi folder thất bại")
+        task.wait(10)
+        CompletedFolderLock = false
+        return false
+    end
+end
+
+-- ==========================================
 -- [ HÀM GET SA ]
 -- ==========================================
 local function RunGetSA()
@@ -753,7 +819,9 @@ local function RunGetSA()
     if currentMelee == "Sanguine Art" then
         SetStatus("✅ Có SA! Ghi file...", Color3.fromRGB(0, 255, 0))
         pcall(function() writefile(Player.Name .. ".txt", "Completed-melee") end)
+        warn("[getSA] Đã ghi: " .. Player.Name .. ".txt → Completed-melee")
         SetStatus("✅ Completed-melee!")
+        ChangeFolderAfterCompleted("Completed-melee")
         return
     end
     SetStatus("SA Active → Chạy getSA...", Color3.fromRGB(255, 200, 0))
@@ -766,7 +834,9 @@ local function RunGetSA()
         if currentMelee == "Sanguine Art" then
             SetStatus("✅ Có SA! Ghi file...", Color3.fromRGB(0, 255, 0))
             pcall(function() writefile(Player.Name .. ".txt", "Completed-melee") end)
+            warn("[getSA] Đã ghi: " .. Player.Name .. ".txt → Completed-melee")
             SetStatus("✅ Completed-melee!")
+            ChangeFolderAfterCompleted("Completed-melee")
             break
         else
             SetStatus("Đợi SA... (" .. currentMelee .. ")", Color3.fromRGB(255, 200, 0))
