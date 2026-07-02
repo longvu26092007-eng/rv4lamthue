@@ -28,7 +28,7 @@ local TweenService         = game:GetService("TweenService")
 local VirtualInputManager  = game:GetService("VirtualInputManager")
 local VirtualUser          = game:GetService("VirtualUser")
 
-local LocalPlayer = Players.LocalPlayer
+local LocalPlayer = Players.LocalPlayer   -- có thể nil nếu executor inject trước khi player replicate (Ally2 load chậm)
 
 --[[ ============================================================================
  [01] BOOTSTRAP — chờ client load, KHÔNG treo vô hạn (timeout 30s). (File A 5-12)
@@ -38,12 +38,21 @@ do
     local t0 = tick()
     repeat
         task.wait(0.1)
+        -- FIX (user 2026-07-02): LocalPlayer cache ở trên có thể nil khi inject sớm → PHẢI gán lại
+        -- CHÍNH biến module-level (trước đây chỉ gán vào biến 'lp' cục bộ → LocalPlayer kẹt nil vĩnh viễn
+        -- → crash :99 LocalPlayer.Name, :850 OnTeleport). Refresh mỗi vòng cho tới khi có.
+        LocalPlayer = Players.LocalPlayer or LocalPlayer
         local rem  = ReplicatedStorage:FindFirstChild("Remotes")
-        local lp   = Players.LocalPlayer
-        local gui  = lp and lp:FindFirstChild("PlayerGui")
+        local gui  = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
         local loadingScreen = gui and gui:FindFirstChild("LoadingScreen")
-        if rem and lp and gui and not loadingScreen then break end
+        if rem and LocalPlayer and gui and not loadingScreen then break end
     until (tick() - t0) > 30
+    -- Chốt chặn cuối: KHÔNG cho chạy tiếp với LocalPlayer nil (nếu timeout mà vẫn chưa có → chờ dứt điểm).
+    -- Poll thuần Players.LocalPlayer (KHÔNG dùng PlayerAdded:Wait vì nó trả player bất kỳ, không chắc là mình).
+    while not LocalPlayer do
+        task.wait(0.2)
+        LocalPlayer = Players.LocalPlayer
+    end
 end
 
 --[[ ============================================================================
@@ -852,8 +861,10 @@ do
             end
         end)
     end)
-    Players.PlayerRemoving:Connect(function(plr)
-        if plr == LocalPlayer and not Runtime.teleporting then ServerSync.sendOffline() end
+    pcall(function()
+        Players.PlayerRemoving:Connect(function(plr)
+            if plr == LocalPlayer and not Runtime.teleporting then ServerSync.sendOffline() end
+        end)
     end)
     pcall(function() game:BindToClose(function()
         if not Runtime.teleporting then ServerSync.sendOffline() end
