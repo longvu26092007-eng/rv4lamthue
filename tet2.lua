@@ -2255,9 +2255,17 @@ do
             needTrain = false, canBuyGear = false,
             uncertain = true, reason = "unknown",
         }
-        if not raw.ok or i == nil then
+        if not raw.ok then
+            -- CHỈ remote thật sự fail/timeout (SafeRemote trả false) mới là uncertain.
             result.uncertain = true
             result.reason = "check_failed"
+        elseif i == nil then
+            -- FIX (user 2026-07-02): remote SUCCEEDED nhưng server trả nil = acc CHƯA trial lần nào (fresh,
+            -- hiện [i=?]). ĐÂY KHÔNG PHẢI uncertain/train — theo user i=? = CÓ THỂ TRIAL. Trước đây gộp
+            -- `not raw.ok or i == nil` thành uncertain → main fresh kẹt limbo, không bao giờ join full moon.
+            result.uncertain = false
+            result.trialable = true
+            result.reason = "fresh_never_trialed"
         elseif i == 0 then
             result.uncertain = false
             result.trialable = true
@@ -3548,15 +3556,14 @@ do
                         _G.trialableStreak = (_G.trialableStreak or 0) + 1
                     end
                 else
-                    -- FIX deadlock [i=?] (user 2026-07-02): remote UpgradeRace fail/timeout (uncertain) MỌI lần
-                    -- đọc → streak đứng yên ở 0 → trainConfirmed=false VÀ trialConfirmed=false → acc kẹt limbo
-                    -- (không train, không trial, dashboard "checking"/"chờ current main" mãi; nếu là current
-                    -- main thì chặn cả queue). Sau N lần uncertain liên tiếp → FALLBACK coi như cần train
-                    -- (an toàn: chỉ grind tại chỗ, KHÔNG join full moon) để thoát limbo + để remote tự hồi.
+                    -- uncertain GIỜ CHỈ còn là remote THẬT SỰ fail/timeout (raw.ok==false). Case [i=?]
+                    -- "acc chưa trial lần nào" đã được checkUpgradeForRole phân loại thành trialable ở nguồn
+                    -- (không rơi vào đây nữa). Nếu remote fail liên tục N lần → nghiêng TRIALABLE để thoát
+                    -- limbo (nhất quán: khi không chắc thì cho trial, không đẩy train).
                     _G.uncertainStreak = (_G.uncertainStreak or 0) + 1
                     if _G.uncertainStreak >= 5 then
-                        _G.trainNeedStreak = (_G.trainNeedStreak or 0) + 1
-                        _G.trialableStreak = 0
+                        _G.trainNeedStreak = 0
+                        _G.trialableStreak = (_G.trialableStreak or 0) + 1
                     end
                 end
             end
