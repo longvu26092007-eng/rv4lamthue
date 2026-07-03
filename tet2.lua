@@ -2990,27 +2990,51 @@ local PostTrial = {}
 do
     local B = Config.baseUrl
 
-    -- Ally auto-reset 1 lần (File A 1966-1982)
+    -- Ally auto-reset CHẮC CHẮN: loop 5 lần Health=0 + BreakJoints (0.15s) → chết hẳn trước main.
+    -- Trước đây chỉ 1 lần Health=0 → ally có thể không chết (shield/respawn) → main tween đến đánh nhầm.
     function PostTrial.resetAllyOnce(roleName)
         if _G.allyKillReset then return "ally_reset" end
         _G.allyKillReset = true
-        status(roleName .. " Kill-player → AUTO RESET (ally)")
+        status(roleName .. " Kill-player → AUTO RESET NGAY (ally, loop 5)")
         task.spawn(function()
-            pcall(function() LocalPlayer.Character.Humanoid.Health = 0 end)
-            task.wait(1)
+            for _ = 1, 5 do
+                pcall(function() LocalPlayer.Character.Humanoid.Health = 0 end)
+                pcall(function() LocalPlayer.Character:BreakJoints() end)
+                local c = LocalPlayer.Character
+                local h = c and c:FindFirstChild("Humanoid")
+                if (not h) or h.Health <= 0 then break end
+                task.wait(0.15)
+            end
+            task.wait(0.5)
             Net.postJSON(B .. "/helpreset", { name = State.myName }, "helpreset")
         end)
         return "ally_reset"
     end
 
-    -- Current main tự reset sau khi kill xong.
-    -- Chỉ reset khi đã thắng trial lượt này (didEnterTrialThisTurn), tránh reset oan.
+    -- Current main: CHỜ server báo "/helpreset all_done" (tức allies đã POST xong)
+    -- rồi mới tự sát. Trước đây reset ngay → main chết trước ally → ally còn trong server → tween đi lung tung.
     function PostTrial.currentMainReset(myStt)
         if not State.didEnterTrialThisTurn then
             status("[MAIN " .. tostring(myStt) .. "] Chưa thắng trial → KHÔNG reset")
             return "posttrial_skip"
         end
-        status("[MAIN " .. tostring(myStt) .. "] Trial done → tự reset")
+        local allies_str = table.concat(Config.allies, ",")
+        if allies_str ~= "" then
+            status("[MAIN " .. tostring(myStt) .. "] Waiting for help accs to reset first...")
+            local timeout = 0
+            repeat
+                task.wait(1)
+                timeout = timeout + 1
+                local res = Net.getJSON(B .. "/helpreset?allies=" .. allies_str, 0)
+                if res and res.all_done then
+                    status("[MAIN " .. tostring(myStt) .. "] All allies reset done → reset main")
+                    break
+                end
+            until timeout >= Config.HELPRESET_TIMEOUT
+            if timeout >= Config.HELPRESET_TIMEOUT then
+                status("[MAIN " .. tostring(myStt) .. "] ⏱ Help reset timeout " .. tostring(Config.HELPRESET_TIMEOUT) .. "s → reset main anyway")
+            end
+        end
         pcall(function() LocalPlayer.Character.Humanoid.Health = 0 end)
         task.wait(3)
         State.setMyMainStatus("training")
@@ -3018,10 +3042,10 @@ do
         return "main_reset_done"
     end
 
-    -- Main phụ delay reset (File A 2011-2019)
+    -- Main phụ delay reset (giữ nguyên: chờ allies*2 + 4 + random 0-3 giây)
     function PostTrial.otherMainReset()
         task.spawn(function()
-            local delay = (#Config.allies * 2) + 5 + math.random(0, 3)
+            local delay = (#Config.allies * 2) + 4 + math.random(0, 3)
             task.wait(delay)
             pcall(function() LocalPlayer.Character.Humanoid.Health = 0 end)
             task.wait(1)
@@ -3030,15 +3054,16 @@ do
         return "other_main_reset"
     end
 
-    -- Main đang turn (current) kill player trong tầm rồi reset
+    -- Main đang turn (current) kill player trong tầm rồi reset.
     -- 3s đầu đứng im để ally kịp reset trước, tránh main reset theo trước ally.
-    -- Sau 3s mới đi kill; chỉ reset khi đã thắng trial (didEnterTrialThisTurn).
+    -- BỎ ĐUỔI khi player chạy xa > 1500 studs (chống tween đi lung tung ra khỏi vùng FFA).
+    -- Chỉ reset khi đã thắng trial (didEnterTrialThisTurn).
     function PostTrial.mainKillThenReset(myStt, currentmain)
         -- Guard 3s: seed _G.mainKillStart lần đầu (hoặc nếu quá 60s → coi là cycle mới)
         if not _G.mainKillStart or (tick() - _G.mainKillStart) > 60 then
             _G.mainKillStart = tick()
         end
-        if (tick() - _G.mainKillStart) < 5 then
+        if (tick() - _G.mainKillStart) < 3 then
             _G.SHOULDSPAMSKILLS = false
             status("[MAIN " .. tostring(myStt) .. "] Kill phase → đứng im 3s cho ally reset trước...")
             return "posttrial_wait_ally"
@@ -3047,10 +3072,14 @@ do
         status("[MAIN " .. tostring(myStt) .. "] Kill Players After Trial")
         for plr in pairs(getplayers()) do
             if plr then
-                repeat task.wait() attackTick(plr)
+                repeat
+                    task.wait()
+                    attackTick(plr)
+                    local hrp = plr:FindFirstChild("HumanoidRootPart")
+                    local tooFar = hrp and getdis(hrp.CFrame) > 1500
                 until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid")
                     or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0
-                    or templeState() ~= "ffup"
+                    or templeState() ~= "ffup" or tooFar
             end
         end
         _G.SHOULDSPAMSKILLS = false
