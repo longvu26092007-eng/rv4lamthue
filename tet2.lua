@@ -3021,7 +3021,7 @@ do
     -- Main phụ delay reset (File A 2011-2019)
     function PostTrial.otherMainReset()
         task.spawn(function()
-            local delay = (#Config.allies * 2) + 4 + math.random(0, 3)
+            local delay = (#Config.allies * 2) + 5 + math.random(0, 3)
             task.wait(delay)
             pcall(function() LocalPlayer.Character.Humanoid.Health = 0 end)
             task.wait(1)
@@ -3038,7 +3038,7 @@ do
         if not _G.mainKillStart or (tick() - _G.mainKillStart) > 60 then
             _G.mainKillStart = tick()
         end
-        if (tick() - _G.mainKillStart) < 3 then
+        if (tick() - _G.mainKillStart) < 5 then
             _G.SHOULDSPAMSKILLS = false
             status("[MAIN " .. tostring(myStt) .. "] Kill phase → đứng im 3s cho ally reset trước...")
             return "posttrial_wait_ally"
