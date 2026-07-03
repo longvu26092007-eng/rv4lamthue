@@ -3021,7 +3021,7 @@ do
     -- Main phụ delay reset (File A 2011-2019)
     function PostTrial.otherMainReset()
         task.spawn(function()
-            local delay = (#Config.allies * 2) + 4 + math.random(0, 3)
+            local delay = (#Config.allies * 2) + 4 + math.random(0, 6)
             task.wait(delay)
             pcall(function() LocalPlayer.Character.Humanoid.Health = 0 end)
             task.wait(1)
