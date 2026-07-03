@@ -1797,9 +1797,36 @@ local function NormalAttack(duration)
     until tick() - started >= (duration or 0.6) or FindTyrant()
 end
 
+-- Dragon Talon la fighting style (melee): khi da so huu, no KHONG nam trong
+-- Backpack/Character duoi dang Tool ma o LocalPlayer.Data.Melee.Value.
+-- Chi dua vao FindTool se luon "khong thay" -> script cu di mua lai giua luc danh boss.
+local function HasMeleeStyle(styleName)
+    local ok, value = pcall(function()
+        local data = LocalPlayer:FindFirstChild("Data")
+        local melee = data and data:FindFirstChild("Melee")
+        return melee and melee.Value or nil
+    end)
+    if not ok or value == nil then
+        return false
+    end
+    return NormalizeName(value) == NormalizeName(styleName)
+end
+
+local function PlayerHasDragonTalon()
+    return FindTool("Dragon Talon") ~= nil
+        or FindTool("DragonTalon") ~= nil
+        or HasMeleeStyle("Dragon Talon")
+end
+
 local function BuyDragonTalon()
-    if FindTool("Dragon Talon") or FindTool("DragonTalon") then
+    -- Da co Dragon Talon (tool hoac fighting style) -> khong mua nua.
+    if PlayerHasDragonTalon() then
         return true
+    end
+
+    -- Dang co Tyrant/boss thi tuyet doi khong tween di mua (se keo nhan vat khoi boss).
+    if FindTyrant() then
+        return false
     end
 
     if not Config.AutoBuyDragonTalon then
@@ -1821,7 +1848,7 @@ local function BuyDragonTalon()
         end)
 
         task.wait(0.5)
-        if FindTool("Dragon Talon") or FindTool("DragonTalon") then
+        if PlayerHasDragonTalon() then
             return true
         end
     end
@@ -1834,7 +1861,10 @@ local function EnsureWeapon()
         return EquipWeapon()
     end
 
-    if NormalizeName(Config.Weapon) == NormalizeName("Dragon Talon") then
+    -- Chi mua khi that su CHUA co Dragon Talon (ke ca dang fighting style o Data.Melee).
+    if NormalizeName(Config.Weapon) == NormalizeName("Dragon Talon")
+        and not PlayerHasDragonTalon()
+    then
         BuyDragonTalon()
     end
 
@@ -2805,8 +2835,7 @@ do
 end
 
 if NormalizeName(Config.Weapon) == NormalizeName("Dragon Talon")
-    and not FindTool("Dragon Talon")
-    and not FindTool("DragonTalon")
+    and not PlayerHasDragonTalon()
 then
     BuyDragonTalon()
 end
