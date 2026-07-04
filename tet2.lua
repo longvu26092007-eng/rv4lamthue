@@ -1277,7 +1277,45 @@ do
             d = Movement.getdis(targetCf)
         end
         _G.lastDoorSrc, _G.lastDoorName, _G.lastDoorDist = src, doorName, d
+        -- FIX (user 2026-07-04) — sau snap d<=35, quẹt trigger cửa 1 lần (áp dụng cả main + ally)
+        -- để phòng ghost door (door load xong nhưng Touched event chưa register đúng frame).
+        if d <= 25 then
+            TempleManager.doorTouch(targetCf, "goToMyDoor_snap")
+        end
         return d <= 25
+    end
+
+    -- FIX (user 2026-07-04) — doorTouch: quẹt HRP qua cửa 2-3 lần để "đánh thức" trigger
+    -- khi door ghost. Mô phỏng thao tác người dùng bấm R + teleport lên/xuống rồi bay lại.
+    -- ÁP DỤNG CẢ MAIN + ALLY (không phân biệt current main). Cooldown 1.5s để không spam.
+    -- offsets = {0, 5, -3, 0}: từ giữa đi tới +5, lùi -3, về 0. Mỗi bước task.wait(0.08) → ~0.32s tổng.
+    local _doorTouchCD = 0
+    local DOOR_TOUCH_CD = 1.5
+    function TempleManager.doorTouch(targetCf, reason)
+        if not targetCf then return end
+        local now = tick()
+        if (now - _doorTouchCD) < DOOR_TOUCH_CD then return end
+        _doorTouchCD = now
+        pcall(function()
+            if Movement.cancel then Movement.cancel() end
+            local char = LocalPlayer and LocalPlayer.Character
+            if not (char and char:FindFirstChild("HumanoidRootPart")) then return end
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            local look = targetCf.LookVector
+            local flatLook = Vector3.new(look.X, 0, look.Z)
+            if flatLook.Magnitude <= 0 then flatLook = Vector3.new(0, 0, -1) end
+            flatLook = flatLook.Unit
+            local pos = targetCf.Position
+            local offsets = {0, 5, -3, 0}
+            for _, off in ipairs(offsets) do
+                local p = pos + flatLook * off
+                hrp.CFrame = CFrame.lookAt(p, p + flatLook)
+                task.wait(0.08)
+            end
+            hrp.CFrame = targetCf
+        end)
+        _G.lastDoorSrc = "touch"
+        if reason then _G.lastDoorTouchReason = reason end
     end
 end
 local function goToMyDoor() return TempleManager.goToMyDoor() end
