@@ -1608,15 +1608,7 @@ do
             pcall(function() Movement.haki() end)
         end
         local hrp = target and target:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            -- SAFETY (2026-07-02): bỏ tween khi target xa > 2500 studs để wrapper `topos` KHÔNG
-            -- ép main tự sát (điều kiện kill khi gần temple). Nếu xa quá, bỏ qua tick này —
-            -- vòng kill ở PostTrial sẽ check `tooFar > 1500` và thoát loop sau.
-            pcall(function()
-                if Movement.getdis(hrp.CFrame) > 2500 then return end
-                topos(hrp.CFrame * _atkOff)
-            end)
-        end
+        if hrp then pcall(function() topos(hrp.CFrame * _atkOff) end) end
     end
 
     -- weapon / spam-skills (File A 2039-2123)
@@ -2760,15 +2752,14 @@ do
 
     local function checkFileForLabel(label) return SYNC_DIR .. "/checkalready_" .. string.lower(label) end
 
-    -- toạ độ cửa dự phòng (toạ độ chuẩn Temple of Time, lấy y chang KaitunV4_ban2_fixed.lua)
-    -- User 2026-07-04: thay toạ độ cửa trial theo file tham khảo để khớp vị trí trong game.
+    -- toạ độ cửa dự phòng (toạ độ chuẩn Temple of Time, kèm rotation)
     local BANANA_DOOR_CFRAME = {
-        Ghoul   = CFrame.new(28674.244, 14890.676, 445.431),
-        Cyborg  = CFrame.new(28502.681, 14895.975, -423.727),
-        Fishman = CFrame.new(28231.175, 14890.975, -211.641),
-        Human   = CFrame.new(29221.822, 14890.975, -205.991),
-        Mink    = CFrame.new(29012.341, 14890.975, -380.149),
-        Skypiea = CFrame.new(28960.158, 14919.624, 235.039),
+        Ghoul   = CFrame.new(28673.1953, 14895.6953, 456.095001, -1, 0, 0, 0, 1, 0, 0, 0, -1),
+        Cyborg  = CFrame.new(28490.5781, 14900.9951, -422.574005, 0, 0, 1, 0, 1, -0, -1, 0, 0),
+        Fishman = CFrame.new(28222.3594, 14895.9961, -211.544006, 0, 0, 1, 0, 1, -0, -1, 0, 0),
+        Human   = CFrame.new(29238.8906, 14896.1953, -206.444, 0, 0, -1, 0, 1, 0, 1, 0, 0),
+        Mink    = CFrame.new(29022.4375, 14896.1953, -379.760986, 0, 0, -1, 0, 1, 0, 1, 0, 0),
+        Skypiea = CFrame.new(28970.0469, 14924.6377, 234.285995, 0, 0, -1, 0, 1, 0, 1, 0, 0),
     }
 
     -- khoảng cách tới cửa (ưu tiên part thật, fallback Banana) (File A 2480-2498)
@@ -3086,18 +3077,9 @@ do
                     attackTick(plr)
                     local hrp = plr:FindFirstChild("HumanoidRootPart")
                     local tooFar = hrp and getdis(hrp.CFrame) > 1500
-                    -- FIX (2026-07-03): MAIN CHẾT trong lúc kill → BREAK loop ngay,
-                    -- KHÔNG chase player tiếp, KHÔNG hop server. StateMachine sẽ tự
-                    -- nhận diện sau khi respawn và retry kill-phase cho trial tiếp theo.
-                    local mainDied = false
-                    pcall(function()
-                        local c = LocalPlayer.Character
-                        local hm = c and c:FindFirstChildOfClass("Humanoid")
-                        if not hm or hm.Health <= 0 then mainDied = true end
-                    end)
                 until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid")
                     or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0
-                    or templeState() ~= "ffup" or tooFar or mainDied
+                    or templeState() ~= "ffup" or tooFar
             end
         end
         _G.SHOULDSPAMSKILLS = false
@@ -3745,25 +3727,6 @@ do
                 status("[MAIN1] In FullMoon, chờ đủ ally (" .. tostring(haveAllies) .. "/" .. tostring(needAllies) .. ") mới ready → chừa slot cho ally")
                 return true
             end
-            -- LOCAL VERIFY (2026-07-03): server `fullmoon_ally_count` có thể stale trong ~50s
-            -- sau khi Ally2 đóng game/Tab (heartbeat cuối chưa hết PRUNE_TTL → vẫn trong scoutAllies).
-            -- Đếm ally THẬT trong server hiện tại (Players:GetPlayers()) để chắc chắn có đủ ally ngồi
-            -- trong server FM trước khi mở gate. Nếu local < cần → giữ "moon", KHÔNG ready.
-            local localAllyCount = 0
-            pcall(function()
-                for _, p in ipairs(Players:GetChildren()) do
-                    if p ~= LocalPlayer and State.isAlly and State.isAlly[p.Name] then
-                        localAllyCount = localAllyCount + 1
-                    end
-                end
-            end)
-            if localAllyCount < needAllies then
-                if myStatus ~= "moon" then State.setMyMainStatus("moon") end
-                status("[MAIN1] ⚠ server báo " .. tostring(haveAllies) .. "/" .. tostring(needAllies)
-                    .. " nhưng local chỉ thấy " .. tostring(localAllyCount) .. "/" .. tostring(needAllies)
-                    .. " ally thật trong server → giữ 'moon' (chờ ally hoặc TTL hết heartbeat cũ)")
-                return true
-            end
             -- Đủ ally → ready → THẢ xuống my-turn gốc (door/trial/kill)
             State.setMyMainStatus("ready")
             status("[MAIN1] In FullMoon với đủ " .. tostring(haveAllies) .. " ally → Ready for trialing")
@@ -4213,16 +4176,6 @@ do
         if isMain and myStatus == "done" then
             StateMachine.transition(S.DONE, "full gear")
             status("[MAIN " .. myStt .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
-            -- Ghi file flag Completed-v4 (tham khảo Melee7.txt dòng 886) — chỉ chạy 1 lần.
-            if not _G.completedV4Written then
-                _G.completedV4Written = true
-                task.spawn(function()
-                    pcall(function()
-                        writefile((State.myName or LocalPlayer.Name) .. ".txt", "Completed-v4")
-                    end)
-                    status("[MAIN " .. myStt .. "] 📝 Đã ghi " .. (State.myName or LocalPlayer.Name) .. ".txt → Completed-v4")
-                end)
-            end
             -- safety net: nếu nhánh AB=="done" chưa gọi (vd race detect chậm), vẫn ép đổi folder.
             -- _G.ChangeFolderAfterCompleted tự guard bằng _ChangeFolderLock + cooldown → không spam.
             if getgenv().change and not _G.changeFileWritten then
