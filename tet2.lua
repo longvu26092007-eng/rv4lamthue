@@ -1213,9 +1213,9 @@ do
         return "ffdown"
     end
 
-    -- goToMyDoor: xa temple >3000 → requestEntrance throttle 4s; gần → topos cửa; trả d<=150 (File A 880-901)
-    -- FIX (user 2026-07-04): ưu tiên WorldProbe.getTrialDoorCFrame() (toạ độ chuẩn do user cung cấp),
-    -- CHỈ fallback getDoorForRace() nếu không có manualCf. KHÔNG ưu tiên Door part thật nữa.
+    -- goToMyDoor: xa temple >3000 → requestEntrance throttle 4s; gần → topos cửa; trả d<=25 (File A 880-901)
+    -- FIX (user 2026-07-04): ưu tiên WorldProbe.getTrialDoorCFrame() (toạ độ chuẩn có hướng),
+    -- CHỈ fallback getDoorForRace() nếu không có manualCf. Snap sát cửa khi d<=35.
     function TempleManager.goToMyDoor()
         if Movement.getdis(CFrame.new(TEMPLE_ENTRY)) >= 3000 then
             if not _G.lastReqEntrance or (tick() - _G.lastReqEntrance) > 4 then
@@ -1240,8 +1240,19 @@ do
         if not (char and char:FindFirstChild("HumanoidRootPart")) then return false end
         pcall(function() topos(targetCf) end)
         local d = Movement.getdis(targetCf)
+        -- snap sát cửa khi d<=35: teleport HRP = targetCf để đứng đúng vị trí + đúng hướng
+        if d <= 35 then
+            pcall(function()
+                local hrp = char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    Movement.cancel()
+                    hrp.CFrame = targetCf
+                end
+            end)
+            d = Movement.getdis(targetCf)
+        end
         _G.lastDoorSrc, _G.lastDoorName, _G.lastDoorDist = src, doorName, d
-        return d <= 150
+        return d <= 25
     end
 end
 local function goToMyDoor() return TempleManager.goToMyDoor() end
@@ -2725,7 +2736,7 @@ local function doTrainGrind(tag, AB, fn) return Training.doTrainGrind(tag, AB, f
 local AbilitySync = {}
 do
     local ABILITY_FIRE_WINDOW = 6
-    local AT_DOOR_DIST        = 150
+    local AT_DOOR_DIST        = 25
     local START_LEAD          = 5
     local ABILITY_COOLDOWN    = 30
     local TZ_OFFSET           = 7 * 3600
@@ -2761,20 +2772,39 @@ do
 
     local function checkFileForLabel(label) return SYNC_DIR .. "/checkalready_" .. string.lower(label) end
 
-    -- FIX (user 2026-07-04) — đổi sang TRIAL_DOOR_CFRAME (chuẩn 3-số, user cung cấp).
-    -- User yêu cầu: ưu tiên toạ độ chuẩn, KHÔNG ưu tiên Door part thật trong map.
-    local TRIAL_DOOR_CFRAME = {
-        ["Skypiea"] = CFrame.new(28966.451172, 14919.623047, 235.318329),    -- Angel
-        ["Mink"]    = CFrame.new(29018.869141, 14890.974609, -377.965332),   -- Rabbit
-        ["Fishman"] = CFrame.new(28225.781250, 14890.974609, -215.560608),   -- Shark
-        ["Human"]   = CFrame.new(29235.443359, 14890.974609, -201.935638),
-        ["Ghoul"]   = CFrame.new(28668.685547, 14890.674805, 453.048553),
-        ["Cyborg"]  = CFrame.new(28493.671875, 14895.974609, -426.649689),
+    -- FIX (user 2026-07-04) — bảng mới: cả Position + LookVector → tạo CFrame.lookAt để giữ hướng nhân vật.
+    -- User yêu cầu: không dùng CFrame.new(x,y,z) 3-số nữa. LookVector ép Y=0 (CheckCoor báo 0.000/-0.000).
+    local TRIAL_DOOR_DATA = {
+        ["Mink"] = {
+            pos = Vector3.new(29020.736328, 14896.214844, -375.964600),
+            look = Vector3.new(0.927, 0, -0.374),
+        }, -- Rabbit
+        ["Human"] = {
+            pos = Vector3.new(29237.261719, 14896.117188, -202.743515),
+            look = Vector3.new(0.868, 0, -0.496),
+        },
+        ["Skypiea"] = {
+            pos = Vector3.new(28968.304688, 14924.379883, 237.973160),
+            look = Vector3.new(1.000, 0, 0.020),
+        }, -- Angel
+        ["Fishman"] = {
+            pos = Vector3.new(28224.082031, 14896.032227, -215.569672),
+            look = Vector3.new(-0.954, 0, -0.299),
+        }, -- Shark
+        ["Ghoul"] = {
+            pos = Vector3.new(28669.337891, 14895.611328, 454.683319),
+            look = Vector3.new(0.004, 0, 1.000),
+        },
+        ["Cyborg"] = {
+            pos = Vector3.new(28492.220703, 14900.972656, -426.378815),
+            look = Vector3.new(-0.985, 0, 0.170),
+        },
     }
-    WorldProbe.TRIAL_DOOR_CFRAME = TRIAL_DOOR_CFRAME
+    WorldProbe.TRIAL_DOOR_DATA = TRIAL_DOOR_DATA
 
     -- normalizeRace: ánh xạ alias → race chuẩn Blox Fruits.
-    -- Rabbit=Mink, Angel=Skypiea, Shark=Fishman, Fishman vẫn Fishman.
+    -- Rabbit=Mink, Mink=Mink, Angel=Skypiea, Skypiea=Skypiea,
+    -- Shark=Fishman, Fishman=Fishman, Human, Ghoul, Cyborg.
     function WorldProbe.normalizeRace(race)
         if not race then return nil end
         local r = tostring(race):lower()
@@ -2792,13 +2822,27 @@ do
         return map[r]
     end
 
-    -- getTrialDoorCFrame: lấy toạ độ cửa chuẩn theo race (đã normalize).
-    -- Đây là nguồn ưu tiên tuyệt đối, KHÔNG fallback sang part thật trong map.
+    -- getTrialDoorCFrame: ưu tiên tuyệt đối, tạo CFrame.lookAt(position, position+look) để đứng đúng hướng.
     function WorldProbe.getTrialDoorCFrame(race)
         race = race or WorldProbe.getRace()
         race = WorldProbe.normalizeRace(race)
         if not race then return nil end
-        return TRIAL_DOOR_CFRAME[race]
+
+        local data = TRIAL_DOOR_DATA[race]
+        if not data then return nil end
+
+        local pos = data.pos
+        local look = data.look
+        if typeof(pos) ~= "Vector3" or typeof(look) ~= "Vector3" then return nil end
+
+        -- ép Y=0 (CheckCoor báo 0.000 / -0.000, coi như 0, không cần nhìn lên/xuống)
+        look = Vector3.new(look.X, 0, look.Z)
+        if look.Magnitude <= 0 then
+            return CFrame.new(pos)
+        end
+
+        look = look.Unit
+        return CFrame.lookAt(pos, pos + look)
     end
 
     -- khoảng cách tới cửa — ƯU TIÊN WorldProbe.getTrialDoorCFrame() (toạ độ chuẩn do user cung cấp).
