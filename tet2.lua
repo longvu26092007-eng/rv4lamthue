@@ -1105,19 +1105,6 @@ do
     }
     WorldProbe.RACE_TRIAL_NAME = RACE_TRIAL_NAME
 
-    -- FIX (user 2026-07-04) — toạ độ door hard-code từ tet2.lua bản gốc.
-    -- Lấy y chang BANANA_DOOR_CFRAME trong tet2.lua (line 2756-2763) — gồm rotation 12 số để
-    -- nhân vật quay đúng hướng cửa. KHÔNG lấy RACE_DOOR_COORDS vì tet2 không có bảng đó.
-    local RACE_DOOR_COORDS = {
-        ["Ghoul"]   = CFrame.new(28673.1953, 14895.6953, 456.095001, -1, 0, 0, 0, 1, 0, 0, 0, -1),
-        ["Cyborg"]  = CFrame.new(28490.5781, 14900.9951, -422.574005, 0, 0, 1, 0, 1, 0, -1, 0, 0),
-        ["Fishman"] = CFrame.new(28222.3594, 14895.9961, -211.544006, 0, 0, 1, 0, 1, 0, -1, 0, 0),
-        ["Human"]   = CFrame.new(29238.8906, 14896.1953, -206.444, 0, 0, -1, 0, 1, 0, 1, 0, 0),
-        ["Mink"]    = CFrame.new(29022.4375, 14896.1953, -379.760986, 0, 0, -1, 0, 1, 0, 1, 0, 0),
-        ["Skypiea"] = CFrame.new(28970.0469, 14924.6377, 234.285995, 0, 0, -1, 0, 1, 0, 1, 0, 0),
-    }
-    WorldProbe.RACE_DOOR_COORDS = RACE_DOOR_COORDS
-
     function WorldProbe.getRace()
         local ok, race = pcall(function() return LocalPlayer.Data.Race.Value end)
         return ok and race or nil
@@ -1127,19 +1114,35 @@ do
         return map and map:FindFirstChild("Temple of Time")
     end
 
-    -- getdoor: CHỈ dùng toạ độ hard-code từ tet2.lua (user 2026-07-04 yêu cầu dùng 1 nguồn duy nhất).
-    -- Bỏ toàn bộ FindFirstChild trên cây workspace vì path có thể đổi theo version game.
+    -- getdoor: cache theo race + check Parent (File A 842-859)
+    -- Path chuẩn (toạ độ chuẩn) = Corridor.Door.Door; Skypiea = Corridor.Door (part luôn).
+    -- Ưu tiên .Door.Door → .Door (nếu tự nó là part, cho Skypiea) → .Entrance (fallback cũ).
     function WorldProbe.getDoorForRace(race)
         race = race or WorldProbe.getRace()
         if not race then return nil end
         local cached = doorCache[race]
-        if cached then return cached end
-        local cf = RACE_DOOR_COORDS[race]
-        if cf then
-            doorCache[race] = cf
-            return cf
+        if cached and cached.Parent then return cached end
+        local temple = WorldProbe.getTemple()
+        if not temple then return nil end
+        local corridor = temple:FindFirstChild(race .. "Corridor")
+        if not corridor then return nil end
+        local door = corridor:FindFirstChild("Door")
+        if not door then return nil end
+        -- 1) .Door.Door (part cửa thật, toạ độ chuẩn)
+        local innerDoor = door:FindFirstChild("Door")
+        if innerDoor and innerDoor:IsA("BasePart") then
+            doorCache[race] = innerDoor
+            return innerDoor
         end
-        return nil
+        -- 2) .Door tự nó là part (trường hợp Skypiea)
+        if door:IsA("BasePart") then
+            doorCache[race] = door
+            return door
+        end
+        -- 3) fallback .Entrance (bản cũ)
+        local entrance = door:FindFirstChild("Entrance")
+        if entrance then doorCache[race] = entrance end
+        return entrance
     end
 
     -- getRaceTrialPlace: cache theo race (File A 970-980)
@@ -1211,6 +1214,8 @@ do
     end
 
     -- goToMyDoor: xa temple >3000 → requestEntrance throttle 4s; gần → topos cửa; trả d<=150 (File A 880-901)
+    -- FIX (user 2026-07-04): ưu tiên WorldProbe.getTrialDoorCFrame() (toạ độ chuẩn do user cung cấp),
+    -- CHỈ fallback getDoorForRace() nếu không có manualCf. KHÔNG ưu tiên Door part thật nữa.
     function TempleManager.goToMyDoor()
         if Movement.getdis(CFrame.new(TEMPLE_ENTRY)) >= 3000 then
             if not _G.lastReqEntrance or (tick() - _G.lastReqEntrance) > 4 then
@@ -1222,18 +1227,20 @@ do
             _G.lastDoorSrc = "far"
             return false
         end
-        local door = WorldProbe.getDoorForRace()
-        if not door then _G.lastDoorSrc = "noload"; return false end
+        local manualCf = WorldProbe.getTrialDoorCFrame()
+        local targetCf, src, doorName
+        if manualCf then
+            targetCf, src, doorName = manualCf, "C", WorldProbe.normalizeRace(WorldProbe.getRace()) or "manual"
+        else
+            local door = WorldProbe.getDoorForRace()
+            if not door then _G.lastDoorSrc = "noload"; return false end
+            targetCf, src, doorName = door.CFrame, "R", door.Name
+        end
         local char = LocalPlayer.Character
         if not (char and char:FindFirstChild("HumanoidRootPart")) then return false end
-        -- FIX (user 2026-07-04) — teleport THẲNG tới door.CFrame (topos có tween → motion thật →
-        -- server fire Touched → vào trial). KHÔNG offset -5/-10: user yêu cầu đứng đúng coor đã gửi,
-        -- không xê dịch.
-        pcall(function()
-            topos(door.CFrame)
-        end)
-        local d = Movement.getdis(door.CFrame)
-        _G.lastDoorDist = d
+        pcall(function() topos(targetCf) end)
+        local d = Movement.getdis(targetCf)
+        _G.lastDoorSrc, _G.lastDoorName, _G.lastDoorDist = src, doorName, d
         return d <= 150
     end
 end
@@ -1610,15 +1617,7 @@ do
             pcall(function() Movement.haki() end)
         end
         local hrp = target and target:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            -- SAFETY (2026-07-02): bỏ tween khi target xa > 2500 studs để wrapper `topos` KHÔNG
-            -- ép main tự sát (điều kiện kill khi gần temple). Nếu xa quá, bỏ qua tick này —
-            -- vòng kill ở PostTrial sẽ check `tooFar > 1500` và thoát loop sau.
-            pcall(function()
-                if Movement.getdis(hrp.CFrame) > 2500 then return end
-                topos(hrp.CFrame * _atkOff)
-            end)
-        end
+        if hrp then pcall(function() topos(hrp.CFrame * _atkOff) end) end
     end
 
     -- weapon / spam-skills (File A 2039-2123)
@@ -2762,11 +2761,56 @@ do
 
     local function checkFileForLabel(label) return SYNC_DIR .. "/checkalready_" .. string.lower(label) end
 
-    -- FIX (user 2026-07-04) — BỎ BANANA_DOOR_CFRAME, chỉ dùng RACE_DOOR_COORDS (1 nguồn duy nhất).
-    -- Nếu getdoor() nil → trả X/none → caller tự xử lý, KHÔNG fallback vì user yêu cầu cứng 1 bảng.
+    -- FIX (user 2026-07-04) — đổi sang TRIAL_DOOR_CFRAME (chuẩn 3-số, user cung cấp).
+    -- User yêu cầu: ưu tiên toạ độ chuẩn, KHÔNG ưu tiên Door part thật trong map.
+    local TRIAL_DOOR_CFRAME = {
+        ["Skypiea"] = CFrame.new(28966.451172, 14919.623047, 235.318329),    -- Angel
+        ["Mink"]    = CFrame.new(29018.869141, 14890.974609, -377.965332),   -- Rabbit
+        ["Fishman"] = CFrame.new(28225.781250, 14890.974609, -215.560608),   -- Shark
+        ["Human"]   = CFrame.new(29235.443359, 14890.974609, -201.935638),
+        ["Ghoul"]   = CFrame.new(28668.685547, 14890.674805, 453.048553),
+        ["Cyborg"]  = CFrame.new(28493.671875, 14895.974609, -426.649689),
+    }
+    WorldProbe.TRIAL_DOOR_CFRAME = TRIAL_DOOR_CFRAME
 
-    -- khoảng cách tới cửa — CHỈ dùng RACE_DOOR_COORDS (user 2026-07-04 yêu cầu bỏ Banana, chỉ 1 nguồn).
+    -- normalizeRace: ánh xạ alias → race chuẩn Blox Fruits.
+    -- Rabbit=Mink, Angel=Skypiea, Shark=Fishman, Fishman vẫn Fishman.
+    function WorldProbe.normalizeRace(race)
+        if not race then return nil end
+        local r = tostring(race):lower()
+        local map = {
+            ["rabbit"]   = "Mink",
+            ["mink"]     = "Mink",
+            ["angel"]    = "Skypiea",
+            ["skypiea"]  = "Skypiea",
+            ["shark"]    = "Fishman",
+            ["fishman"]  = "Fishman",
+            ["human"]    = "Human",
+            ["ghoul"]    = "Ghoul",
+            ["cyborg"]   = "Cyborg",
+        }
+        return map[r]
+    end
+
+    -- getTrialDoorCFrame: lấy toạ độ cửa chuẩn theo race (đã normalize).
+    -- Đây là nguồn ưu tiên tuyệt đối, KHÔNG fallback sang part thật trong map.
+    function WorldProbe.getTrialDoorCFrame(race)
+        race = race or WorldProbe.getRace()
+        race = WorldProbe.normalizeRace(race)
+        if not race then return nil end
+        return TRIAL_DOOR_CFRAME[race]
+    end
+
+    -- khoảng cách tới cửa — ƯU TIÊN WorldProbe.getTrialDoorCFrame() (toạ độ chuẩn do user cung cấp).
+    -- Chỉ fallback getdoor() nếu không có manualCf. User 2026-07-04 yêu cầu: KHÔNG ưu tiên part thật trong map.
     function AbilitySync.distToMyDoor()
+        local manualCf = WorldProbe.getTrialDoorCFrame()
+        if manualCf then
+            local d = getdis(manualCf)
+            _G.lastDoorSrc, _G.lastDoorName, _G.lastDoorDist = "C",
+                WorldProbe.normalizeRace(WorldProbe.getRace()) or "manual", d
+            return d
+        end
         local door = getdoor()
         if door then
             local d = getdis(door.CFrame)
@@ -3074,18 +3118,9 @@ do
                     attackTick(plr)
                     local hrp = plr:FindFirstChild("HumanoidRootPart")
                     local tooFar = hrp and getdis(hrp.CFrame) > 1500
-                    -- FIX (2026-07-03): MAIN CHẾT trong lúc kill → BREAK loop ngay,
-                    -- KHÔNG chase player tiếp, KHÔNG hop server. StateMachine sẽ tự
-                    -- nhận diện sau khi respawn và retry kill-phase cho trial tiếp theo.
-                    local mainDied = false
-                    pcall(function()
-                        local c = LocalPlayer.Character
-                        local hm = c and c:FindFirstChildOfClass("Humanoid")
-                        if not hm or hm.Health <= 0 then mainDied = true end
-                    end)
                 until not plr or not plr.Parent or not plr:FindFirstChild("Humanoid")
                     or not plr:FindFirstChild("HumanoidRootPart") or plr.Humanoid.Health <= 0
-                    or templeState() ~= "ffup" or tooFar or mainDied
+                    or templeState() ~= "ffup" or tooFar
             end
         end
         _G.SHOULDSPAMSKILLS = false
@@ -3733,25 +3768,6 @@ do
                 status("[MAIN1] In FullMoon, chờ đủ ally (" .. tostring(haveAllies) .. "/" .. tostring(needAllies) .. ") mới ready → chừa slot cho ally")
                 return true
             end
-            -- LOCAL VERIFY (2026-07-03): server `fullmoon_ally_count` có thể stale trong ~50s
-            -- sau khi Ally2 đóng game/Tab (heartbeat cuối chưa hết PRUNE_TTL → vẫn trong scoutAllies).
-            -- Đếm ally THẬT trong server hiện tại (Players:GetPlayers()) để chắc chắn có đủ ally ngồi
-            -- trong server FM trước khi mở gate. Nếu local < cần → giữ "moon", KHÔNG ready.
-            local localAllyCount = 0
-            pcall(function()
-                for _, p in ipairs(Players:GetChildren()) do
-                    if p ~= LocalPlayer and State.isAlly and State.isAlly[p.Name] then
-                        localAllyCount = localAllyCount + 1
-                    end
-                end
-            end)
-            if localAllyCount < needAllies then
-                if myStatus ~= "moon" then State.setMyMainStatus("moon") end
-                status("[MAIN1] ⚠ server báo " .. tostring(haveAllies) .. "/" .. tostring(needAllies)
-                    .. " nhưng local chỉ thấy " .. tostring(localAllyCount) .. "/" .. tostring(needAllies)
-                    .. " ally thật trong server → giữ 'moon' (chờ ally hoặc TTL hết heartbeat cũ)")
-                return true
-            end
             -- Đủ ally → ready → THẢ xuống my-turn gốc (door/trial/kill)
             State.setMyMainStatus("ready")
             status("[MAIN1] In FullMoon với đủ " .. tostring(haveAllies) .. " ally → Ready for trialing")
@@ -4201,16 +4217,6 @@ do
         if isMain and myStatus == "done" then
             StateMachine.transition(S.DONE, "full gear")
             status("[MAIN " .. myStt .. "] ✅ DONE YOUR RACE - FULL GEAR (Gear2/3/4)!")
-            -- Ghi file flag Completed-v4 (tham khảo Melee7.txt dòng 886) — chỉ chạy 1 lần.
-            if not _G.completedV4Written then
-                _G.completedV4Written = true
-                task.spawn(function()
-                    pcall(function()
-                        writefile((State.myName or LocalPlayer.Name) .. ".txt", "Completed-v4")
-                    end)
-                    status("[MAIN " .. myStt .. "] 📝 Đã ghi " .. (State.myName or LocalPlayer.Name) .. ".txt → Completed-v4")
-                end)
-            end
             -- safety net: nếu nhánh AB=="done" chưa gọi (vd race detect chậm), vẫn ép đổi folder.
             -- _G.ChangeFolderAfterCompleted tự guard bằng _ChangeFolderLock + cooldown → không spam.
             if getgenv().change and not _G.changeFileWritten then
