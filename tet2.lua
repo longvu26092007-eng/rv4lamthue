@@ -2738,16 +2738,20 @@ do
                         task.wait(0.5)
                     else
                         Movement.equip(); Movement.haki()
+                        -- TRAINING: KHÔNG spam chiêu. Tắt cờ để background loop (Z/X/C/V/F) im lặng.
+                        _G.SHOULDSPAMSKILLS = false
                         local hrp = v:FindFirstChild("HumanoidRootPart")
-                        -- V3: gom quái quanh con này + đánh trực tiếp (ăn chắc). Đứng NGANG tầm (offset 20) để trong 65 studs.
+                        -- V3: gom quái quanh con này rồi đánh trực tiếp. Đứng CẠNH mob (offset ngang 20,
+                        -- Y ±20 tùy độ cao) và QUAY MẶT vào mob — KHÔNG lơ lửng thẳng trên đầu — để M1 +
+                        -- RegisterHit ăn chắc, giữ trong 65 studs, giảm ghost do lệch vị trí / mất tầm.
                         if hrp then
                             v3BringMob(nil, 3, hrp.CFrame)
-                            pcall(function() topos(hrp.CFrame * CFrame.new(0, 20, 0)) end)
+                            pcall(function()
+                                local yoff = (hrp.Position.Y > 60) and -20 or 20
+                                topos(CFrame.new(hrp.Position + Vector3.new(0, yoff, -20), hrp.Position))
+                            end)
                         end
-                        -- FALLBACK tường minh: nếu V3 chưa tìm được remote (initV3Combat còn false) thì bật
-                        -- background FastAttack + spam skill để VẪN gây damage, tránh đứng im nếu v3 chết.
-                        -- V3 ready hay không đều spam skill (Z/X/C/V/F) — trước đây loop mới không bật cờ này.
-                        _G.SHOULDSPAMSKILLS = true
+                        -- Chỉ dùng V3 attack (RegisterAttack + RegisterHit + encoded remote), không keypress chiêu.
                         if CombatActions.initV3Combat() then
                             v3FastAttack()
                         end
