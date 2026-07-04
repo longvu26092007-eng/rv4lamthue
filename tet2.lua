@@ -1213,7 +1213,32 @@ do
         return "ffdown"
     end
 
-    -- goToMyDoor: xa temple >3000 → requestEntrance throttle 4s; gần → topos cửa; trả d<=25 (File A 880-901)
+    -- FIX (user 2026-07-04) — toposSlow: tween Linear với tốc độ chỉ định (studs/s). Mặc định 150.
+    -- Lý do tồn tại: Movement.topos dùng chung 200 studs/s cho mọi chỗ (fly tile, gate, ...).
+    -- Riêng trial door, tween quá nhanh (200 studs/s + Linear.Out decelerate) khiến HRP đến
+    -- vị trí cửa với vận tốc ~0 trong 1 frame → trigger có thể không tính là "touched" → ghost.
+    -- 150 studs/s cho vận tốc cuối vẫn dương (chậm vừa), trigger overlap lâu hơn → door nhận.
+    local function toposSlow(v, speed)
+        speed = speed or 150
+        pcall(function()
+            if getdis(v) > 2500 and getdis(TEMPLE_ENTRY_FAR_CF) < 1500 then
+                LocalPlayer.Character.Humanoid.Health = 0
+            end
+        end)
+        if Movement.cancel then Movement.cancel() end
+        local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        local dist = (hrp.Position - (typeof(v) == "CFrame" and v.Position or v)).Magnitude
+        local dur = math.clamp(dist / speed, 0.05, 600)
+        local tw = TweenService:Create(hrp,
+            TweenInfo.new(dur, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+            { CFrame = typeof(v) == "CFrame" and v or CFrame.new(v) })
+        tw:Play()
+        return tw
+    end
+
+    -- goToMyDoor: xa temple >3000 → requestEntrance throttle 4s; gần → toposSlow cửa (150 studs/s);
+    -- snap sát cửa khi d<=35. Trả d<=25 (File A 880-901 + FIX 2026-07-04 tốc độ trial riêng).
     -- FIX (user 2026-07-04): ưu tiên WorldProbe.getTrialDoorCFrame() (toạ độ chuẩn có hướng),
     -- CHỈ fallback getDoorForRace() nếu không có manualCf. Snap sát cửa khi d<=35.
     function TempleManager.goToMyDoor()
@@ -1238,7 +1263,7 @@ do
         end
         local char = LocalPlayer.Character
         if not (char and char:FindFirstChild("HumanoidRootPart")) then return false end
-        pcall(function() topos(targetCf) end)
+        pcall(function() toposSlow(targetCf, 150) end)
         local d = Movement.getdis(targetCf)
         -- snap sát cửa khi d<=35: teleport HRP = targetCf để đứng đúng vị trí + đúng hướng
         if d <= 35 then
