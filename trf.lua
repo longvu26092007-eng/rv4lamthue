@@ -672,6 +672,13 @@ local function TryChangeFolder()
         tostring(target)
     ))
 
+    -- Ghi file <PlayerName>.txt de danh dau da doi folder thanh cong.
+    pcall(function()
+        local name = tostring(LocalPlayer.Name)
+        writefile(name .. ".txt", "Completed-fchange")
+        warn("[Fragment] Da ghi " .. name .. ".txt -> Completed-fchange")
+    end)
+
     -- Log args truoc khi goi ChangeToFolder (chi de xem, khong bien nil thanh string).
     warn(("[Fragment] ChangeToFolder args: id1=%s id2=%s id3=%s"):format(
         tostring(id1),
