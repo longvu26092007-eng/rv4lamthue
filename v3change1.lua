@@ -11,7 +11,7 @@
 ]]
 
 --==================  SERVICES  ==================--
-local Players           = game:GetService("Players")
+local Players         = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer       = Players.LocalPlayer
 
@@ -140,13 +140,17 @@ local _savedV3 = false
 local function saveV3File()
     if _savedV3 then return end
     if type(writefile) ~= "function" then return end   -- executor khong ho tro writefile
+    
     local fileName = tostring(LocalPlayer.Name) .. ".txt"
-    local ok = pcall(function() writefile(fileName, "Completed-v4") end)
+    -- Ghi "Completed-v3" theo yêu cầu
+    local ok = pcall(function() writefile(fileName, "Completed-v3") end)
+    
     if ok then
         _savedV3 = true
         _G.RaceV3FileSaved = fileName
-        print("[RaceV3Change] Da ghi file: " .. fileName .. " (Completed-v4)")
+        print("[RaceV3Change] Da ghi file: " .. fileName .. " (Completed-v3)")
 
+        -- Sau khi tạo file xong thì mới gọi ChangeFolder
         ChangeFolderAfterCompleted("Completed-v3")
     end
 end
