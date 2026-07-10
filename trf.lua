@@ -38,13 +38,11 @@ ENV.TyrantConfig = ENV.TyrantConfig or {
     MaxVaseTargets = 30
 }
 
--- Cấu hình đổi folder khi đủ Fragment.
+-- Cấu hình ghi file khi đủ Race + Fragment.
+-- Khi đủ điều kiện, script chỉ tạo file <PlayerName>.txt với nội dung "Completed-fragment".
+-- Chỉ ghi file hoàn thành, không tự đổi folder/rejoin.
 -- Để trống hoặc đặt về "" / "........." nếu chưa muốn dùng tính năng này.
 ENV.fragmenttarget = ENV.fragmenttarget or "........."
-ENV.id1 = ENV.id1 or "........."
-ENV.id2 = ENV.id2 or "........."
--- id3 KHONG bat buoc: KHONG set default "........." de truyen nil that vao ChangeToFolder.
--- NormalizeFolderId se chuyen "........." / "nil" / rong -> nil that tai TryChangeFolder.
 
 local Config = ENV.TyrantConfig
 
@@ -114,8 +112,12 @@ local VaseModeStartedAt = 0
 local LastOriginScan = 0
 local InternalSkillReadyAt = {}
 
--- Cờ chỉ chạy đổi folder đúng 1 lần, tránh gọi liên tục gây spam/disconnect loop.
+-- Cờ chỉ chạy ghi file hoàn thành đúng 1 lần, tránh spam file/log.
 local FragmentFolderLock = false
+-- Cờ báo đã đạt đủ cả target race + target fragment. Dùng để UI/status hiện Completed-fragment.
+local FragmentCompletedStatus = false
+-- Cờ ghi file hoàn thành 1 lần duy nhất khi đủ Race + Fragment.
+local CompletedFragmentFileWritten = false
 local LastFragmentLogAt = 0
 local CURRENT_FRAGMENT_LOG_INTERVAL = 30
 
@@ -279,6 +281,63 @@ local function SetStatus(text)
         SetStatusLast = text
         warn("[Auto Tyrant] " .. text)
     end
+end
+
+local function MarkCompletedFragmentStatus(current, target)
+    if FragmentCompletedStatus then
+        return
+    end
+
+    FragmentCompletedStatus = true
+    CurrentMode = "Completed-fragment"
+    CurrentTarget = nil
+
+    ENV.CompletedFragment = true
+    ENV.CompletedFragmentAt = tick()
+    ENV.CompletedFragmentRace = raceOf()
+    ENV.CompletedFragmentValue = current
+    ENV.CompletedFragmentTarget = target
+
+    SetStatus(string.format(
+        "Completed-fragment | Race=%s | Fragment=%s/%s",
+        tostring(ENV.CompletedFragmentRace or "?"),
+        tostring(current),
+        tostring(target)
+    ))
+end
+
+-- Ghi file báo hoàn thành cho tool ngoài đọc: <PlayerName>.txt = Completed-fragment
+-- Chỉ gọi khi đã đủ Race target + Fragment target.
+local function WriteCompletedFragmentFile(current, target)
+    if CompletedFragmentFileWritten then
+        return true
+    end
+
+    if type(writefile) ~= "function" then
+        warn("[Fragment] Executor không hỗ trợ writefile - không thể tạo file Completed-fragment")
+        return false
+    end
+
+    local fileName = tostring((LocalPlayer and LocalPlayer.Name) or "UnknownPlayer") .. ".txt"
+    local ok, err = pcall(function()
+        writefile(fileName, "Completed-fragment")
+    end)
+
+    if ok then
+        CompletedFragmentFileWritten = true
+        ENV.CompletedFragmentFile = fileName
+        warn(string.format(
+            "[Fragment] Đã ghi file %s = Completed-fragment | Race=%s | Fragment=%s/%s",
+            fileName,
+            tostring(raceOf() or "?"),
+            tostring(current),
+            tostring(target)
+        ))
+        return true
+    end
+
+    warn("[Fragment] Lỗi khi ghi file Completed-fragment: " .. tostring(err))
+    return false
 end
 
 local function Character()
@@ -590,63 +649,40 @@ GetCurrentFragments = function()
     return tonumber(value)
 end
 
--- Chuan hoa gia tri id1/id2/id3 truoc khi truyen vao ChangeToFolder.
--- Voi id1/id2 (allowNil=false): rong / placeholder / chuoi "nil" -> (nil, false),
--- caller bat buoc phai warn va khong goi ChangeToFolder.
--- Voi id3 (allowNil=true): rong / placeholder / chuoi "nil" -> (nil, false) nhung
--- caller khong check ok3, nen van goi ChangeToFolder(..., nil) - truyen nil that.
-local function NormalizeFolderId(value, allowNil)
-    if value == nil then
-        return allowNil and nil or nil, false
-    end
-
-    local s = tostring(value)
-    s = s:gsub("^%s+", ""):gsub("%s+$", "")
-
-    if s == "" or s == "........." or s:match("^%.+$") then
-        return allowNil and nil or nil, false
-    end
-
-    if s:lower() == "nil" then
-        return allowNil and nil or nil, false
-    end
-
-    return s, true
-end
-
--- Kiem tra du dieu kien chua, neu du thi goi ENV.client:ChangeToFolder(...)
--- theo dung mau ma loader goc dat san. Moi phien chi chay dung 1 lan.
-local function TryChangeFolder()
+-- Kiem tra du dieu kien chua, neu du thi CHI ghi file:
+--   <PlayerName>.txt = Completed-fragment
+-- Chi ghi file hoan thanh, khong tu doi folder/rejoin.
+local function TryWriteCompletedFragmentFile()
     if FragmentFolderLock then
-        return false
-    end
-    if not ENV.client then
-        warn("[Fragment] ENV.client chưa được set - bỏ qua đổi folder")
-        return false
-    end
-    if typeof(ENV.client.ChangeToFolder) ~= "function" then
-        warn("[Fragment] ENV.client.ChangeToFolder không tồn tại - bỏ qua đổi folder")
         return false
     end
 
     local rawTarget = ENV.fragmenttarget
     if rawTarget == nil then
-        warn("[Fragment] ENV.fragmenttarget nil - bỏ qua đổi folder")
+        warn("[Fragment] ENV.fragmenttarget nil - bỏ qua ghi file")
         return false
     end
 
     local target = tonumber(rawTarget)
     if not target or target <= 0 then
         warn(string.format(
-            "[Fragment] ENV.fragmenttarget không hợp lệ (%s) - bỏ qua đổi folder",
+            "[Fragment] ENV.fragmenttarget không hợp lệ (%s) - bỏ qua ghi file",
             tostring(rawTarget)
+        ))
+        return false
+    end
+
+    if not RaceReady then
+        warn(string.format(
+            "[Fragment] Race chưa đạt target (race hiện tại = %s) - chưa ghi file",
+            tostring(raceOf() or "?")
         ))
         return false
     end
 
     local current = GetCurrentFragments()
     if current == nil then
-        warn("[Fragment] Không đọc được số Fragment hiện tại - bỏ qua đổi folder")
+        warn("[Fragment] Không đọc được số Fragment hiện tại - bỏ qua ghi file")
         return false
     end
 
@@ -654,84 +690,43 @@ local function TryChangeFolder()
         return false
     end
 
-    -- id1/id2 bat buoc, id3 optional (co the nil that).
-    -- NormalizeFolderId tra ve (value, ok). neu ok=false thi value khong dung duoc.
-    local id1, ok1 = NormalizeFolderId(ENV.id1, false)
-    local id2, ok2 = NormalizeFolderId(ENV.id2, false)
-    local id3, ok3 = NormalizeFolderId(ENV.id3, true)
-
-    if not ok1 or not ok2 then
-        warn("[Fragment] id1/id2 bat buoc nhung dang rong - bo qua doi folder")
-        return false
-    end
-
     FragmentFolderLock = true
     warn(string.format(
-        "[Fragment] Đủ điều kiện: hiện tại = %s, target = %s - tiến hành đổi folder",
+        "[Fragment] Đủ điều kiện: Race=%s | Fragment=%s/%s - ghi PlayerName.txt",
+        tostring(raceOf() or "?"),
         tostring(current),
         tostring(target)
     ))
 
-    -- Ghi file <PlayerName>.txt de danh dau da doi folder thanh cong.
-    pcall(function()
-        local name = tostring(LocalPlayer.Name)
-        writefile(name .. ".txt", "Completed-fchange")
-        warn("[Fragment] Da ghi " .. name .. ".txt -> Completed-fchange")
-    end)
+    MarkCompletedFragmentStatus(current, target)
 
-    -- Log args truoc khi goi ChangeToFolder (chi de xem, khong bien nil thanh string).
-    warn(("[Fragment] ChangeToFolder args: id1=%s id2=%s id3=%s"):format(
-        tostring(id1),
-        tostring(id2),
-        id3 == nil and "nil" or tostring(id3)
-    ))
-
-    local changed = false
-    local ok, ret = pcall(function()
-        return ENV.client:ChangeToFolder(id1, id2, true, id3)
-    end)
-
-    if not ok then
-        warn("[Fragment] Lỗi khi gọi ChangeToFolder: " .. tostring(ret))
-        FragmentFolderLock = false
-        return false
+    local wrote = WriteCompletedFragmentFile(current, target)
+    if wrote then
+        warn("[Fragment] Completed-fragment đã ghi xong. Không đổi folder/disconnect/shutdown.")
+        return true
     end
 
-    changed = ret and true or false
-
-    if changed then
-        warn("[Client] Successfully changed folder, disconnecting to apply changes...")
-        pcall(function()
-            ENV.client:Disconnect()
-        end)
-        task.wait(5)
-        pcall(function()
-            game:Shutdown()
-        end)
-    else
-        warn("[Client] Failed to change folder")
-        task.wait(10)
-        FragmentFolderLock = false
-    end
-
-    return changed
+    -- Nếu executor lỗi writefile, mở khóa để thử lại ở vòng sau.
+    task.wait(10)
+    FragmentFolderLock = false
+    return false
 end
 
 -- Gọi nhẹ mỗi vòng lặp: nếu chưa đủ Fragment thì chỉ log số hiện tại + target
--- theo interval (mặc định 30s) để tránh spam warn. Khi đủ thì gọi TryChangeFolder.
+-- theo interval (mặc định 30s) để tránh spam warn. Khi đủ thì gọi TryWriteCompletedFragmentFile().
 local function MaybeCheckFragment()
     if FragmentFolderLock then
         return
     end
 
-    -- Gate race: nếu ENV.race được set mà chưa đạt -> KHÔNG đổi folder,
+    -- Gate race: nếu ENV.race được set mà chưa đạt -> KHÔNG ghi file,
     -- chỉ log định kỳ để biết script đang chờ race.
     if not RaceReady then
         local now = tick()
         if now - LastFragmentLogAt >= CURRENT_FRAGMENT_LOG_INTERVAL then
             LastFragmentLogAt = now
             warn(string.format(
-                "[Fragment] Đang chờ Race đạt target (race hiện tại = %s) - chưa đổi folder",
+                "[Fragment] Đang chờ Race đạt target (race hiện tại = %s) - chưa ghi file",
                 tostring(raceOf() or "?")
             ))
         end
@@ -750,7 +745,7 @@ local function MaybeCheckFragment()
     end
 
     if current >= target then
-        TryChangeFolder()
+        TryWriteCompletedFragmentFile()
         return
     end
 
@@ -2796,7 +2791,9 @@ do
                     end
                     local rname = ENV.RaceTarget
                     raceReady = tostring(RaceReady)
-                    if rname and rname ~= false and race ~= "?" then
+                    if FragmentCompletedStatus then
+                        raceReady = "Completed-fragment"
+                    elseif rname and rname ~= false and race ~= "?" then
                         if race == rname then raceReady = "READY" end
                     elseif rname == false then
                         raceReady = "off"
