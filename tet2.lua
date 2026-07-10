@@ -2421,18 +2421,29 @@ do
             pcall(function() tp(workspace.Map.CyborgTrial.Floor.CFrame * CFrame.new(0, 500, 0)) end)
 
         elseif myrace == "Human" or myrace == "Ghoul" then
+            -- FIX (user 2026-07-10) — trial Human/Ghoul "lâu lâu không chết boss":
+            -- Trước đây CHỈ set client-side hum.Health=0. Boss trial thường do SERVER giữ network
+            -- ownership → server replicate lại HP → Health=0 bị revert → boss sống dai (đám lính nhỏ
+            -- client-owned thì vẫn chết). Sửa: BỒI damage THẬT bằng bộ remote V3 (RE/RegisterHit mã hoá)
+            -- y như loop raiding boss (dòng ~2680) — vừa chắc chắn hạ boss, vừa để acc phụ cũng đánh boss.
+            pcall(function() CombatActions.initV3Combat() end)  -- bật remote đánh thật 1 lần trước loop
+            pcall(function() setscriptable(LP, "SimulationRadius", true) end)
             for _, v in pairs(workspace.Enemies:GetChildren()) do
                 local hum = v:FindFirstChild("Humanoid")
                 local hrp = v:FindFirstChild("HumanoidRootPart")
                 if hum and hrp and hum.Health > 0
                     and (not race_trial_place or getdis(hrp.CFrame, race_trial_place.CFrame) < 1500) then
+                    local mobName = v.Name
                     local t0 = tick()
                     repeat task.wait()
                         equipMelee()
                         Movement.equip(); Movement.haki()
                         tp(hrp.CFrame * CFrame.new(0, 30, 0))
                         pcall(function() sethiddenproperty(LP, "SimulationRadius", math.huge) end)
+                        -- set HP (dính với quái client-owned) + damage thật (dính với boss server-owned)
                         pcall(function() hrp.CanCollide = false; hum.Health = 0 end)
+                        v3BringMob(mobName, 3)
+                        v3FastAttack(mobName)
                     until (not v.Parent) or (not v:FindFirstChild("Humanoid")) or v.Humanoid.Health <= 0 or (tick() - t0) > 20
                 end
             end
