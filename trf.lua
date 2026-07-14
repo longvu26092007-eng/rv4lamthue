@@ -30,8 +30,8 @@ ENV.TyrantConfig = ENV.TyrantConfig or {
     -- Giảm tải CPU / FPS drop.
     FastAttackInterval = 0.12,
     BreakableFullScanInterval = 1.75,
-    BringMobInterval = 0.35,
-    BringDistance = 700,
+    BringMobInterval = 0.18,
+    BringDistance = 420,
     BringTweenSpeed = 300,
     NoclipInterval = 0.50,
     TyrantScanInterval = 0.25,
@@ -40,7 +40,13 @@ ENV.TyrantConfig = ENV.TyrantConfig or {
     -- Safe runtime: giảm remote spam và các thao tác dễ bị server đánh dấu.
     SafeMode = true,
     MaxFastAttackTargets = 6,
-    MaxBringMobsPerTick = 10,
+    MaxBringMobsPerTick = 8,
+    BringActivationDistance = 190,
+    BringFallbackOwnershipDistance = 120,
+    BringMaxVerticalDelta = 90,
+    BringSpacing = 2.25,
+    BringMaxRadius = 5.5,
+    BringSnapTolerance = 1.35,
     TeamRetryInterval = 1.25,
     TeamMaxWait = 30,
     TeamBackgroundRetry = 5,
@@ -78,14 +84,20 @@ Config.OriginScanInterval = tonumber(Config.OriginScanInterval) or 1.25
 Config.AttackDelay = math.max(0.10, tonumber(Config.AttackDelay) or 0.12)
 Config.FastAttackInterval = math.max(0.10, tonumber(Config.FastAttackInterval) or 0.12)
 Config.BreakableFullScanInterval = math.max(1.25, tonumber(Config.BreakableFullScanInterval) or 1.75)
-Config.BringMobInterval = math.max(0.30, tonumber(Config.BringMobInterval) or 0.35)
-Config.BringDistance = math.min(800, math.max(200, tonumber(Config.BringDistance) or 700))
+Config.BringMobInterval = math.min(0.35, math.max(0.15, tonumber(Config.BringMobInterval) or 0.18))
+Config.BringDistance = math.min(500, math.max(180, tonumber(Config.BringDistance) or 420))
 Config.BringTweenSpeed = math.min(350, math.max(150, tonumber(Config.BringTweenSpeed) or 280))
 Config.NoclipInterval = math.max(0.40, tonumber(Config.NoclipInterval) or 0.50)
 Config.TyrantScanInterval = math.max(0.20, tonumber(Config.TyrantScanInterval) or 0.25)
 Config.MaxVaseTargets = math.max(12, tonumber(Config.MaxVaseTargets) or 30)
 Config.MaxFastAttackTargets = math.min(8, math.max(1, tonumber(Config.MaxFastAttackTargets) or 6))
-Config.MaxBringMobsPerTick = math.min(15, math.max(1, tonumber(Config.MaxBringMobsPerTick) or 10))
+Config.MaxBringMobsPerTick = math.min(10, math.max(2, tonumber(Config.MaxBringMobsPerTick) or 8))
+Config.BringActivationDistance = math.min(260, math.max(80, tonumber(Config.BringActivationDistance) or 190))
+Config.BringFallbackOwnershipDistance = math.min(180, math.max(50, tonumber(Config.BringFallbackOwnershipDistance) or 120))
+Config.BringMaxVerticalDelta = math.min(160, math.max(35, tonumber(Config.BringMaxVerticalDelta) or 90))
+Config.BringSpacing = math.min(4, math.max(1.25, tonumber(Config.BringSpacing) or 2.25))
+Config.BringMaxRadius = math.min(8, math.max(3, tonumber(Config.BringMaxRadius) or 5.5))
+Config.BringSnapTolerance = math.min(2.5, math.max(0.75, tonumber(Config.BringSnapTolerance) or 1.35))
 Config.TeamRetryInterval = math.max(1, tonumber(Config.TeamRetryInterval) or 1.25)
 Config.TeamMaxWait = math.max(10, tonumber(Config.TeamMaxWait) or 30)
 Config.TeamBackgroundRetry = math.max(3, tonumber(Config.TeamBackgroundRetry) or 5)
@@ -2478,55 +2490,118 @@ local function SetupCharacterSupport()
     end)
 end
 
-local ActiveMobTweens = setmetatable({}, {__mode = "k"})
+-- Stable bring controller.
+-- Chỉ gom quái cùng loại với CurrentTarget, lấy CurrentTarget làm anchor cố định.
+-- Không tính average động, không tween mob chồng, không dùng các thủ thuật ownership/animation cũ.
+local BringState = {
+    Anchor = nil,
+    AnchorPosition = nil,
+    NextSlot = 1,
+    SlotOf = setmetatable({}, {__mode = "k"}),
+    Tracked = setmetatable({}, {__mode = "k"}),
+}
 
-local function TweenObject(object, targetCF, speed)
-    speed = speed or Config.BringTweenSpeed or 300
+local function RestoreBroughtMob(root, state)
+    if not state then return end
+    local hum = state.Humanoid
 
-    if not object or not object.Parent or not targetCF then
-        return
-    end
-
-    local distance = (targetCF.Position - object.Position).Magnitude
-    if distance <= 3 then
-        local oldTween = ActiveMobTweens[object]
-        if oldTween then
-            pcall(function()
-                oldTween:Cancel()
-            end)
-            ActiveMobTweens[object] = nil
-        end
-        object.CFrame = targetCF
-        return
-    end
-
-    -- Hủy tween cũ trước khi tạo tween mới để không chồng hàng chục tween trên cùng một mob.
-    local oldTween = ActiveMobTweens[object]
-    if oldTween then
-        pcall(function()
-            oldTween:Cancel()
-        end)
-    end
-
-    local duration = distance / math.max(speed, 1)
-    local tween = TweenService:Create(
-        object,
-        TweenInfo.new(duration, Enum.EasingStyle.Linear),
-        {CFrame = targetCF}
-    )
-    ActiveMobTweens[object] = tween
-
-    tween.Completed:Connect(function()
-        if ActiveMobTweens[object] == tween then
-            ActiveMobTweens[object] = nil
+    pcall(function()
+        if root and root.Parent and state.CanCollide ~= nil then
+            root.CanCollide = state.CanCollide
         end
     end)
-
-    tween:Play()
+    pcall(function()
+        if hum and hum.Parent and hum.Health > 0 then
+            if state.WalkSpeed ~= nil then hum.WalkSpeed = state.WalkSpeed end
+            if state.JumpPower ~= nil then hum.JumpPower = state.JumpPower end
+            if state.AutoRotate ~= nil then hum.AutoRotate = state.AutoRotate end
+        end
+    end)
 end
 
--- Gom theo cơ chế của buy+farmtalon:
--- tính vị trí trung bình theo tên quái rồi tween các quái cùng loại về một cụm.
+local function ResetBringState()
+    for root, state in pairs(BringState.Tracked) do
+        RestoreBroughtMob(root, state)
+    end
+
+    BringState.Anchor = nil
+    BringState.AnchorPosition = nil
+    BringState.NextSlot = 1
+    BringState.SlotOf = setmetatable({}, {__mode = "k"})
+    BringState.Tracked = setmetatable({}, {__mode = "k"})
+end
+
+local function TrackBroughtMob(root, hum)
+    local state = BringState.Tracked[root]
+    if state then return state end
+
+    state = {Humanoid = hum}
+    pcall(function() state.CanCollide = root.CanCollide end)
+    pcall(function() state.WalkSpeed = hum.WalkSpeed end)
+    pcall(function() state.JumpPower = hum.JumpPower end)
+    pcall(function() state.AutoRotate = hum.AutoRotate end)
+    BringState.Tracked[root] = state
+    return state
+end
+
+local function CanControlMob(root, distanceFromPlayer)
+    if type(isnetworkowner) == "function" then
+        local ok, owned = pcall(isnetworkowner, root)
+        return ok and owned == true
+    end
+
+    -- Executor không có isnetworkowner: chỉ fallback với quái rất gần để giảm desync/security risk.
+    return distanceFromPlayer <= Config.BringFallbackOwnershipDistance
+end
+
+local function GetBringSlot(enemy)
+    local slot = BringState.SlotOf[enemy]
+    if slot then return slot end
+
+    slot = BringState.NextSlot
+    BringState.NextSlot = BringState.NextSlot + 1
+    BringState.SlotOf[enemy] = slot
+    return slot
+end
+
+local function GetBringOffset(slot)
+    local perRing = 6
+    local ring = math.floor((slot - 1) / perRing) + 1
+    local index = (slot - 1) % perRing
+    local radius = math.min(Config.BringMaxRadius, ring * Config.BringSpacing)
+    local angle = (math.pi * 2 / perRing) * index
+
+    return Vector3.new(
+        math.cos(angle) * radius,
+        0,
+        math.sin(angle) * radius
+    )
+end
+
+local function FreezeBroughtMob(root, hum)
+    TrackBroughtMob(root, hum)
+
+    pcall(function()
+        root.CanCollide = false
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+    pcall(function()
+        hum.WalkSpeed = 0
+        hum.JumpPower = 0
+        hum.AutoRotate = false
+    end)
+end
+
+local function RestoreInactiveBroughtMobs(activeRoots)
+    for root, state in pairs(BringState.Tracked) do
+        if not activeRoots[root] then
+            RestoreBroughtMob(root, state)
+            BringState.Tracked[root] = nil
+        end
+    end
+end
+
 local function SetupBringMobs()
     if not Config.BringMobs then
         return
@@ -2536,71 +2611,116 @@ local function SetupBringMobs()
         while RuntimeAlive do
             task.wait(Config.BringMobInterval)
 
-            if CurrentMode == "MOBS" and not SkillCasting and TeamReady then
-                local root = HumanoidRootPart()
-                local enemiesFolder = Workspace:FindFirstChild("Enemies")
+            local target = CurrentTarget
+            local targetHum = target and target:FindFirstChildOfClass("Humanoid")
+            local targetRoot = target and target:FindFirstChild("HumanoidRootPart")
+            local playerRoot = HumanoidRootPart()
+            local enemiesFolder = Workspace:FindFirstChild("Enemies")
 
-                if root and enemiesFolder then
-                    local groups = {}
+            local canBring = CurrentMode == "MOBS"
+                and not SkillCasting
+                and TeamReady
+                and playerRoot
+                and enemiesFolder
+                and target
+                and target.Parent
+                and IsTikiMob(target)
+                and targetHum
+                and targetRoot
+                and targetHum.Health > 0
+
+            if not canBring then
+                if BringState.Anchor or next(BringState.Tracked) then
+                    ResetBringState()
+                end
+            else
+                local playerToAnchor = (playerRoot.Position - targetRoot.Position).Magnitude
+                if playerToAnchor > Config.BringActivationDistance then
+                    if BringState.Anchor or next(BringState.Tracked) then
+                        ResetBringState()
+                    end
+                else
+                    if BringState.Anchor ~= target then
+                        ResetBringState()
+                        BringState.Anchor = target
+                        BringState.AnchorPosition = targetRoot.Position
+                    elseif not BringState.AnchorPosition
+                        or (targetRoot.Position - BringState.AnchorPosition).Magnitude >= 2.5
+                    then
+                        BringState.AnchorPosition = targetRoot.Position
+                    end
+
+                    local anchorPosition = BringState.AnchorPosition or targetRoot.Position
+                    local wantedName = BaseEnemyName(target.Name)
+                    local candidates = {}
 
                     for _, enemy in ipairs(enemiesFolder:GetChildren()) do
-                        if IsTikiMob(enemy) then
+                        if IsTikiMob(enemy) and BaseEnemyName(enemy.Name) == wantedName then
                             local hum = enemy:FindFirstChildOfClass("Humanoid")
                             local enemyRoot = enemy:FindFirstChild("HumanoidRootPart")
 
-                            if hum and enemyRoot and hum.Health > 0
-                                and (enemyRoot.Position - root.Position).Magnitude <= Config.BringDistance
-                            then
-                                local canMove = true
-                                if type(isnetworkowner) == "function" then
-                                    local ok, owned = pcall(isnetworkowner, enemyRoot)
-                                    canMove = ok and owned == true
-                                end
+                            if hum and enemyRoot and hum.Health > 0 then
+                                local distanceToAnchor = (enemyRoot.Position - anchorPosition).Magnitude
+                                local distanceToPlayer = (enemyRoot.Position - playerRoot.Position).Magnitude
+                                local verticalDelta = math.abs(enemyRoot.Position.Y - anchorPosition.Y)
 
-                                if canMove then
-                                    local key = BaseEnemyName(enemy.Name)
-                                    local group = groups[key]
-                                    if not group then
-                                        group = {PositionSum = Vector3.zero, Count = 0, Members = {}}
-                                        groups[key] = group
-                                    end
-                                    group.PositionSum = group.PositionSum + enemyRoot.Position
-                                    group.Count = group.Count + 1
-                                    group.Members[#group.Members + 1] = {Humanoid = hum, Root = enemyRoot}
+                                if distanceToAnchor <= Config.BringDistance
+                                    and distanceToPlayer <= (Config.BringDistance + Config.BringActivationDistance)
+                                    and verticalDelta <= Config.BringMaxVerticalDelta
+                                    and CanControlMob(enemyRoot, distanceToPlayer)
+                                then
+                                    candidates[#candidates + 1] = {
+                                        Enemy = enemy,
+                                        Humanoid = hum,
+                                        Root = enemyRoot,
+                                        Distance = distanceToAnchor,
+                                        IsAnchor = enemy == target,
+                                    }
                                 end
                             end
                         end
                     end
 
-                    local moved = 0
-                    for _, group in pairs(groups) do
-                        if group.Count > 1 and moved < Config.MaxBringMobsPerTick then
-                            local averagePosition = group.PositionSum / group.Count
-                            local targetCF = CFrame.new(averagePosition)
+                    table.sort(candidates, function(a, b)
+                        if a.IsAnchor ~= b.IsAnchor then
+                            return a.IsAnchor
+                        end
+                        return a.Distance < b.Distance
+                    end)
 
-                            for _, member in ipairs(group.Members) do
-                                if moved >= Config.MaxBringMobsPerTick then break end
-                                local hum = member.Humanoid
-                                local enemyRoot = member.Root
+                    local activeRoots = {}
+                    local limit = math.min(#candidates, Config.MaxBringMobsPerTick)
+                    for index = 1, limit do
+                        local data = candidates[index]
+                        local enemy = data.Enemy
+                        local hum = data.Humanoid
+                        local enemyRoot = data.Root
 
-                                if hum.Parent and enemyRoot.Parent and hum.Health > 0 then
-                                    local distance = (enemyRoot.Position - averagePosition).Magnitude
-                                    if distance > 3 and distance <= Config.BringDistance then
-                                        pcall(function()
-                                            enemyRoot.CanCollide = false
-                                            enemyRoot.AssemblyLinearVelocity = Vector3.zero
-                                            enemyRoot.AssemblyAngularVelocity = Vector3.zero
-                                            TweenObject(enemyRoot, targetCF, Config.BringTweenSpeed)
-                                        end)
-                                        moved = moved + 1
-                                    end
+                        if enemy.Parent and hum.Parent and enemyRoot.Parent and hum.Health > 0 then
+                            activeRoots[enemyRoot] = true
+                            FreezeBroughtMob(enemyRoot, hum)
+
+                            -- Anchor chỉ được giữ đứng yên; các mob còn lại vào slot cố định quanh anchor.
+                            if enemy ~= target then
+                                local slot = GetBringSlot(enemy)
+                                local desiredPosition = anchorPosition + GetBringOffset(slot)
+                                local distanceToSlot = (enemyRoot.Position - desiredPosition).Magnitude
+
+                                if distanceToSlot > Config.BringSnapTolerance then
+                                    pcall(function()
+                                        enemyRoot.CFrame = CFrame.lookAt(desiredPosition, anchorPosition)
+                                    end)
                                 end
                             end
                         end
                     end
+
+                    RestoreInactiveBroughtMobs(activeRoots)
                 end
             end
         end
+
+        ResetBringState()
     end)
 end
 
