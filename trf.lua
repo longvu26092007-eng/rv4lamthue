@@ -1,5 +1,13 @@
 local ENV = (type(getgenv) == "function" and getgenv()) or _G
 
+-- Chống execute trùng làm sinh nhiều FastAttack/BringMob/UI loop cùng lúc.
+if ENV.__TYRANT_TRF_STABLE_RUNNING then
+    warn("[Auto Tyrant] Script đang chạy - bỏ qua lần execute trùng")
+    return
+end
+ENV.__TYRANT_TRF_STABLE_RUNNING = true
+ENV.__TYRANT_TRF_READY = false
+
 ENV.TyrantConfig = ENV.TyrantConfig or {
     Team = "Marines",
     Weapon = "Dragon Talon",
@@ -9,7 +17,7 @@ ENV.TyrantConfig = ENV.TyrantConfig or {
     FarmHeight = 18,
     BossHeight = 25,
     AttackDistance = 85,
-    AttackDelay = 0.10,
+    AttackDelay = 0.03,
     BringMobs = true,
 
     -- Phá bình bằng skill của vũ khí đang cầm.
@@ -28,51 +36,19 @@ ENV.TyrantConfig = ENV.TyrantConfig or {
     OriginScanInterval = 1.25,
 
     -- Giảm tải CPU / FPS drop.
-    FastAttackInterval = 0.10,
+    FastAttackInterval = 0.03,
     BreakableFullScanInterval = 1.75,
-    BringMobInterval = 0.22,
-    BringDistance = 300,
+    BringMobInterval = 0.15,
+    BringDistance = 1500,
     BringTweenSpeed = 300,
-    NoclipInterval = 0.50,
-    TyrantScanInterval = 0.25,
-    MaxVaseTargets = 30,
-
-    -- Safe runtime: giảm remote spam và các thao tác dễ bị server đánh dấu.
-    SafeMode = true,
-    MaxFastAttackTargets = 5,
-    MaxBringMobsPerTick = 5,
-    BringActivationDistance = 135,
-    BringFallbackOwnershipDistance = 120,
-    BringMaxVerticalDelta = 50,
-    BringSpacing = 1.75,
-    BringMaxRadius = 3.75,
-    BringSnapTolerance = 1.50,
-    TeamRetryInterval = 1.25,
-    TeamMaxWait = 30,
-    TeamBackgroundRetry = 5,
-    BusoInterval = 3,
-    TravelRetryInterval = 3,
-    TravelMaxAttempts = 4,
-    MainLoopInterval = 0.25,
-    UIRefreshInterval = 0.50,
-    RaceActionInterval = 5,
-
-    -- Ghost-M1 recovery: chỉ gom/quét hit các mob đã sync ổn định.
-    BringVerifyDelay = 0.45,
-    BringVerifiedTTL = 1.00,
-    GhostM1NoDamageTimeout = 4.25,
-    GhostRecoveryDuration = 2.00,
-    GhostRecoveryLongPause = 5,
-    NativeM1FallbackInterval = 0.26,
-    BringMoveInterval = 0.45,
-    FinishSingleTargetPercent = 0.20,
-    FinishSingleTargetHealth = 2500
+    NoclipInterval = 0.30,
+    TyrantScanInterval = 0.15,
+    MaxVaseTargets = 30
 }
 
--- Cấu hình ghi file khi đủ Race + Fragment.
--- Khi đủ điều kiện, script chỉ tạo file <PlayerName>.txt với nội dung "Completed-fragment".
--- Chỉ ghi file hoàn thành, không tự đổi folder/rejoin.
--- Để trống hoặc đặt về "" / "........." nếu chưa muốn dùng tính năng này.
+-- Cấu hình đánh dấu hoàn thành khi đủ Race + Fragment.
+-- Khi đủ điều kiện, script chỉ tạo file <PlayerName>.txt = "Completed-fragment".
+-- Không đổi thư mục, không ngắt kết nối và không tắt game.
 ENV.fragmenttarget = ENV.fragmenttarget or "........."
 
 local Config = ENV.TyrantConfig
@@ -92,42 +68,14 @@ Config.VaseMaxAttackAttempts = 12
 Config.VaseTargetTimeout = 45
 Config.VaseNoTargetWait = tonumber(Config.VaseNoTargetWait) or 0.35
 Config.OriginScanInterval = tonumber(Config.OriginScanInterval) or 1.25
-Config.AttackDelay = math.max(0.08, tonumber(Config.AttackDelay) or 0.10)
-Config.FastAttackInterval = math.max(0.08, tonumber(Config.FastAttackInterval) or 0.10)
-Config.BreakableFullScanInterval = math.max(1.25, tonumber(Config.BreakableFullScanInterval) or 1.75)
-Config.BringMobInterval = math.min(0.40, math.max(0.18, tonumber(Config.BringMobInterval) or 0.22))
-Config.BringDistance = math.min(340, math.max(150, tonumber(Config.BringDistance) or 300))
-Config.BringTweenSpeed = math.min(350, math.max(150, tonumber(Config.BringTweenSpeed) or 280))
-Config.NoclipInterval = math.max(0.40, tonumber(Config.NoclipInterval) or 0.50)
-Config.TyrantScanInterval = math.max(0.20, tonumber(Config.TyrantScanInterval) or 0.25)
-Config.MaxVaseTargets = math.max(12, tonumber(Config.MaxVaseTargets) or 30)
-Config.MaxFastAttackTargets = math.min(6, math.max(1, tonumber(Config.MaxFastAttackTargets) or 5))
-Config.MaxBringMobsPerTick = math.min(6, math.max(2, tonumber(Config.MaxBringMobsPerTick) or 5))
-Config.BringActivationDistance = math.min(180, math.max(70, tonumber(Config.BringActivationDistance) or 135))
-Config.BringFallbackOwnershipDistance = math.min(180, math.max(50, tonumber(Config.BringFallbackOwnershipDistance) or 120))
-Config.BringMaxVerticalDelta = math.min(80, math.max(25, tonumber(Config.BringMaxVerticalDelta) or 50))
-Config.BringSpacing = math.min(3.0, math.max(1.25, tonumber(Config.BringSpacing) or 1.75))
-Config.BringMaxRadius = math.min(5, math.max(2.5, tonumber(Config.BringMaxRadius) or 3.75))
-Config.BringSnapTolerance = math.min(2.5, math.max(1.0, tonumber(Config.BringSnapTolerance) or 1.50))
-Config.TeamRetryInterval = math.max(1, tonumber(Config.TeamRetryInterval) or 1.25)
-Config.TeamMaxWait = math.max(10, tonumber(Config.TeamMaxWait) or 30)
-Config.TeamBackgroundRetry = math.max(3, tonumber(Config.TeamBackgroundRetry) or 5)
-Config.BusoInterval = math.max(2, tonumber(Config.BusoInterval) or 3)
-Config.TravelRetryInterval = math.max(2, tonumber(Config.TravelRetryInterval) or 3)
-Config.TravelMaxAttempts = math.max(1, tonumber(Config.TravelMaxAttempts) or 4)
-Config.MainLoopInterval = math.max(0.20, tonumber(Config.MainLoopInterval) or 0.25)
-Config.UIRefreshInterval = math.max(0.35, tonumber(Config.UIRefreshInterval) or 0.50)
-Config.RaceActionInterval = math.max(5, tonumber(Config.RaceActionInterval) or 5)
-Config.BringVerifyDelay = math.min(1.2, math.max(0.30, tonumber(Config.BringVerifyDelay) or 0.45))
-Config.BringVerifiedTTL = math.min(2.0, math.max(0.60, tonumber(Config.BringVerifiedTTL) or 1.00))
-Config.GhostM1NoDamageTimeout = math.min(10, math.max(3.0, tonumber(Config.GhostM1NoDamageTimeout) or 4.25))
-Config.GhostRecoveryDuration = math.min(4, math.max(1.25, tonumber(Config.GhostRecoveryDuration) or 2.00))
-Config.GhostRecoveryLongPause = math.min(10, math.max(3, tonumber(Config.GhostRecoveryLongPause) or 5))
-Config.NativeM1FallbackInterval = math.min(0.8, math.max(0.20, tonumber(Config.NativeM1FallbackInterval) or 0.26))
-Config.BringMoveInterval = math.min(1.0, math.max(0.25, tonumber(Config.BringMoveInterval) or 0.45))
-Config.FinishSingleTargetPercent = math.min(0.35, math.max(0.05, tonumber(Config.FinishSingleTargetPercent) or 0.20))
-Config.FinishSingleTargetHealth = math.max(100, tonumber(Config.FinishSingleTargetHealth) or 2500)
-if Config.SafeMode == nil then Config.SafeMode = true end
+Config.FastAttackInterval = tonumber(Config.FastAttackInterval) or 0.03
+Config.BreakableFullScanInterval = tonumber(Config.BreakableFullScanInterval) or 1.75
+Config.BringMobInterval = tonumber(Config.BringMobInterval) or 0.15
+Config.BringDistance = tonumber(Config.BringDistance) or 1500
+Config.BringTweenSpeed = tonumber(Config.BringTweenSpeed) or 300
+Config.NoclipInterval = tonumber(Config.NoclipInterval) or 0.30
+Config.TyrantScanInterval = tonumber(Config.TyrantScanInterval) or 0.15
+Config.MaxVaseTargets = tonumber(Config.MaxVaseTargets) or 30
 
 repeat
     task.wait(1)
@@ -170,40 +118,16 @@ local LastBreakableScan = 0
 local VaseModeStartedAt = 0
 local LastOriginScan = 0
 local InternalSkillReadyAt = {}
-local RuntimeAlive = true
-local TeamReady = false
-local TeamSetupBusy = false
-local FastAttackBusy = false
 
--- State anti-ghost M1 / bring verification được gom vào 1 module table.
--- File gốc đã gần giới hạn 200 local của Lua/Luau; không khai báo thêm nhiều local top-level.
-local GhostM1 = {
-    BringState = nil,
-    ResetBringState = nil,
-    Telemetry = {
-        SentCount = 0,
-        LastSentAt = 0,
-        LastNativeM1At = 0,
-        SingleTargetUntil = 0,
-        BringPausedUntil = 0,
-        LastRecoveryAt = 0,
-        BlockedSince = 0,
-    },
-}
-
--- Cờ chỉ chạy ghi file hoàn thành đúng 1 lần, tránh spam file/log.
+-- Cờ chỉ chạy đổi folder đúng 1 lần, tránh gọi liên tục gây spam/disconnect loop.
 local FragmentFolderLock = false
--- Cờ báo đã đạt đủ cả target race + target fragment. Dùng để UI/status hiện Completed-fragment.
-local FragmentCompletedStatus = false
--- Cờ ghi file hoàn thành 1 lần duy nhất khi đủ Race + Fragment.
-local CompletedFragmentFileWritten = false
 local LastFragmentLogAt = 0
 local CURRENT_FRAGMENT_LOG_INTERVAL = 30
 
 -- ===== Race target (gate đổi folder) =====
 -- ENV.race = "Mink" | "Fishman" | "Skypiea" | "Human" | "Ghoul" | "Cyborg" | "rabbit/shark/angel/..." (alias) | "off" | nil
---   nil / "off" / rỗng -> KHÔNG check race (đổi folder chỉ phụ thuộc fragmenttarget).
---   Có giá trị       -> phải đạt đúng race đó trước khi đợi fragmenttarget.
+--   nil / "off" / rỗng -> KHÔNG check race (Completed chỉ phụ thuộc fragmenttarget).
+--   Có giá trị       -> phải đạt đúng race đó trước khi ghi Completed-fragment.
 local CF_RACE_MAP = {
     rabbit = "Mink", mink = "Mink", shark = "Fishman", fishman = "Fishman",
     angel = "Skypiea", skypiea = "Skypiea", human = "Human",
@@ -259,9 +183,9 @@ local function RaceDriverLoop(target)
         local frag = (GetCurrentFragments and GetCurrentFragments()) or 0
         if CF_REROLLABLE[target] then
             local elapsed = tick() - lastAct
-            if frag >= 2500 and (lastAct == 0 or elapsed >= Config.RaceActionInterval) then
+            if frag >= 2500 and (lastAct == 0 or elapsed >= 3) then
                 dlog(("Reroll #%d: cur=%s target=%s frag=%d elapsed=%.1f"):format(
-                    (lastAct == 0) and 0 or math.floor(elapsed / Config.RaceActionInterval), tostring(cur), target, frag, elapsed))
+                    (lastAct == 0) and 0 or math.floor(elapsed / 3), tostring(cur), target, frag, elapsed))
                 -- pcall từng remote để lỗi không giết driver loop (Sửa lỗi C).
                 pcall(function()
                     ReplicatedStorage.Remotes.CommF_:InvokeServer("BlackbeardReward", "Reroll", "1")
@@ -274,13 +198,13 @@ local function RaceDriverLoop(target)
                 CF_DBG_LAST_LOG = tick()
                 dlog(("Cho du frag de reroll: cur=%s target=%s frag=%d/2500"):format(tostring(cur), target, frag))
             end
-        elseif target == "Ghoul" and tick() - lastAct >= Config.RaceActionInterval then
+        elseif target == "Ghoul" and tick() - lastAct >= 3 then
             dlog("Mua Ghoul qua Ectoplasm")
             pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("Ectoplasm", "BuyCheck", 4) end)
             task.wait(0.5)
             pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("Ectoplasm", "Change", 4) end)
             lastAct = tick(); task.wait(1.5)
-        elseif target == "Cyborg" and tick() - lastAct >= Config.RaceActionInterval then
+        elseif target == "Cyborg" and tick() - lastAct >= 3 then
             dlog("Mua Cyborg qua CyborgTrainer")
             pcall(function() ReplicatedStorage.Remotes.CommF_:InvokeServer("CyborgTrainer", "Buy") end)
             lastAct = tick(); task.wait(1.5)
@@ -360,63 +284,6 @@ local function SetStatus(text)
         SetStatusLast = text
         warn("[Auto Tyrant] " .. text)
     end
-end
-
-local function MarkCompletedFragmentStatus(current, target)
-    if FragmentCompletedStatus then
-        return
-    end
-
-    FragmentCompletedStatus = true
-    CurrentMode = "Completed-fragment"
-    CurrentTarget = nil
-
-    ENV.CompletedFragment = true
-    ENV.CompletedFragmentAt = tick()
-    ENV.CompletedFragmentRace = raceOf()
-    ENV.CompletedFragmentValue = current
-    ENV.CompletedFragmentTarget = target
-
-    SetStatus(string.format(
-        "Completed-fragment | Race=%s | Fragment=%s/%s",
-        tostring(ENV.CompletedFragmentRace or "?"),
-        tostring(current),
-        tostring(target)
-    ))
-end
-
--- Ghi file báo hoàn thành cho tool ngoài đọc: <PlayerName>.txt = Completed-fragment
--- Chỉ gọi khi đã đủ Race target + Fragment target.
-local function WriteCompletedFragmentFile(current, target)
-    if CompletedFragmentFileWritten then
-        return true
-    end
-
-    if type(writefile) ~= "function" then
-        warn("[Fragment] Executor không hỗ trợ writefile - không thể tạo file Completed-fragment")
-        return false
-    end
-
-    local fileName = tostring((LocalPlayer and LocalPlayer.Name) or "UnknownPlayer") .. ".txt"
-    local ok, err = pcall(function()
-        writefile(fileName, "Completed-fragment")
-    end)
-
-    if ok then
-        CompletedFragmentFileWritten = true
-        ENV.CompletedFragmentFile = fileName
-        warn(string.format(
-            "[Fragment] Đã ghi file %s = Completed-fragment | Race=%s | Fragment=%s/%s",
-            fileName,
-            tostring(raceOf() or "?"),
-            tostring(current),
-            tostring(target)
-        ))
-        return true
-    end
-
-    warn("[Fragment] Lỗi khi ghi file Completed-fragment: " .. tostring(err))
-    return false
 end
 
 local function Character()
@@ -516,13 +383,6 @@ local function EquipWeapon()
 end
 
 local ActivePlayerTween = nil
-local ActiveFollowTween = nil
-local LastFollowTargetPosition = nil
-local LastFollowUpdateAt = 0
-local FOLLOW_UPDATE_INTERVAL = 0.14
-local FOLLOW_TARGET_DELTA = 2.5
-local TWEEN_ARRIVAL_RADIUS = 3.0
-local TWEEN_SNAP_RADIUS = 1.25
 
 local function StopPlayerTween()
     if ActivePlayerTween then
@@ -533,26 +393,11 @@ local function StopPlayerTween()
     end
 end
 
-local function StopFollowTween()
-    if ActiveFollowTween then
-        pcall(function()
-            ActiveFollowTween:Cancel()
-        end)
-        ActiveFollowTween = nil
-    end
-    LastFollowTargetPosition = nil
-end
-
-local function StopAllPlayerMovement()
-    StopPlayerTween()
-    StopFollowTween()
-end
-
--- Tween đường dài: không còn snap về đích từ 12-15 studs.
--- Chỉ căn tuyệt đối khi đã cách đích <= 1.25 studs; còn lại giữ vị trí tween thực tế.
+-- Tween được lấy theo cơ chế trong buy+farmtalon:
+-- tween trực tiếp HumanoidRootPart, chờ đến gần đích rồi hủy và căn lại CFrame.
 local function TweenTo(targetCF, speed)
     local hrp = HumanoidRootPart()
-    if not hrp or typeof(targetCF) ~= "CFrame" then
+    if not hrp or not targetCF then
         return false
     end
 
@@ -561,15 +406,16 @@ local function TweenTo(targetCF, speed)
         hum.Sit = false
     end
 
-    StopAllPlayerMovement()
+    StopPlayerTween()
 
     local distance = (hrp.Position - targetCF.Position).Magnitude
-    if distance <= TWEEN_SNAP_RADIUS then
+    local duration = distance / (speed or Config.TweenSpeed or 300)
+
+    if duration < 0.05 then
         hrp.CFrame = targetCF
         return true
     end
 
-    local duration = math.max(distance / math.max(speed or Config.TweenSpeed or 300, 1), 0.05)
     local tween = TweenService:Create(
         hrp,
         TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
@@ -600,7 +446,7 @@ local function TweenTo(targetCF, speed)
             break
         end
 
-        if (hrp.Position - targetCF.Position).Magnitude <= TWEEN_ARRIVAL_RADIUS then
+        if (hrp.Position - targetCF.Position).Magnitude <= 8 then
             success = true
             break
         end
@@ -609,85 +455,23 @@ local function TweenTo(targetCF, speed)
     if ActivePlayerTween == tween then
         ActivePlayerTween = nil
     end
-    pcall(function() tween:Cancel() end)
-    if conn then conn:Disconnect() end
+
+    pcall(function()
+        tween:Cancel()
+    end)
+
+    if conn then
+        conn:Disconnect()
+        conn = nil
+    end
 
     hrp = HumanoidRootPart()
-    if hrp and (hrp.Position - targetCF.Position).Magnitude <= TWEEN_SNAP_RADIUS then
+    if hrp and (hrp.Position - targetCF.Position).Magnitude <= 12 then
         hrp.CFrame = targetCF
         return true
     end
 
     return success
-end
-
--- Follow mục tiêu đang di chuyển: chỉ cập nhật khi đủ interval hoặc mục tiêu đã đổi vị trí đáng kể.
--- Không Completed:Wait(), không tạo tween mới mỗi frame và không snap về CFrame cũ.
-local function FollowTargetCFrame(targetCF)
-    local root = HumanoidRootPart()
-    if not root or typeof(targetCF) ~= "CFrame" then
-        return false
-    end
-
-    local now = tick()
-    local targetPosition = targetCF.Position
-    local moved = not LastFollowTargetPosition
-        or (LastFollowTargetPosition - targetPosition).Magnitude >= FOLLOW_TARGET_DELTA
-
-    if ActiveFollowTween and not moved and (now - LastFollowUpdateAt) < FOLLOW_UPDATE_INTERVAL then
-        return true
-    end
-    if (now - LastFollowUpdateAt) < FOLLOW_UPDATE_INTERVAL then
-        return true
-    end
-
-    LastFollowUpdateAt = now
-    LastFollowTargetPosition = targetPosition
-    StopPlayerTween()
-    if ActiveFollowTween then
-        pcall(function() ActiveFollowTween:Cancel() end)
-        ActiveFollowTween = nil
-    end
-
-    local distance = (root.Position - targetPosition).Magnitude
-    local duration = math.clamp(distance / 420, 0.07, 0.24)
-    local tween = TweenService:Create(
-        root,
-        TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
-        {CFrame = targetCF}
-    )
-    ActiveFollowTween = tween
-    tween.Completed:Connect(function()
-        if ActiveFollowTween == tween then
-            ActiveFollowTween = nil
-        end
-    end)
-    tween:Play()
-    return true
-end
-
-local function SettleAtCFrame(targetCF)
-    local root = HumanoidRootPart()
-    if not root or typeof(targetCF) ~= "CFrame" then return false end
-
-    StopAllPlayerMovement()
-    local distance = (root.Position - targetCF.Position).Magnitude
-    if distance <= TWEEN_SNAP_RADIUS then
-        root.CFrame = targetCF
-        return true
-    end
-
-    local duration = math.clamp(distance / 260, 0.06, 0.18)
-    local tween = TweenService:Create(
-        root,
-        TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
-        {CFrame = targetCF}
-    )
-    ActivePlayerTween = tween
-    tween:Play()
-    tween.Completed:Wait()
-    if ActivePlayerTween == tween then ActivePlayerTween = nil end
-    return true
 end
 
 local function GetEnemyFolders()
@@ -811,84 +595,84 @@ GetCurrentFragments = function()
     return tonumber(value)
 end
 
--- Kiem tra du dieu kien chua, neu du thi CHI ghi file:
---   <PlayerName>.txt = Completed-fragment
--- Chi ghi file hoan thanh, khong tu doi folder/rejoin.
-local function TryWriteCompletedFragmentFile()
+-- Khi đủ Race + Fragment, chỉ ghi file hoàn thành.
+-- Không đổi thư mục, không ngắt kết nối và không tắt game.
+local function TryWriteCompletedFragment()
     if FragmentFolderLock then
-        return false
+        return true
     end
 
     local rawTarget = ENV.fragmenttarget
     if rawTarget == nil then
-        warn("[Fragment] ENV.fragmenttarget nil - bỏ qua ghi file")
+        warn("[Fragment] ENV.fragmenttarget nil - bỏ qua ghi Completed-fragment")
         return false
     end
 
     local target = tonumber(rawTarget)
     if not target or target <= 0 then
         warn(string.format(
-            "[Fragment] ENV.fragmenttarget không hợp lệ (%s) - bỏ qua ghi file",
+            "[Fragment] ENV.fragmenttarget không hợp lệ (%s) - bỏ qua ghi Completed-fragment",
             tostring(rawTarget)
         ))
         return false
     end
 
     if not RaceReady then
-        warn(string.format(
-            "[Fragment] Race chưa đạt target (race hiện tại = %s) - chưa ghi file",
-            tostring(raceOf() or "?")
-        ))
         return false
     end
 
     local current = GetCurrentFragments()
-    if current == nil then
-        warn("[Fragment] Không đọc được số Fragment hiện tại - bỏ qua ghi file")
+    if current == nil or current < target then
         return false
     end
 
-    if current < target then
+    if type(writefile) ~= "function" then
+        warn("[Fragment] Executor không hỗ trợ writefile - chưa thể tạo Completed-fragment")
+        return false
+    end
+
+    local fileName = tostring((LocalPlayer and LocalPlayer.Name) or "UnknownPlayer") .. ".txt"
+    local ok, err = pcall(function()
+        writefile(fileName, "Completed-fragment")
+    end)
+
+    if not ok then
+        warn("[Fragment] Lỗi ghi " .. fileName .. ": " .. tostring(err))
         return false
     end
 
     FragmentFolderLock = true
-    warn(string.format(
-        "[Fragment] Đủ điều kiện: Race=%s | Fragment=%s/%s - ghi PlayerName.txt",
-        tostring(raceOf() or "?"),
+    ENV.CompletedFragment = true
+    ENV.CompletedFragmentFile = fileName
+    ENV.CompletedFragmentRace = raceOf()
+    ENV.CompletedFragmentValue = current
+    ENV.CompletedFragmentTarget = target
+    CurrentMode = "Completed-fragment"
+
+    SetStatus(string.format(
+        "Completed-fragment | Race=%s | Fragment=%s/%s",
+        tostring(ENV.CompletedFragmentRace or "?"),
         tostring(current),
         tostring(target)
     ))
-
-    MarkCompletedFragmentStatus(current, target)
-
-    local wrote = WriteCompletedFragmentFile(current, target)
-    if wrote then
-        warn("[Fragment] Completed-fragment đã ghi xong. Không đổi folder/disconnect/shutdown.")
-        return true
-    end
-
-    -- Nếu executor lỗi writefile, mở khóa để thử lại ở vòng sau.
-    task.wait(10)
-    FragmentFolderLock = false
-    return false
+    warn("[Fragment] Đã ghi " .. fileName .. " = Completed-fragment")
+    return true
 end
 
 -- Gọi nhẹ mỗi vòng lặp: nếu chưa đủ Fragment thì chỉ log số hiện tại + target
--- theo interval (mặc định 30s) để tránh spam warn. Khi đủ thì gọi TryWriteCompletedFragmentFile().
+-- theo interval (mặc định 30s). Khi đủ thì ghi Completed-fragment đúng một lần.
 local function MaybeCheckFragment()
     if FragmentFolderLock then
         return
     end
 
-    -- Gate race: nếu ENV.race được set mà chưa đạt -> KHÔNG ghi file,
-    -- chỉ log định kỳ để biết script đang chờ race.
+    -- Gate race: nếu ENV.race được set mà chưa đạt thì chưa ghi Completed-fragment.
     if not RaceReady then
         local now = tick()
         if now - LastFragmentLogAt >= CURRENT_FRAGMENT_LOG_INTERVAL then
             LastFragmentLogAt = now
             warn(string.format(
-                "[Fragment] Đang chờ Race đạt target (race hiện tại = %s) - chưa ghi file",
+                "[Fragment] Đang chờ Race đạt target (race hiện tại = %s) - chưa Completed",
                 tostring(raceOf() or "?")
             ))
         end
@@ -907,7 +691,7 @@ local function MaybeCheckFragment()
     end
 
     if current >= target then
-        TryWriteCompletedFragmentFile()
+        TryWriteCompletedFragment()
         return
     end
 
@@ -1738,290 +1522,203 @@ local function GetVaseStandCFrame(targetObject, keyName)
 end
 
 
-
-function GhostM1.IsEnemyAlive(enemy)
-    if not enemy or not enemy.Parent or not enemy:IsDescendantOf(Workspace) then
-        return false
-    end
-    local hum = enemy:FindFirstChildOfClass("Humanoid")
-    local root = enemy:FindFirstChild("HumanoidRootPart")
-    if not hum or not hum.Parent or not root or not root.Parent then
-        return false
-    end
-    if hum.Health <= 0 then
-        return false
-    end
-    local ok, state = pcall(function() return hum:GetState() end)
-    if ok and state == Enum.HumanoidStateType.Dead then
-        return false
-    end
-    return true
-end
-
-function GhostM1.ShouldFinishSingleTarget(enemy, hum)
-    hum = hum or (enemy and enemy:FindFirstChildOfClass("Humanoid"))
-    if not hum or hum.Health <= 0 then
-        return true
-    end
-    local maxHealth = tonumber(hum.MaxHealth) or 0
-    if hum.Health <= Config.FinishSingleTargetHealth then
-        return true
-    end
-    return maxHealth > 0 and hum.Health <= (maxHealth * Config.FinishSingleTargetPercent)
-end
-
-function GhostM1.IsVerifiedBroughtEnemy(enemy, enemyRoot)
-    if enemy == CurrentTarget then
-        return true
-    end
-
-    if not GhostM1.BringState or not GhostM1.BringState.Active or not GhostM1.BringState.VerifiedAt then
-        return false
-    end
-
-    local verifiedAt = GhostM1.BringState.VerifiedAt[enemy]
-    if not GhostM1.BringState.Active[enemy]
-        or not verifiedAt
-        or (tick() - verifiedAt) > Config.BringVerifiedTTL
-    then
-        return false
-    end
-
-    if type(isnetworkowner) == "function" then
-        local ok, owned = pcall(isnetworkowner, enemyRoot)
-        if not ok or owned ~= true then
-            return false
-        end
-    end
-
-    return true
-end
-
 local function GetAttackTargets()
     local root = HumanoidRootPart()
     local targets = {}
 
-    if not root or CurrentMode == "VASES" then
+    if not root then
         return targets
     end
 
-    local singleTargetOnly = tick() < GhostM1.Telemetry.SingleTargetUntil
-    local currentHum = CurrentTarget and CurrentTarget:FindFirstChildOfClass("Humanoid")
-    if CurrentTarget and GhostM1.ShouldFinishSingleTarget(CurrentTarget, currentHum) then
-        singleTargetOnly = true
+    if CurrentMode == "VASES" then
+        -- Bình chỉ được phá bằng skill Z/X/C; tuyệt đối không gửi RegisterHit/M1.
+        return targets
     end
 
     for _, folder in ipairs(GetEnemyFolders()) do
         for _, enemy in ipairs(folder:GetChildren()) do
             local hum = enemy:FindFirstChildOfClass("Humanoid")
             local enemyRoot = enemy:FindFirstChild("HumanoidRootPart")
-            local hitPart = enemy:FindFirstChild("Head") or enemyRoot
+            local head = enemy:FindFirstChild("Head")
             local valid = false
 
-            if GhostM1.IsEnemyAlive(enemy) and hum and enemyRoot and hitPart then
+            if hum and enemyRoot and hum.Health > 0 then
                 if CurrentMode == "BOSS" then
                     valid = enemy == CurrentTarget or IsTyrant(enemy)
                 elseif CurrentMode == "MOBS" then
-                    valid = enemy == CurrentTarget
-                        or (
-                            not singleTargetOnly
-                            and IsTikiMob(enemy)
-                            and GhostM1.IsVerifiedBroughtEnemy(enemy, enemyRoot)
-                        )
+                    valid = IsTikiMob(enemy)
                 end
             end
 
-            if valid then
-                local distance = (hitPart.Position - root.Position).Magnitude
-                if distance <= Config.AttackDistance then
-                    targets[#targets + 1] = {
-                        enemy,
-                        hitPart,
-                        IsCurrent = enemy == CurrentTarget,
-                        Distance = distance,
-                    }
-                end
+            if valid and (enemyRoot.Position - root.Position).Magnitude <= Config.AttackDistance then
+                targets[#targets + 1] = {
+                    enemy,
+                    head or enemyRoot
+                }
             end
         end
     end
-
-    table.sort(targets, function(a, b)
-        if a.IsCurrent ~= b.IsCurrent then
-            return a.IsCurrent
-        end
-        return a.Distance < b.Distance
-    end)
 
     return targets
 end
 
 local function LoadAttack()
     if AttackLoaded then
-        return true
+        return
     end
+    AttackLoaded = true
 
-    local modules = ReplicatedStorage:FindFirstChild("Modules")
-        or ReplicatedStorage:WaitForChild("Modules", 15)
-    local net = modules and (modules:FindFirstChild("Net") or modules:WaitForChild("Net", 15))
-    local registerAttack = net and (net:FindFirstChild("RE/RegisterAttack") or net:WaitForChild("RE/RegisterAttack", 10))
-    local registerHit = net and (net:FindFirstChild("RE/RegisterHit") or net:WaitForChild("RE/RegisterHit", 10))
+    local Modules = ReplicatedStorage:WaitForChild("Modules")
+    local Net = Modules:WaitForChild("Net")
+    local RegisterAttack = Net:WaitForChild("RE/RegisterAttack")
+    local RegisterHit = Net:WaitForChild("RE/RegisterHit")
 
-    if not registerAttack or not registerHit then
-        warn("[Auto Tyrant] Không tìm thấy combat remotes; tắt FastAttack để tránh loop lỗi")
+    local remoteAttack, idremote
+    local seed = nil
+    local lastAttack = 0
+
+    pcall(function()
+        seed = Net:WaitForChild("seed"):InvokeServer()
+    end)
+
+    local remoteFolders = {
+        ReplicatedStorage:FindFirstChild("Util"),
+        ReplicatedStorage:FindFirstChild("Common"),
+        ReplicatedStorage:FindFirstChild("Remotes"),
+        ReplicatedStorage:FindFirstChild("Assets"),
+        ReplicatedStorage:FindFirstChild("FX")
+    }
+
+    local function GetRemoteAttack()
+        if remoteAttack and remoteAttack.Parent and idremote then
+            return true
+        end
+
+        remoteAttack = nil
+        idremote = nil
+
+        for _, folder in ipairs(remoteFolders) do
+            if folder then
+                for _, obj in ipairs(folder:GetChildren()) do
+                    if obj:IsA("RemoteEvent") and obj:GetAttribute("Id") then
+                        remoteAttack = obj
+                        idremote = obj:GetAttribute("Id")
+                        return true
+                    end
+                end
+            end
+        end
+
         return false
     end
 
-    AttackLoaded = true
-    local lastAttack = 0
+    -- Giữ cách của buy+farmtalon: cập nhật remote mã hóa ngay khi game tạo remote mới.
+    for _, folder in ipairs(remoteFolders) do
+        if folder then
+            folder.ChildAdded:Connect(function(obj)
+                if obj:IsA("RemoteEvent") and obj:GetAttribute("Id") then
+                    remoteAttack = obj
+                    idremote = obj:GetAttribute("Id")
+                end
+            end)
+        end
+    end
+
+    GetRemoteAttack()
+
+    local function EncryptedRegisterHit(hitData)
+        if not seed then
+            pcall(function()
+                seed = Net:WaitForChild("seed"):InvokeServer()
+            end)
+        end
+
+        if not GetRemoteAttack() or not seed then
+            return false
+        end
+
+        pcall(function()
+            local encodedName = string.gsub("RE/RegisterHit", ".", function(c)
+                return string.char(
+                    bit32.bxor(
+                        string.byte(c),
+                        math.floor(Workspace:GetServerTimeNow() / 10 % 10) + 1
+                    )
+                )
+            end)
+
+            remoteAttack:FireServer(
+                encodedName,
+                bit32.bxor(idremote + 909090, seed * 2),
+                unpack(hitData)
+            )
+        end)
+
+        return true
+    end
 
     local function FastAttack()
-        if FastAttackBusy
-            or SkillCasting
-            or CurrentMode == "VASES"
-            or not TeamReady
-            or not Farming
-        then
-            return false
+        if SkillCasting or CurrentMode == "VASES" then
+            return
         end
 
-        local char = LocalPlayer.Character
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        local equipped = char and char:FindFirstChildWhichIsA("Tool")
-        if not char or not hum or hum.Health <= 0 or not equipped then
-            return false
+        local char = Character()
+        local hum = Humanoid()
+
+        if not char or not hum or hum.Health <= 0 then
+            return
         end
 
-        local now = tick()
-        if now - lastAttack < Config.AttackDelay then
-            return false
+        if not char:FindFirstChildWhichIsA("Tool") then
+            return
         end
 
+        if tick() - lastAttack < (Config.AttackDelay or 0.03) then
+            return
+        end
+
+        -- Giữ bộ lọc mục tiêu của bản Tyrant để đánh đúng Tiki mob / Tyrant / bình.
         local targets = GetAttackTargets()
         if #targets <= 0 then
-            return false
+            return
         end
 
-        local maxTargets = math.min(#targets, Config.MaxFastAttackTargets)
         local hitData = {
             [1] = targets[1][2],
             [2] = {}
         }
 
-        for index = 1, maxTargets do
-            local data = targets[index]
-            local freshPart = data[1]:FindFirstChild("Head")
-                or data[1]:FindFirstChild("HumanoidRootPart")
-            if freshPart and GhostM1.IsEnemyAlive(data[1]) then
-                if #hitData[2] == 0 then
-                    hitData[1] = freshPart
-                end
-                hitData[2][#hitData[2] + 1] = {data[1], freshPart}
-            end
+        for _, data in ipairs(targets) do
+            hitData[2][#hitData[2] + 1] = {
+                data[1],
+                data[2]
+            }
         end
 
-        if #hitData[2] <= 0 then
-            return false
-        end
-
-        FastAttackBusy = true
-
-        -- Theo đúng dạng gọi của bản trf tham khảo:
-        -- RegisterAttack không truyền cooldown; mỗi hit dùng Part mới đọc ngay lúc gửi.
-        local attackOK = pcall(function()
-            registerAttack:FireServer()
-        end)
-        local hitOK = pcall(function()
-            registerHit:FireServer(unpack(hitData))
+        pcall(function()
+            RegisterAttack:FireServer()
         end)
 
-        lastAttack = now
-        FastAttackBusy = false
+        pcall(function()
+            RegisterHit:FireServer(unpack(hitData))
+        end)
 
-        if attackOK and hitOK then
-            GhostM1.Telemetry.SentCount = GhostM1.Telemetry.SentCount + 1
-            GhostM1.Telemetry.LastSentAt = now
-            return true
-        end
-        return false
+        EncryptedRegisterHit(hitData)
+        lastAttack = tick()
     end
 
+    -- Xuất cả hai tên để tương thích hai script.
     ENV.DragonTalonFastAttack = FastAttack
     ENV.TyrantFastAttack = FastAttack
 
     task.spawn(function()
-        while RuntimeAlive do
-            task.wait(Config.FastAttackInterval)
-            if Farming and not SkillCasting and TeamReady then
+        -- Script nguồn dùng task.wait() mỗi frame. Giữ cùng cơ chế nhưng có interval để giảm tải.
+        while task.wait(Config.FastAttackInterval) do
+            if Farming and not SkillCasting then
                 pcall(FastAttack)
             end
         end
     end)
-
-    return true
-end
-
-
-function GhostM1.RefreshEquippedToolForM1()
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local tool = char and char:FindFirstChildWhichIsA("Tool")
-    if not hum or hum.Health <= 0 or not tool then return false end
-
-    return pcall(function()
-        hum:UnequipTools()
-        task.wait(0.10)
-        if tool.Parent then
-            hum:EquipTool(tool)
-        end
-    end)
-end
-
-function GhostM1.PulseNativeM1()
-    local now = tick()
-    if now - GhostM1.Telemetry.LastNativeM1At < Config.NativeM1FallbackInterval then
-        return false
-    end
-
-    local char = LocalPlayer.Character
-    local tool = char and char:FindFirstChildWhichIsA("Tool")
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not tool or not hum or hum.Health <= 0 then return false end
-
-    GhostM1.Telemetry.LastNativeM1At = now
-    return pcall(function()
-        tool:Activate()
-        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
-        task.wait(0.025)
-        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
-    end)
-end
-
-function GhostM1.StartRecovery(reason, longPause)
-    local now = tick()
-    if now - GhostM1.Telemetry.LastRecoveryAt < 1.5 then
-        return false
-    end
-
-    GhostM1.Telemetry.LastRecoveryAt = now
-    GhostM1.Telemetry.SingleTargetUntil = math.max(
-        GhostM1.Telemetry.SingleTargetUntil,
-        now + Config.GhostRecoveryDuration
-    )
-    GhostM1.Telemetry.BringPausedUntil = math.max(
-        GhostM1.Telemetry.BringPausedUntil,
-        now + (longPause and Config.GhostRecoveryLongPause or Config.GhostRecoveryDuration)
-    )
-
-    if GhostM1.ResetBringState then
-        pcall(GhostM1.ResetBringState)
-    end
-    pcall(StopFollowTween)
-
-    -- Không dừng FastAttack và không tin Busy/Stun local nữa.
-    -- Chuyển đánh đơn + M1 native để kết liễu target thật.
-    pcall(GhostM1.PulseNativeM1)
-    warn("[Auto Tyrant][M1 resync] " .. tostring(reason))
-    return true
 end
 
 local function NormalAttack(duration)
@@ -2029,17 +1726,28 @@ local function NormalAttack(duration)
 
     repeat
         local tool = EquipWeapon()
+        if tool then
+            pcall(function()
+                tool:Activate()
+            end)
+        end
+
+        pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+            VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+        end)
+
         if ENV.TyrantFastAttack then
             pcall(ENV.TyrantFastAttack)
         end
-        if tool then
-            GhostM1.PulseNativeM1()
-        end
 
-        task.wait(Config.AttackDelay)
+        task.wait(0.06)
     until tick() - started >= (duration or 0.6) or FindTyrant()
 end
 
+-- Dragon Talon la fighting style (melee): khi da so huu, no KHONG nam trong
+-- Backpack/Character duoi dang Tool ma o LocalPlayer.Data.Melee.Value.
+-- Chi dua vao FindTool se luon "khong thay" -> script cu di mua lai giua luc danh boss.
 local function HasMeleeStyle(styleName)
     local ok, value = pcall(function()
         local data = LocalPlayer:FindFirstChild("Data")
@@ -2082,12 +1790,12 @@ local function BuyDragonTalon()
     TweenTo(DRAGON_TALON_BUY_POS, Config.TweenSpeed)
     task.wait(0.8)
 
-    for attempt = 1, 5 do
+    for _ = 1, 15 do
         pcall(function()
             commf:InvokeServer("BuyDragonTalon")
         end)
 
-        task.wait(1.5)
+        task.wait(0.5)
         if PlayerHasDragonTalon() then
             return true
         end
@@ -2488,10 +2196,9 @@ local function AttackStaticVaseTarget(target, preferredKey)
         return false
     end
 
-    -- Căn mượt về CFrame riêng của skill; chỉ snap khi đã sát <= 1.25 studs.
-    SettleAtCFrame(standCF)
-    root = HumanoidRootPart()
-    if not root then return false end
+    -- Căn tuyệt đối về CFrame riêng của từng skill trước khi nhấn phím.
+    StopPlayerTween()
+    root.CFrame = standCF
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
     task.wait(0.10)
@@ -2533,7 +2240,7 @@ local function FarmEnemy(enemy, isBoss)
     local hum = enemy and enemy:FindFirstChildOfClass("Humanoid")
     local enemyRoot = enemy and enemy:FindFirstChild("HumanoidRootPart")
 
-    if not GhostM1.IsEnemyAlive(enemy) or not hum or not enemyRoot then
+    if not hum or not enemyRoot or hum.Health <= 0 then
         return
     end
 
@@ -2542,17 +2249,14 @@ local function FarmEnemy(enemy, isBoss)
 
     local stuckAt = tick()
     local previousHealth = hum.Health
-    local noDamageSince = tick()
-    local sentAtLastDamage = GhostM1.Telemetry.SentCount
-    local ghostRecoveries = 0
 
-    while RuntimeAlive and TeamReady and GhostM1.IsEnemyAlive(enemy) do
-        hum = enemy:FindFirstChildOfClass("Humanoid")
-        enemyRoot = enemy:FindFirstChild("HumanoidRootPart")
-
+    while Farming and ENV.__TYRANT_TRF_READY
+        and enemy.Parent and hum.Parent and enemyRoot.Parent and hum.Health > 0
+    do
         local root = HumanoidRootPart()
         local playerHum = Humanoid()
-        if not hum or not enemyRoot or not root or not playerHum or playerHum.Health <= 0 then
+
+        if not root or not playerHum or playerHum.Health <= 0 then
             break
         end
 
@@ -2561,86 +2265,34 @@ local function FarmEnemy(enemy, isBoss)
         local height = isBoss and Config.BossHeight or Config.FarmHeight
         local target = TargetCFrame(enemyRoot, height)
         local distance = (root.Position - enemyRoot.Position).Magnitude
-        local finishing = not isBoss and GhostM1.ShouldFinishSingleTarget(enemy, hum)
-
-        if finishing then
-            GhostM1.Telemetry.SingleTargetUntil = math.max(
-                GhostM1.Telemetry.SingleTargetUntil,
-                tick() + 1.5
-            )
-            GhostM1.Telemetry.BringPausedUntil = math.max(
-                GhostM1.Telemetry.BringPausedUntil,
-                tick() + 1.5
-            )
-            if GhostM1.ResetBringState then pcall(GhostM1.ResetBringState) end
-        end
 
         if distance > 80 then
-            StopFollowTween()
             TweenTo(target, Config.TweenSpeed)
         else
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
-            FollowTargetCFrame(target)
 
-            -- Bản trf dùng cả FastAttack lẫn M1 native.
-            -- Khi target gần chết hoặc không tụt máu, luôn bấm native để kết liễu.
-            if finishing or (tick() - noDamageSince) >= 1.5 then
-                GhostM1.PulseNativeM1()
-            end
+            local followTween = TweenService:Create(
+                root,
+                TweenInfo.new(0.08, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+                {CFrame = target}
+            )
+            followTween:Play()
+            followTween.Completed:Wait()
         end
 
         if hum.Health < previousHealth then
             previousHealth = hum.Health
             stuckAt = tick()
-            noDamageSince = tick()
-            sentAtLastDamage = GhostM1.Telemetry.SentCount
-            ghostRecoveries = 0
-        else
-            local sentWithoutDamage = GhostM1.Telemetry.SentCount - sentAtLastDamage
-            if tick() - noDamageSince >= Config.GhostM1NoDamageTimeout
-                and sentWithoutDamage >= 8
-                and CurrentMode == "MOBS"
-            then
-                ghostRecoveries = ghostRecoveries + 1
-                GhostM1.StartRecovery(
-                    ("target=%s hp=%.0f/%.0f sends=%d recovery=%d"):format(
-                        tostring(enemy.Name),
-                        tonumber(hum.Health) or -1,
-                        tonumber(hum.MaxHealth) or -1,
-                        sentWithoutDamage,
-                        ghostRecoveries
-                    ),
-                    ghostRecoveries >= 2
-                )
-                noDamageSince = tick()
-                sentAtLastDamage = GhostM1.Telemetry.SentCount
-                NormalAttack(0.8)
-            elseif tick() - stuckAt > 15 then
-                StopFollowTween()
-                if distance > 8 then
-                    TweenTo(target, math.max(Config.TweenSpeed, 380))
-                end
-                NormalAttack(0.65)
-                stuckAt = tick()
-            end
+        elseif tick() - stuckAt > 15 then
+            root.CFrame = target
+            NormalAttack(0.5)
+            stuckAt = tick()
         end
 
-        task.wait(0.08)
+        task.wait(0.05)
     end
 
-    -- HP đã về 0 nhưng model có thể còn tồn tại vài frame; chờ server dọn rồi mới đổi target.
-    if hum and hum.Health <= 0 then
-        local waitStarted = tick()
-        while enemy.Parent and tick() - waitStarted < 1.25 do
-            task.wait(0.05)
-        end
-    end
-
-    StopFollowTween()
-    if GhostM1.ResetBringState then pcall(GhostM1.ResetBringState) end
-    GhostM1.Telemetry.SingleTargetUntil = 0
-    GhostM1.Telemetry.BringPausedUntil = 0
     CurrentTarget = nil
 end
 
@@ -2661,7 +2313,9 @@ local function BreakTyrantVases()
     local pass = 0
     local keys = Config.VaseSkillKeys
 
-    while AreTyrantEyesReady() and not FindTyrant() do
+    while Farming and ENV.__TYRANT_TRF_READY
+        and AreTyrantEyesReady() and not FindTyrant()
+    do
         pass = pass + 1
 
         for index, target in ipairs(STATIC_VASE_TARGETS) do
@@ -2689,51 +2343,52 @@ end
 
 
 local function SetupCharacterSupport()
-    local descendantConnection = nil
-
-    local function RemoveLegacyBodyClip(char)
-        local root = char and char:FindFirstChild("HumanoidRootPart")
-        local bodyClip = root and root:FindFirstChild("BodyClip")
-        if bodyClip then
-            pcall(function() bodyClip:Destroy() end)
-        end
-    end
+    local noclipConnection = nil
 
     local function ApplyCharacterSupport(char)
-        if descendantConnection then
-            descendantConnection:Disconnect()
-            descendantConnection = nil
+        if noclipConnection then
+            noclipConnection:Disconnect()
+            noclipConnection = nil
         end
-        if not char then return end
 
-        RemoveLegacyBodyClip(char)
+        if not char then
+            return
+        end
 
-        local function ApplyNoclip(object)
-            if object:IsA("BasePart") and (ActivePlayerTween or ActiveFollowTween or CurrentTarget or CurrentMode == "VASES") then
+        local function NoclipObject(object)
+            if object:IsA("BasePart") then
                 object.CanCollide = false
             end
         end
 
         for _, object in ipairs(char:GetDescendants()) do
-            ApplyNoclip(object)
+            NoclipObject(object)
         end
-        descendantConnection = char.DescendantAdded:Connect(ApplyNoclip)
+
+        noclipConnection = char.DescendantAdded:Connect(NoclipObject)
     end
 
     ApplyCharacterSupport(LocalPlayer.Character)
     LocalPlayer.CharacterAdded:Connect(function(char)
-        task.wait(0.35)
+        task.wait(0.2)
         ApplyCharacterSupport(char)
     end)
 
     task.spawn(function()
-        while RuntimeAlive do
-            task.wait(Config.NoclipInterval)
-            local char = LocalPlayer.Character
-            if char and Farming and (ActivePlayerTween or ActiveFollowTween or CurrentTarget or CurrentMode == "VASES") then
-                for _, object in ipairs(char:GetDescendants()) do
-                    if object:IsA("BasePart") and object.CanCollide then
-                        object.CanCollide = false
+        while task.wait(Config.NoclipInterval) do
+            if Farming then
+                local root = HumanoidRootPart()
+                if root then
+                    local bodyClip = root:FindFirstChild("BodyClip")
+                    if not bodyClip then
+                        bodyClip = Instance.new("BodyVelocity")
+                        bodyClip.Name = "BodyClip"
+                        bodyClip.MaxForce = Vector3.new(100000, 100000, 100000)
+                        bodyClip.Velocity = Vector3.zero
+                        bodyClip.Parent = root
+                    elseif not SkillCasting then
+                        bodyClip.MaxForce = Vector3.new(100000, 100000, 100000)
+                        bodyClip.Velocity = Vector3.zero
                     end
                 end
             end
@@ -2741,469 +2396,291 @@ local function SetupCharacterSupport()
     end)
 end
 
--- Stable bring controller.
--- Chỉ gom quái cùng loại với CurrentTarget, lấy CurrentTarget làm anchor cố định.
--- Không tính average động, không tween mob chồng, không dùng các thủ thuật ownership/animation cũ.
-GhostM1.BringState = {
-    Anchor = nil,
-    AnchorPosition = nil,
-    NextSlot = 1,
-    SlotOf = setmetatable({}, {__mode = "k"}),
-    Tracked = setmetatable({}, {__mode = "k"}),
-    PendingAt = setmetatable({}, {__mode = "k"}),
-    Active = setmetatable({}, {__mode = "k"}),
-    VerifiedAt = setmetatable({}, {__mode = "k"}),
-    LastMoveAt = setmetatable({}, {__mode = "k"}),
-}
+local ActiveMobTweens = setmetatable({}, {__mode = "k"})
 
-local function RestoreBroughtMob(root, state)
-    if not state then return end
-    pcall(function()
-        if root and root.Parent and state.CanCollide ~= nil then
-            root.CanCollide = state.CanCollide
+local function TweenObject(object, targetCF, speed)
+    speed = speed or Config.BringTweenSpeed or 300
+
+    if not object or not object.Parent or not targetCF then
+        return
+    end
+
+    local distance = (targetCF.Position - object.Position).Magnitude
+    if distance <= 3 then
+        local oldTween = ActiveMobTweens[object]
+        if oldTween then
+            pcall(function()
+                oldTween:Cancel()
+            end)
+            ActiveMobTweens[object] = nil
         end
-    end)
-end
-
-GhostM1.ResetBringState = function()
-    if not GhostM1.BringState then return end
-    for root, state in pairs(GhostM1.BringState.Tracked) do
-        RestoreBroughtMob(root, state)
+        object.CFrame = targetCF
+        return
     end
 
-    GhostM1.BringState.Anchor = nil
-    GhostM1.BringState.AnchorPosition = nil
-    GhostM1.BringState.NextSlot = 1
-    GhostM1.BringState.SlotOf = setmetatable({}, {__mode = "k"})
-    GhostM1.BringState.Tracked = setmetatable({}, {__mode = "k"})
-    GhostM1.BringState.PendingAt = setmetatable({}, {__mode = "k"})
-    GhostM1.BringState.Active = setmetatable({}, {__mode = "k"})
-    GhostM1.BringState.VerifiedAt = setmetatable({}, {__mode = "k"})
-    GhostM1.BringState.LastMoveAt = setmetatable({}, {__mode = "k"})
-end
-
-local function TrackBroughtMob(root)
-    local state = GhostM1.BringState.Tracked[root]
-    if state then return state end
-
-    state = {}
-    pcall(function() state.CanCollide = root.CanCollide end)
-    GhostM1.BringState.Tracked[root] = state
-    return state
-end
-
-local function CanControlMob(root, distanceFromPlayer)
-    if type(isnetworkowner) == "function" then
-        local ok, owned = pcall(isnetworkowner, root)
-        return ok and owned == true
+    -- Hủy tween cũ trước khi tạo tween mới để không chồng hàng chục tween trên cùng một mob.
+    local oldTween = ActiveMobTweens[object]
+    if oldTween then
+        pcall(function()
+            oldTween:Cancel()
+        end)
     end
 
-    -- Executor không có isnetworkowner: chỉ fallback với quái rất gần để giảm desync/security risk.
-    return distanceFromPlayer <= Config.BringFallbackOwnershipDistance
-end
-
-local function GetBringSlot(enemy)
-    local slot = GhostM1.BringState.SlotOf[enemy]
-    if slot then return slot end
-
-    slot = GhostM1.BringState.NextSlot
-    GhostM1.BringState.NextSlot = GhostM1.BringState.NextSlot + 1
-    GhostM1.BringState.SlotOf[enemy] = slot
-    return slot
-end
-
-local function GetBringOffset(slot)
-    local perRing = 6
-    local ring = math.floor((slot - 1) / perRing) + 1
-    local index = (slot - 1) % perRing
-    local radius = math.min(Config.BringMaxRadius, ring * Config.BringSpacing)
-    local angle = (math.pi * 2 / perRing) * index
-
-    return Vector3.new(
-        math.cos(angle) * radius,
-        0,
-        math.sin(angle) * radius
+    local duration = distance / math.max(speed, 1)
+    local tween = TweenService:Create(
+        object,
+        TweenInfo.new(duration, Enum.EasingStyle.Linear),
+        {CFrame = targetCF}
     )
-end
+    ActiveMobTweens[object] = tween
 
-local function FreezeBroughtMob(root)
-    TrackBroughtMob(root)
-
-    -- Chỉ khóa vật lý phần root. Không đổi WalkSpeed/JumpPower/AutoRotate/State
-    -- vì các state Humanoid bị giữ sai sau nhiều vòng có thể tạo mob ghost phía client.
-    pcall(function()
-        root.CanCollide = false
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
+    tween.Completed:Connect(function()
+        if ActiveMobTweens[object] == tween then
+            ActiveMobTweens[object] = nil
+        end
     end)
+
+    tween:Play()
 end
 
-local function RestoreInactiveBroughtMobs(activeRoots, activeEnemies)
-    for root, state in pairs(GhostM1.BringState.Tracked) do
-        if not activeRoots[root] then
-            RestoreBroughtMob(root, state)
-            GhostM1.BringState.Tracked[root] = nil
-        end
-    end
-
-    for enemy in pairs(GhostM1.BringState.Active) do
-        if not activeEnemies[enemy] then
-            GhostM1.BringState.Active[enemy] = nil
-            GhostM1.BringState.VerifiedAt[enemy] = nil
-            if GhostM1.BringState.LastMoveAt then
-                GhostM1.BringState.LastMoveAt[enemy] = nil
-            end
-        end
-    end
-    for enemy in pairs(GhostM1.BringState.PendingAt) do
-        if not activeEnemies[enemy] then
-            GhostM1.BringState.PendingAt[enemy] = nil
-        end
-    end
-end
-
+-- Gom theo cơ chế của buy+farmtalon:
+-- tính vị trí trung bình theo tên quái rồi tween các quái cùng loại về một cụm.
 local function SetupBringMobs()
     if not Config.BringMobs then
         return
     end
 
     task.spawn(function()
-        while RuntimeAlive do
-            task.wait(Config.BringMobInterval)
+        local lastSimulationRadius = 0
 
-            local target = CurrentTarget
-            local targetHum = target and target:FindFirstChildOfClass("Humanoid")
-            local targetRoot = target and target:FindFirstChild("HumanoidRootPart")
-            local playerRoot = HumanoidRootPart()
-            local enemiesFolder = Workspace:FindFirstChild("Enemies")
+        while task.wait(Config.BringMobInterval) do
+            if CurrentMode == "MOBS" and not SkillCasting then
+                local root = HumanoidRootPart()
+                local enemiesFolder = Workspace:FindFirstChild("Enemies")
 
-            local canBring = CurrentMode == "MOBS"
-                and tick() >= GhostM1.Telemetry.BringPausedUntil
-                and not SkillCasting
-                and TeamReady
-                and playerRoot
-                and enemiesFolder
-                and target
-                and target.Parent
-                and IsTikiMob(target)
-                and targetHum
-                and targetRoot
-                and targetHum.Health > 0
-                and not GhostM1.ShouldFinishSingleTarget(target, targetHum)
-
-            if not canBring then
-                if GhostM1.BringState.Anchor or next(GhostM1.BringState.Tracked) then
-                    GhostM1.ResetBringState()
-                end
-            else
-                local playerToAnchor = (playerRoot.Position - targetRoot.Position).Magnitude
-                if playerToAnchor > Config.BringActivationDistance then
-                    if GhostM1.BringState.Anchor or next(GhostM1.BringState.Tracked) then
-                        GhostM1.ResetBringState()
-                    end
-                else
-                    if GhostM1.BringState.Anchor ~= target then
-                        GhostM1.ResetBringState()
-                        GhostM1.BringState.Anchor = target
-                        GhostM1.BringState.AnchorPosition = targetRoot.Position
-                    elseif not GhostM1.BringState.AnchorPosition
-                        or (targetRoot.Position - GhostM1.BringState.AnchorPosition).Magnitude >= 6
-                    then
-                        GhostM1.BringState.AnchorPosition = targetRoot.Position
+                if root and enemiesFolder then
+                    if tick() - lastSimulationRadius >= 1 then
+                        lastSimulationRadius = tick()
+                        pcall(function()
+                            setscriptable(LocalPlayer, "SimulationRadius", true)
+                        end)
+                        pcall(function()
+                            sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge)
+                        end)
                     end
 
-                    local anchorPosition = GhostM1.BringState.AnchorPosition or targetRoot.Position
-                    local wantedName = BaseEnemyName(target.Name)
-                    local candidates = {}
+                    local enemies = enemiesFolder:GetChildren()
+                    local groups = {}
 
-                    for _, enemy in ipairs(enemiesFolder:GetChildren()) do
-                        if IsTikiMob(enemy) and BaseEnemyName(enemy.Name) == wantedName then
+                    -- Một lượt duy nhất để tính tổng/vị trí trung bình, tránh O(n^2) như bản nguồn.
+                    for _, enemy in ipairs(enemies) do
+                        if IsTikiMob(enemy) then
                             local hum = enemy:FindFirstChildOfClass("Humanoid")
                             local enemyRoot = enemy:FindFirstChild("HumanoidRootPart")
 
-                            if hum and enemyRoot and hum.Health > 0 then
-                                local distanceToAnchor = (enemyRoot.Position - anchorPosition).Magnitude
-                                local distanceToPlayer = (enemyRoot.Position - playerRoot.Position).Magnitude
-                                local verticalDelta = math.abs(enemyRoot.Position.Y - anchorPosition.Y)
+                            if hum and enemyRoot and hum.Health > 0
+                                and (enemyRoot.Position - root.Position).Magnitude <= Config.BringDistance
+                            then
+                                local key = BaseEnemyName(enemy.Name)
+                                local group = groups[key]
 
-                                if distanceToAnchor <= Config.BringDistance
-                                    and distanceToPlayer <= (Config.BringDistance + Config.BringActivationDistance)
-                                    and verticalDelta <= Config.BringMaxVerticalDelta
-                                    and CanControlMob(enemyRoot, distanceToPlayer)
-                                then
-                                    candidates[#candidates + 1] = {
-                                        Enemy = enemy,
-                                        Humanoid = hum,
-                                        Root = enemyRoot,
-                                        Distance = distanceToAnchor,
-                                        DistanceToPlayer = distanceToPlayer,
-                                        IsAnchor = enemy == target,
+                                if not group then
+                                    group = {
+                                        PositionSum = Vector3.zero,
+                                        Count = 0,
+                                        Members = {}
                                     }
+                                    groups[key] = group
                                 end
+
+                                group.PositionSum = group.PositionSum + enemyRoot.Position
+                                group.Count = group.Count + 1
+                                group.Members[#group.Members + 1] = {
+                                    Humanoid = hum,
+                                    Root = enemyRoot
+                                }
                             end
                         end
                     end
 
-                    table.sort(candidates, function(a, b)
-                        if a.IsAnchor ~= b.IsAnchor then
-                            return a.IsAnchor
-                        end
-                        return a.Distance < b.Distance
-                    end)
+                    for _, group in pairs(groups) do
+                        if group.Count > 1 then
+                            local averagePosition = group.PositionSum / group.Count
+                            local targetCF = CFrame.new(averagePosition)
 
-                    local activeRoots = {}
-                    local activeEnemies = {}
-                    local limit = math.min(#candidates, Config.MaxBringMobsPerTick)
-                    local now = tick()
+                            for _, member in ipairs(group.Members) do
+                                local hum = member.Humanoid
+                                local enemyRoot = member.Root
 
-                    for index = 1, limit do
-                        local data = candidates[index]
-                        local enemy = data.Enemy
-                        local hum = data.Humanoid
-                        local enemyRoot = data.Root
+                                if hum.Parent and enemyRoot.Parent and hum.Health > 0 then
+                                    local distance = (enemyRoot.Position - averagePosition).Magnitude
 
-                        if enemy.Parent and hum.Parent and enemyRoot.Parent and hum.Health > 0 then
-                            activeEnemies[enemy] = true
-
-                            if enemy == target then
-                                -- Anchor thật không bị đổi CFrame hay khóa Humanoid.
-                                -- Nó luôn là base hit đầu tiên và là fallback đánh đơn.
-                                GhostM1.BringState.Active[enemy] = true
-                                GhostM1.BringState.VerifiedAt[enemy] = now
-                            else
-                                activeRoots[enemyRoot] = true
-                                local slot = GetBringSlot(enemy)
-                                local desiredPosition = anchorPosition + GetBringOffset(slot)
-                                local distanceToSlot = (enemyRoot.Position - desiredPosition).Magnitude
-
-                                if distanceToSlot > Config.BringSnapTolerance then
-                                    GhostM1.BringState.Active[enemy] = nil
-                                    GhostM1.BringState.VerifiedAt[enemy] = nil
-
-                                    local lastMoveAt = GhostM1.BringState.LastMoveAt[enemy] or 0
-                                    if now - lastMoveAt >= Config.BringMoveInterval
-                                        and CanControlMob(enemyRoot, data.DistanceToPlayer)
-                                    then
-                                        GhostM1.BringState.LastMoveAt[enemy] = now
-                                        GhostM1.BringState.PendingAt[enemy] = now
-                                        FreezeBroughtMob(enemyRoot)
+                                    if distance > 3 and distance <= Config.BringDistance then
                                         pcall(function()
-                                            enemyRoot.CFrame = CFrame.lookAt(desiredPosition, anchorPosition)
+                                            enemyRoot.CanCollide = false
+                                            enemyRoot.AssemblyLinearVelocity = Vector3.zero
+                                            enemyRoot.AssemblyAngularVelocity = Vector3.zero
+
+                                            local animator = hum:FindFirstChild("Animator")
+                                            if animator then
+                                                animator:Destroy()
+                                            end
+
+                                            TweenObject(enemyRoot, targetCF, Config.BringTweenSpeed)
                                         end)
                                     end
-                                else
-                                    local pendingAt = GhostM1.BringState.PendingAt[enemy]
-                                    if not pendingAt then
-                                        GhostM1.BringState.PendingAt[enemy] = now
-                                    elseif now - pendingAt >= Config.BringVerifyDelay
-                                        and CanControlMob(enemyRoot, data.DistanceToPlayer)
-                                    then
-                                        GhostM1.BringState.Active[enemy] = true
-                                        GhostM1.BringState.VerifiedAt[enemy] = now
-                                    end
                                 end
                             end
                         end
                     end
-
-                    RestoreInactiveBroughtMobs(activeRoots, activeEnemies)
                 end
             end
         end
-
-        GhostM1.ResetBringState()
     end)
-end
-
-local function NormalizeTeamName(value)
-    value = tostring(value or "Marines")
-    if value ~= "Marines" and value ~= "Pirates" then
-        return "Marines"
-    end
-    return value
-end
-
-local function CurrentTeamName()
-    local team = LocalPlayer.Team
-    return team and team.Name or nil
-end
-
-local function IsDesiredTeam()
-    return CurrentTeamName() == NormalizeTeamName(Config.Team)
-end
-
-local function TryTeamUI(teamName)
-    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-    if not playerGui then return false end
-
-    local bestButton = nil
-    for _, object in ipairs(playerGui:GetDescendants()) do
-        if object:IsA("TextButton") and object.Visible then
-            local name = string.lower(tostring(object.Name or ""))
-            local label = string.lower(tostring(object.Text or ""))
-            local wanted = string.lower(teamName)
-            if name == wanted or label == wanted or string.find(name, wanted, 1, true) or string.find(label, wanted, 1, true) then
-                bestButton = object
-                break
-            end
-        end
-    end
-
-    if not bestButton then return false end
-
-    if type(firesignal) == "function" then
-        local ok = pcall(function() firesignal(bestButton.Activated) end)
-        if ok then return true end
-    end
-
-    return pcall(function()
-        local x = bestButton.AbsolutePosition.X + bestButton.AbsoluteSize.X / 2
-        local y = bestButton.AbsolutePosition.Y + bestButton.AbsoluteSize.Y / 2
-        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
-        task.wait(0.08)
-        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
-    end)
-end
-
-local function EnsureTeamSelected(maxWait)
-    if IsDesiredTeam() then
-        TeamReady = true
-        return true
-    end
-    if TeamSetupBusy then
-        return TeamReady
-    end
-
-    TeamSetupBusy = true
-    local teamName = NormalizeTeamName(Config.Team)
-    Config.Team = teamName
-    local started = tick()
-    local attempt = 0
-
-    while RuntimeAlive and not IsDesiredTeam() and tick() - started < (maxWait or Config.TeamMaxWait) do
-        attempt = attempt + 1
-        local commf = CommF()
-        if commf then
-            pcall(function()
-                commf:InvokeServer("SetTeam", teamName)
-            end)
-        end
-
-        task.wait(0.45)
-        if not IsDesiredTeam() then
-            TryTeamUI(teamName)
-        end
-
-        local remaining = Config.TeamRetryInterval - 0.45
-        if remaining > 0 then task.wait(remaining) end
-    end
-
-    TeamReady = IsDesiredTeam()
-    TeamSetupBusy = false
-
-    if TeamReady then
-        warn("[Auto Tyrant] Team loaded: " .. tostring(CurrentTeamName()))
-    else
-        warn("[Auto Tyrant] Chưa load được team sau " .. tostring(attempt) .. " lần; sẽ retry nền")
-    end
-
-    return TeamReady
-end
-
-local function EnsureSea3()
-    if not TeamReady then return false end
-
-    local mapName = Workspace:GetAttribute("MAP")
-    if mapName == nil or mapName == "Sea3" then
-        return true
-    end
-
-    for _ = 1, Config.TravelMaxAttempts do
-        local commf = CommF()
-        if commf then
-            pcall(function() commf:InvokeServer("TravelZou") end)
-        end
-        task.wait(Config.TravelRetryInterval)
-        mapName = Workspace:GetAttribute("MAP")
-        if mapName == nil or mapName == "Sea3" then
-            return true
-        end
-    end
-
-    return false
-end
-
-
-function GhostM1.WaitForStartupReady()
-    Farming = false
-    SetStatus("Đang chọn team " .. NormalizeTeamName(Config.Team))
-
-    while RuntimeAlive do
-        if not IsDesiredTeam() then
-            EnsureTeamSelected(math.min(12, Config.TeamMaxWait))
-        else
-            TeamReady = true
-        end
-
-        if TeamReady then
-            local char = LocalPlayer.Character
-            local hum = char and char:FindFirstChildOfClass("Humanoid")
-            local root = char and char:FindFirstChild("HumanoidRootPart")
-            local inWorld = char and (
-                char:IsDescendantOf(Workspace)
-                or (Workspace:FindFirstChild("Characters") and char:IsDescendantOf(Workspace.Characters))
-            )
-
-            if hum and root and hum.Health > 0 and inWorld then
-                EnsureSea3()
-                Farming = true
-                SetStatus("Team đã load - bắt đầu script")
-                return true
-            end
-
-            SetStatus("Đã chọn team - đang chờ Character load")
-        end
-
-        task.wait(0.75)
-    end
-
-    return false
 end
 
 local function SetupTeamAndSea()
-    task.spawn(function()
-        while RuntimeAlive do
-            task.wait(Config.TeamBackgroundRetry)
-            if not IsDesiredTeam() then
-                TeamReady = false
-                EnsureTeamSelected(math.min(12, Config.TeamMaxWait))
-            else
-                TeamReady = true
+    local wantedTeam = tostring(Config.Team or "Marines")
+    if wantedTeam == "Pirate" then wantedTeam = "Pirates" end
+    if wantedTeam ~= "Marines" and wantedTeam ~= "Pirates" then
+        wantedTeam = "Marines"
+    end
+    Config.Team = wantedTeam
+
+    Farming = false
+    ENV.__TYRANT_TRF_READY = false
+
+    local function HasCorrectTeam()
+        local teamObject = LocalPlayer.Team
+        return teamObject ~= nil and tostring(teamObject.Name) == wantedTeam
+    end
+
+    local function CharacterReady()
+        local gui = LocalPlayer:FindFirstChild("PlayerGui")
+        local loadingScreen = gui and gui:FindFirstChild("LoadingScreen")
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        return not loadingScreen
+            and char ~= nil
+            and hum ~= nil
+            and hum.Health > 0
+            and root ~= nil
+            and backpack ~= nil
+            and char:IsDescendantOf(Workspace)
+    end
+
+    local function ClickChooseTeamButton()
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+        if not playerGui then return false end
+
+        local wantedWord = wantedTeam == "Marines" and "marine" or "pirate"
+        local clicked = false
+        for _, object in ipairs(playerGui:GetDescendants()) do
+            if object:IsA("GuiButton") then
+                local label = string.lower(tostring(object.Name or ""))
+                if object:IsA("TextButton") then
+                    label = label .. " " .. string.lower(tostring(object.Text or ""))
+                end
+
+                if string.find(label, wantedWord, 1, true) then
+                    local ok = pcall(function()
+                        if type(firesignal) == "function" then
+                            firesignal(object.Activated)
+                        else
+                            object:Activate()
+                        end
+                    end)
+                    clicked = clicked or ok
+                end
             end
         end
-    end)
+        return clicked
+    end
 
+    local function EnsureTeamAndCharacter()
+        local attempt = 0
+        while not HasCorrectTeam() do
+            attempt = attempt + 1
+            SetStatus(string.format("Đang chọn team %s (lần %d)", wantedTeam, attempt))
+
+            local remote = CommF()
+            if remote then
+                pcall(function()
+                    remote:InvokeServer("SetTeam", wantedTeam)
+                end)
+            end
+
+            if not HasCorrectTeam() then
+                pcall(ClickChooseTeamButton)
+            end
+
+            task.wait(math.min(2, 0.55 + attempt * 0.08))
+        end
+
+        while not CharacterReady() do
+            SetStatus("Đã chọn team - đang chờ Character load hoàn chỉnh")
+            task.wait(0.5)
+        end
+
+        return true
+    end
+
+    EnsureTeamAndCharacter()
+
+    -- Giữ đúng hành vi bản trf: xác nhận team xong mới gọi TravelZou.
+    if Workspace:GetAttribute("MAP") and Workspace:GetAttribute("MAP") ~= "Sea3" then
+        SetStatus("Đã chọn team - đang sang Sea 3")
+        local remote = CommF()
+        if remote then
+            pcall(function()
+                remote:InvokeServer("TravelZou")
+            end)
+        end
+        task.wait(1)
+    end
+
+    ENV.__TYRANT_TRF_READY = true
+    Farming = true
+    SetStatus("Team + Character đã sẵn sàng - bắt đầu Auto Tyrant")
+
+    -- Watchdog nhẹ: nếu team/Character mất sau respawn thì dừng toàn bộ farm trước,
+    -- khôi phục xong mới bật lại. Không tạo thêm attack/bring loop.
     task.spawn(function()
-        while RuntimeAlive do
-            task.wait(Config.BusoInterval)
-            if TeamReady and Config.AutoBuso then
+        while task.wait(2) do
+            if not HasCorrectTeam() or not CharacterReady() then
+                Farming = false
+                ENV.__TYRANT_TRF_READY = false
+                pcall(StopPlayerTween)
+                SetStatus("Mất team/Character - tạm dừng và khôi phục")
+                EnsureTeamAndCharacter()
+                ENV.__TYRANT_TRF_READY = true
+                Farming = true
+                SetStatus("Đã khôi phục team/Character - tiếp tục chạy")
+            end
+
+            if Farming and Config.AutoBuso then
                 local char = LocalPlayer.Character
-                local hum = char and char:FindFirstChildOfClass("Humanoid")
-                if char and hum and hum.Health > 0 and not char:FindFirstChild("HasBuso") then
-                    local commf = CommF()
-                    if commf then
-                        pcall(function() commf:InvokeServer("Buso") end)
+                if char and not char:FindFirstChild("HasBuso") then
+                    local remote = CommF()
+                    if remote then
+                        pcall(function()
+                            remote:InvokeServer("Buso")
+                        end)
                     end
                 end
             end
         end
     end)
 
-    return TeamReady
+    return true
 end
 
-GhostM1.WaitForStartupReady()
-SetupTeamAndSea()
+if not SetupTeamAndSea() then
+    ENV.__TYRANT_TRF_STABLE_RUNNING = false
+    return
+end
 SetupEyeWatcher()
 SetupCharacterSupport()
 SetupBringMobs()
@@ -3378,9 +2855,7 @@ do
                     end
                     local rname = ENV.RaceTarget
                     raceReady = tostring(RaceReady)
-                    if FragmentCompletedStatus then
-                        raceReady = "Completed-fragment"
-                    elseif rname and rname ~= false and race ~= "?" then
+                    if rname and rname ~= false and race ~= "?" then
                         if race == rname then raceReady = "READY" end
                     elseif rname == false then
                         raceReady = "off"
@@ -3398,8 +2873,7 @@ do
             end
 
             task.spawn(function()
-                while RuntimeAlive do
-                    task.wait(Config.UIRefreshInterval)
+                while task.wait(0.25) do
                     pcall(render)
                 end
             end)
@@ -3432,49 +2906,41 @@ then
     BuyDragonTalon()
 end
 
-while RuntimeAlive do
-    task.wait(Config.MainLoopInterval)
-    MaybeCheckFragment()
-
-    local playerHum = Humanoid()
-
-    if not TeamReady or not IsDesiredTeam() then
-        TeamReady = false
-        Farming = false
-        SetStatus("Mất team - tạm dừng script và chọn lại " .. NormalizeTeamName(Config.Team))
-        EnsureTeamSelected(math.min(10, Config.TeamMaxWait))
-        if TeamReady then
-            GhostM1.WaitForStartupReady()
-        end
+while task.wait(0.15) do
+    if not Farming or not ENV.__TYRANT_TRF_READY then
+        SetStatus("Đang chờ team/Character sẵn sàng")
         task.wait(0.5)
-    elseif not playerHum or playerHum.Health <= 0 then
-        Farming = false
-        SetStatus("Đang chờ nhân vật hồi sinh")
-        task.wait(1)
-        GhostM1.WaitForStartupReady()
     else
-        Farming = true
-        local tyrant = FindTyrant()
+            MaybeCheckFragment()
 
-        if tyrant then
-            SetStatus("Đã tìm thấy Tyrant - đang đánh boss")
-            FarmEnemy(tyrant, true)
-        elseif AreTyrantEyesReady() then
-            BreakTyrantVases()
-        else
-            CurrentMode = "MOBS"
-            CurrentTarget = nil
-            local activeEyes = GetTyrantEyeProgress()
-            SetStatus(string.format("Đang farm NPC Tiki - mắt đỏ %d/4", activeEyes))
-            EnsureWeapon()
+            local playerHum = Humanoid()
 
-            local mob = GetNearestTikiMob()
-            if mob then
-                FarmEnemy(mob, false)
+            if not playerHum or playerHum.Health <= 0 then
+                SetStatus("Đang chờ nhân vật hồi sinh")
+                task.wait(1)
             else
-                TweenTo(TIKI_CENTER, Config.TweenSpeed)
-                task.wait(0.8)
+                local tyrant = FindTyrant()
+
+                if tyrant then
+                    SetStatus("Đã tìm thấy Tyrant - đang đánh boss")
+                    FarmEnemy(tyrant, true)
+                elseif AreTyrantEyesReady() then
+                    BreakTyrantVases()
+                else
+                    CurrentMode = "MOBS"
+                    CurrentTarget = nil
+                    local activeEyes = GetTyrantEyeProgress()
+                    SetStatus(string.format("Đang farm NPC Tiki - mắt đỏ %d/4", activeEyes))
+                    EnsureWeapon()
+
+                    local mob = GetNearestTikiMob()
+                    if mob then
+                        FarmEnemy(mob, false)
+                    else
+                        TweenTo(TIKI_CENTER, Config.TweenSpeed)
+                        task.wait(0.8)
+                    end
+                end
             end
-        end
     end
 end
