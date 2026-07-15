@@ -169,17 +169,20 @@ local TeamReady = false
 local TeamSetupBusy = false
 local FastAttackBusy = false
 
--- Forward state cho anti-ghost M1 / bring verification.
-local BringState = nil
-local ResetBringState = nil
-local AttackTelemetry = {
-    SentCount = 0,
-    LastSentAt = 0,
-    LastNativeM1At = 0,
-    SingleTargetUntil = 0,
-    BringPausedUntil = 0,
-    LastRecoveryAt = 0,
-    BlockedSince = 0,
+-- State anti-ghost M1 / bring verification được gom vào 1 module table.
+-- File gốc đã gần giới hạn 200 local của Lua/Luau; không khai báo thêm nhiều local top-level.
+local GhostM1 = {
+    BringState = nil,
+    ResetBringState = nil,
+    Telemetry = {
+        SentCount = 0,
+        LastSentAt = 0,
+        LastNativeM1At = 0,
+        SingleTargetUntil = 0,
+        BringPausedUntil = 0,
+        LastRecoveryAt = 0,
+        BlockedSince = 0,
+    },
 }
 
 -- Cờ chỉ chạy ghi file hoàn thành đúng 1 lần, tránh spam file/log.
@@ -1729,17 +1732,17 @@ local function GetVaseStandCFrame(targetObject, keyName)
 end
 
 
-local function IsVerifiedBroughtEnemy(enemy, enemyRoot)
+function GhostM1.IsVerifiedBroughtEnemy(enemy, enemyRoot)
     if enemy == CurrentTarget then
         return true
     end
 
-    if not BringState or not BringState.Active or not BringState.VerifiedAt then
+    if not GhostM1.BringState or not GhostM1.BringState.Active or not GhostM1.BringState.VerifiedAt then
         return false
     end
 
-    local verifiedAt = BringState.VerifiedAt[enemy]
-    if not BringState.Active[enemy]
+    local verifiedAt = GhostM1.BringState.VerifiedAt[enemy]
+    if not GhostM1.BringState.Active[enemy]
         or not verifiedAt
         or (tick() - verifiedAt) > Config.BringVerifiedTTL
     then
@@ -1769,7 +1772,7 @@ local function GetAttackTargets()
         return targets
     end
 
-    local singleTargetOnly = tick() < AttackTelemetry.SingleTargetUntil
+    local singleTargetOnly = tick() < GhostM1.Telemetry.SingleTargetUntil
 
     for _, folder in ipairs(GetEnemyFolders()) do
         for _, enemy in ipairs(folder:GetChildren()) do
@@ -1785,7 +1788,7 @@ local function GetAttackTargets()
                     -- Chỉ target thật + mob đã giữ ownership/sync ổn định mới được gửi RegisterHit.
                     valid = IsTikiMob(enemy)
                         and (not singleTargetOnly or enemy == CurrentTarget)
-                        and IsVerifiedBroughtEnemy(enemy, enemyRoot)
+                        and GhostM1.IsVerifiedBroughtEnemy(enemy, enemyRoot)
                 end
             end
 
@@ -1854,12 +1857,12 @@ local function LoadAttack()
             or (stun and tonumber(stun.Value) and tonumber(stun.Value) > 0)
             or (busy and busy.Value == true)
         if blocked then
-            if AttackTelemetry.BlockedSince <= 0 then
-                AttackTelemetry.BlockedSince = now
+            if GhostM1.Telemetry.BlockedSince <= 0 then
+                GhostM1.Telemetry.BlockedSince = now
             end
             return false
         end
-        AttackTelemetry.BlockedSince = 0
+        GhostM1.Telemetry.BlockedSince = 0
         if now - lastAttack < Config.AttackDelay then
             return false
         end
@@ -1902,8 +1905,8 @@ local function LoadAttack()
         FastAttackBusy = false
 
         if attackOK and hitOK then
-            AttackTelemetry.SentCount = AttackTelemetry.SentCount + 1
-            AttackTelemetry.LastSentAt = now
+            GhostM1.Telemetry.SentCount = GhostM1.Telemetry.SentCount + 1
+            GhostM1.Telemetry.LastSentAt = now
             return true
         end
         return false
@@ -1925,7 +1928,7 @@ local function LoadAttack()
 end
 
 
-local function RefreshEquippedToolForM1()
+function GhostM1.RefreshEquippedToolForM1()
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     local tool = char and char:FindFirstChildWhichIsA("Tool")
@@ -1941,9 +1944,9 @@ local function RefreshEquippedToolForM1()
     return ok
 end
 
-local function PulseNativeM1()
+function GhostM1.PulseNativeM1()
     local now = tick()
-    if now - AttackTelemetry.LastNativeM1At < Config.NativeM1FallbackInterval then
+    if now - GhostM1.Telemetry.LastNativeM1At < Config.NativeM1FallbackInterval then
         return false
     end
 
@@ -1951,36 +1954,36 @@ local function PulseNativeM1()
     local tool = char and char:FindFirstChildWhichIsA("Tool")
     if not tool then return false end
 
-    AttackTelemetry.LastNativeM1At = now
+    GhostM1.Telemetry.LastNativeM1At = now
     local ok = pcall(function()
         tool:Activate()
     end)
     return ok
 end
 
-local function StartGhostM1Recovery(reason, longPause)
+function GhostM1.StartRecovery(reason, longPause)
     local now = tick()
-    if now - AttackTelemetry.LastRecoveryAt < 1.0 then
+    if now - GhostM1.Telemetry.LastRecoveryAt < 1.0 then
         return false
     end
 
-    AttackTelemetry.LastRecoveryAt = now
-    AttackTelemetry.SingleTargetUntil = math.max(
-        AttackTelemetry.SingleTargetUntil,
+    GhostM1.Telemetry.LastRecoveryAt = now
+    GhostM1.Telemetry.SingleTargetUntil = math.max(
+        GhostM1.Telemetry.SingleTargetUntil,
         now + Config.GhostRecoveryDuration
     )
-    AttackTelemetry.BringPausedUntil = math.max(
-        AttackTelemetry.BringPausedUntil,
+    GhostM1.Telemetry.BringPausedUntil = math.max(
+        GhostM1.Telemetry.BringPausedUntil,
         now + (longPause and Config.GhostRecoveryLongPause or Config.GhostRecoveryDuration)
     )
 
-    if ResetBringState then
-        pcall(ResetBringState)
+    if GhostM1.ResetBringState then
+        pcall(GhostM1.ResetBringState)
     end
     pcall(StopFollowTween)
-    pcall(RefreshEquippedToolForM1)
-    AttackTelemetry.BlockedSince = 0
-    pcall(PulseNativeM1)
+    pcall(GhostM1.RefreshEquippedToolForM1)
+    GhostM1.Telemetry.BlockedSince = 0
+    pcall(GhostM1.PulseNativeM1)
     SetStatus("M1 không tụt máu - resync target, tạm dừng gom quái")
     warn("[Auto Tyrant][GhostM1] " .. tostring(reason))
     return true
@@ -1998,10 +2001,10 @@ local function NormalAttack(duration)
             fastUsed = ok and result == true
         end
 
-        if tick() < AttackTelemetry.SingleTargetUntil then
-            PulseNativeM1()
+        if tick() < GhostM1.Telemetry.SingleTargetUntil then
+            GhostM1.PulseNativeM1()
         elseif not fastUsed and tool then
-            PulseNativeM1()
+            GhostM1.PulseNativeM1()
         end
 
         task.wait(Config.AttackDelay)
@@ -2511,7 +2514,7 @@ local function FarmEnemy(enemy, isBoss)
     local stuckAt = tick()
     local previousHealth = hum.Health
     local noDamageSince = tick()
-    local sentAtLastDamage = AttackTelemetry.SentCount
+    local sentAtLastDamage = GhostM1.Telemetry.SentCount
     local ghostRecoveries = 0
 
     while enemy.Parent and hum.Parent and enemyRoot.Parent and hum.Health > 0 do
@@ -2541,25 +2544,25 @@ local function FarmEnemy(enemy, isBoss)
             previousHealth = hum.Health
             stuckAt = tick()
             noDamageSince = tick()
-            sentAtLastDamage = AttackTelemetry.SentCount
+            sentAtLastDamage = GhostM1.Telemetry.SentCount
             ghostRecoveries = 0
         else
-            local sentWithoutDamage = AttackTelemetry.SentCount - sentAtLastDamage
-            local blockedTooLong = AttackTelemetry.BlockedSince > 0
-                and (tick() - AttackTelemetry.BlockedSince) >= 2.5
+            local sentWithoutDamage = GhostM1.Telemetry.SentCount - sentAtLastDamage
+            local blockedTooLong = GhostM1.Telemetry.BlockedSince > 0
+                and (tick() - GhostM1.Telemetry.BlockedSince) >= 2.5
             if tick() - noDamageSince >= Config.GhostM1NoDamageTimeout
                 and (sentWithoutDamage >= 6 or blockedTooLong)
                 and CurrentMode == "MOBS"
             then
                 ghostRecoveries = ghostRecoveries + 1
-                StartGhostM1Recovery(
+                GhostM1.StartRecovery(
                     ("target=%s, sends=%d, blocked=%s, recovery=%d"):format(
                         tostring(enemy.Name), sentWithoutDamage, tostring(blockedTooLong), ghostRecoveries
                     ),
                     ghostRecoveries >= 2
                 )
                 noDamageSince = tick()
-                sentAtLastDamage = AttackTelemetry.SentCount
+                sentAtLastDamage = GhostM1.Telemetry.SentCount
                 NormalAttack(0.65)
             elseif tick() - stuckAt > 15 then
                 -- Watchdog tổng: làm mới follow nhưng không teleport target/quái.
@@ -2576,9 +2579,9 @@ local function FarmEnemy(enemy, isBoss)
     end
 
     StopFollowTween()
-    if ResetBringState then pcall(ResetBringState) end
-    AttackTelemetry.SingleTargetUntil = 0
-    AttackTelemetry.BringPausedUntil = 0
+    if GhostM1.ResetBringState then pcall(GhostM1.ResetBringState) end
+    GhostM1.Telemetry.SingleTargetUntil = 0
+    GhostM1.Telemetry.BringPausedUntil = 0
     CurrentTarget = nil
 end
 
@@ -2682,7 +2685,7 @@ end
 -- Stable bring controller.
 -- Chỉ gom quái cùng loại với CurrentTarget, lấy CurrentTarget làm anchor cố định.
 -- Không tính average động, không tween mob chồng, không dùng các thủ thuật ownership/animation cũ.
-BringState = {
+GhostM1.BringState = {
     Anchor = nil,
     AnchorPosition = nil,
     NextSlot = 1,
@@ -2702,29 +2705,29 @@ local function RestoreBroughtMob(root, state)
     end)
 end
 
-ResetBringState = function()
-    if not BringState then return end
-    for root, state in pairs(BringState.Tracked) do
+GhostM1.ResetBringState = function()
+    if not GhostM1.BringState then return end
+    for root, state in pairs(GhostM1.BringState.Tracked) do
         RestoreBroughtMob(root, state)
     end
 
-    BringState.Anchor = nil
-    BringState.AnchorPosition = nil
-    BringState.NextSlot = 1
-    BringState.SlotOf = setmetatable({}, {__mode = "k"})
-    BringState.Tracked = setmetatable({}, {__mode = "k"})
-    BringState.PendingAt = setmetatable({}, {__mode = "k"})
-    BringState.Active = setmetatable({}, {__mode = "k"})
-    BringState.VerifiedAt = setmetatable({}, {__mode = "k"})
+    GhostM1.BringState.Anchor = nil
+    GhostM1.BringState.AnchorPosition = nil
+    GhostM1.BringState.NextSlot = 1
+    GhostM1.BringState.SlotOf = setmetatable({}, {__mode = "k"})
+    GhostM1.BringState.Tracked = setmetatable({}, {__mode = "k"})
+    GhostM1.BringState.PendingAt = setmetatable({}, {__mode = "k"})
+    GhostM1.BringState.Active = setmetatable({}, {__mode = "k"})
+    GhostM1.BringState.VerifiedAt = setmetatable({}, {__mode = "k"})
 end
 
 local function TrackBroughtMob(root)
-    local state = BringState.Tracked[root]
+    local state = GhostM1.BringState.Tracked[root]
     if state then return state end
 
     state = {}
     pcall(function() state.CanCollide = root.CanCollide end)
-    BringState.Tracked[root] = state
+    GhostM1.BringState.Tracked[root] = state
     return state
 end
 
@@ -2739,12 +2742,12 @@ local function CanControlMob(root, distanceFromPlayer)
 end
 
 local function GetBringSlot(enemy)
-    local slot = BringState.SlotOf[enemy]
+    local slot = GhostM1.BringState.SlotOf[enemy]
     if slot then return slot end
 
-    slot = BringState.NextSlot
-    BringState.NextSlot = BringState.NextSlot + 1
-    BringState.SlotOf[enemy] = slot
+    slot = GhostM1.BringState.NextSlot
+    GhostM1.BringState.NextSlot = GhostM1.BringState.NextSlot + 1
+    GhostM1.BringState.SlotOf[enemy] = slot
     return slot
 end
 
@@ -2775,22 +2778,22 @@ local function FreezeBroughtMob(root)
 end
 
 local function RestoreInactiveBroughtMobs(activeRoots, activeEnemies)
-    for root, state in pairs(BringState.Tracked) do
+    for root, state in pairs(GhostM1.BringState.Tracked) do
         if not activeRoots[root] then
             RestoreBroughtMob(root, state)
-            BringState.Tracked[root] = nil
+            GhostM1.BringState.Tracked[root] = nil
         end
     end
 
-    for enemy in pairs(BringState.Active) do
+    for enemy in pairs(GhostM1.BringState.Active) do
         if not activeEnemies[enemy] then
-            BringState.Active[enemy] = nil
-            BringState.VerifiedAt[enemy] = nil
+            GhostM1.BringState.Active[enemy] = nil
+            GhostM1.BringState.VerifiedAt[enemy] = nil
         end
     end
-    for enemy in pairs(BringState.PendingAt) do
+    for enemy in pairs(GhostM1.BringState.PendingAt) do
         if not activeEnemies[enemy] then
-            BringState.PendingAt[enemy] = nil
+            GhostM1.BringState.PendingAt[enemy] = nil
         end
     end
 end
@@ -2811,7 +2814,7 @@ local function SetupBringMobs()
             local enemiesFolder = Workspace:FindFirstChild("Enemies")
 
             local canBring = CurrentMode == "MOBS"
-                and tick() >= AttackTelemetry.BringPausedUntil
+                and tick() >= GhostM1.Telemetry.BringPausedUntil
                 and not SkillCasting
                 and TeamReady
                 and playerRoot
@@ -2824,27 +2827,27 @@ local function SetupBringMobs()
                 and targetHum.Health > 0
 
             if not canBring then
-                if BringState.Anchor or next(BringState.Tracked) then
-                    ResetBringState()
+                if GhostM1.BringState.Anchor or next(GhostM1.BringState.Tracked) then
+                    GhostM1.ResetBringState()
                 end
             else
                 local playerToAnchor = (playerRoot.Position - targetRoot.Position).Magnitude
                 if playerToAnchor > Config.BringActivationDistance then
-                    if BringState.Anchor or next(BringState.Tracked) then
-                        ResetBringState()
+                    if GhostM1.BringState.Anchor or next(GhostM1.BringState.Tracked) then
+                        GhostM1.ResetBringState()
                     end
                 else
-                    if BringState.Anchor ~= target then
-                        ResetBringState()
-                        BringState.Anchor = target
-                        BringState.AnchorPosition = targetRoot.Position
-                    elseif not BringState.AnchorPosition
-                        or (targetRoot.Position - BringState.AnchorPosition).Magnitude >= 6
+                    if GhostM1.BringState.Anchor ~= target then
+                        GhostM1.ResetBringState()
+                        GhostM1.BringState.Anchor = target
+                        GhostM1.BringState.AnchorPosition = targetRoot.Position
+                    elseif not GhostM1.BringState.AnchorPosition
+                        or (targetRoot.Position - GhostM1.BringState.AnchorPosition).Magnitude >= 6
                     then
-                        BringState.AnchorPosition = targetRoot.Position
+                        GhostM1.BringState.AnchorPosition = targetRoot.Position
                     end
 
-                    local anchorPosition = BringState.AnchorPosition or targetRoot.Position
+                    local anchorPosition = GhostM1.BringState.AnchorPosition or targetRoot.Position
                     local wantedName = BaseEnemyName(target.Name)
                     local candidates = {}
 
@@ -2900,8 +2903,8 @@ local function SetupBringMobs()
                             if enemy == target then
                                 -- Anchor thật không bị đổi CFrame hay khóa Humanoid.
                                 -- Nó luôn là base hit đầu tiên và là fallback đánh đơn.
-                                BringState.Active[enemy] = true
-                                BringState.VerifiedAt[enemy] = now
+                                GhostM1.BringState.Active[enemy] = true
+                                GhostM1.BringState.VerifiedAt[enemy] = now
                             else
                                 activeRoots[enemyRoot] = true
                                 FreezeBroughtMob(enemyRoot)
@@ -2911,21 +2914,21 @@ local function SetupBringMobs()
                                 local distanceToSlot = (enemyRoot.Position - desiredPosition).Magnitude
 
                                 if distanceToSlot > Config.BringSnapTolerance then
-                                    BringState.Active[enemy] = nil
-                                    BringState.VerifiedAt[enemy] = nil
-                                    BringState.PendingAt[enemy] = now
+                                    GhostM1.BringState.Active[enemy] = nil
+                                    GhostM1.BringState.VerifiedAt[enemy] = nil
+                                    GhostM1.BringState.PendingAt[enemy] = now
                                     pcall(function()
                                         enemyRoot.CFrame = CFrame.lookAt(desiredPosition, anchorPosition)
                                     end)
                                 else
-                                    local pendingAt = BringState.PendingAt[enemy]
+                                    local pendingAt = GhostM1.BringState.PendingAt[enemy]
                                     if not pendingAt then
-                                        BringState.PendingAt[enemy] = now
+                                        GhostM1.BringState.PendingAt[enemy] = now
                                     elseif now - pendingAt >= Config.BringVerifyDelay
                                         and CanControlMob(enemyRoot, data.DistanceToPlayer)
                                     then
-                                        BringState.Active[enemy] = true
-                                        BringState.VerifiedAt[enemy] = now
+                                        GhostM1.BringState.Active[enemy] = true
+                                        GhostM1.BringState.VerifiedAt[enemy] = now
                                     end
                                 end
                             end
@@ -2937,7 +2940,7 @@ local function SetupBringMobs()
             end
         end
 
-        ResetBringState()
+        GhostM1.ResetBringState()
     end)
 end
 
