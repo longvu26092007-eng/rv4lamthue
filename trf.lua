@@ -31,7 +31,7 @@ ENV.TyrantConfig = ENV.TyrantConfig or {
     FastAttackInterval = 0.12,
     BreakableFullScanInterval = 1.75,
     BringMobInterval = 0.18,
-    BringDistance = 420,
+    BringDistance = 340,
     BringTweenSpeed = 300,
     NoclipInterval = 0.50,
     TyrantScanInterval = 0.25,
@@ -40,13 +40,13 @@ ENV.TyrantConfig = ENV.TyrantConfig or {
     -- Safe runtime: giảm remote spam và các thao tác dễ bị server đánh dấu.
     SafeMode = true,
     MaxFastAttackTargets = 6,
-    MaxBringMobsPerTick = 8,
-    BringActivationDistance = 190,
+    MaxBringMobsPerTick = 6,
+    BringActivationDistance = 155,
     BringFallbackOwnershipDistance = 120,
-    BringMaxVerticalDelta = 90,
-    BringSpacing = 2.25,
-    BringMaxRadius = 5.5,
-    BringSnapTolerance = 1.35,
+    BringMaxVerticalDelta = 65,
+    BringSpacing = 2.0,
+    BringMaxRadius = 4.5,
+    BringSnapTolerance = 1.10,
     TeamRetryInterval = 1.25,
     TeamMaxWait = 30,
     TeamBackgroundRetry = 5,
@@ -55,7 +55,15 @@ ENV.TyrantConfig = ENV.TyrantConfig or {
     TravelMaxAttempts = 4,
     MainLoopInterval = 0.25,
     UIRefreshInterval = 0.50,
-    RaceActionInterval = 5
+    RaceActionInterval = 5,
+
+    -- Ghost-M1 recovery: chỉ gom/quét hit các mob đã sync ổn định.
+    BringVerifyDelay = 0.35,
+    BringVerifiedTTL = 0.75,
+    GhostM1NoDamageTimeout = 3.25,
+    GhostRecoveryDuration = 2.25,
+    GhostRecoveryLongPause = 8,
+    NativeM1FallbackInterval = 0.32
 }
 
 -- Cấu hình ghi file khi đủ Race + Fragment.
@@ -85,19 +93,19 @@ Config.AttackDelay = math.max(0.10, tonumber(Config.AttackDelay) or 0.12)
 Config.FastAttackInterval = math.max(0.10, tonumber(Config.FastAttackInterval) or 0.12)
 Config.BreakableFullScanInterval = math.max(1.25, tonumber(Config.BreakableFullScanInterval) or 1.75)
 Config.BringMobInterval = math.min(0.35, math.max(0.15, tonumber(Config.BringMobInterval) or 0.18))
-Config.BringDistance = math.min(500, math.max(180, tonumber(Config.BringDistance) or 420))
+Config.BringDistance = math.min(380, math.max(160, tonumber(Config.BringDistance) or 340))
 Config.BringTweenSpeed = math.min(350, math.max(150, tonumber(Config.BringTweenSpeed) or 280))
 Config.NoclipInterval = math.max(0.40, tonumber(Config.NoclipInterval) or 0.50)
 Config.TyrantScanInterval = math.max(0.20, tonumber(Config.TyrantScanInterval) or 0.25)
 Config.MaxVaseTargets = math.max(12, tonumber(Config.MaxVaseTargets) or 30)
 Config.MaxFastAttackTargets = math.min(8, math.max(1, tonumber(Config.MaxFastAttackTargets) or 6))
-Config.MaxBringMobsPerTick = math.min(10, math.max(2, tonumber(Config.MaxBringMobsPerTick) or 8))
-Config.BringActivationDistance = math.min(260, math.max(80, tonumber(Config.BringActivationDistance) or 190))
+Config.MaxBringMobsPerTick = math.min(8, math.max(2, tonumber(Config.MaxBringMobsPerTick) or 6))
+Config.BringActivationDistance = math.min(210, math.max(70, tonumber(Config.BringActivationDistance) or 155))
 Config.BringFallbackOwnershipDistance = math.min(180, math.max(50, tonumber(Config.BringFallbackOwnershipDistance) or 120))
-Config.BringMaxVerticalDelta = math.min(160, math.max(35, tonumber(Config.BringMaxVerticalDelta) or 90))
-Config.BringSpacing = math.min(4, math.max(1.25, tonumber(Config.BringSpacing) or 2.25))
-Config.BringMaxRadius = math.min(8, math.max(3, tonumber(Config.BringMaxRadius) or 5.5))
-Config.BringSnapTolerance = math.min(2.5, math.max(0.75, tonumber(Config.BringSnapTolerance) or 1.35))
+Config.BringMaxVerticalDelta = math.min(100, math.max(30, tonumber(Config.BringMaxVerticalDelta) or 65))
+Config.BringSpacing = math.min(3.5, math.max(1.25, tonumber(Config.BringSpacing) or 2.0))
+Config.BringMaxRadius = math.min(6, math.max(3, tonumber(Config.BringMaxRadius) or 4.5))
+Config.BringSnapTolerance = math.min(2.0, math.max(0.65, tonumber(Config.BringSnapTolerance) or 1.10))
 Config.TeamRetryInterval = math.max(1, tonumber(Config.TeamRetryInterval) or 1.25)
 Config.TeamMaxWait = math.max(10, tonumber(Config.TeamMaxWait) or 30)
 Config.TeamBackgroundRetry = math.max(3, tonumber(Config.TeamBackgroundRetry) or 5)
@@ -107,6 +115,12 @@ Config.TravelMaxAttempts = math.max(1, tonumber(Config.TravelMaxAttempts) or 4)
 Config.MainLoopInterval = math.max(0.20, tonumber(Config.MainLoopInterval) or 0.25)
 Config.UIRefreshInterval = math.max(0.35, tonumber(Config.UIRefreshInterval) or 0.50)
 Config.RaceActionInterval = math.max(5, tonumber(Config.RaceActionInterval) or 5)
+Config.BringVerifyDelay = math.min(1.0, math.max(0.20, tonumber(Config.BringVerifyDelay) or 0.35))
+Config.BringVerifiedTTL = math.min(1.5, math.max(0.40, tonumber(Config.BringVerifiedTTL) or 0.75))
+Config.GhostM1NoDamageTimeout = math.min(8, math.max(2.0, tonumber(Config.GhostM1NoDamageTimeout) or 3.25))
+Config.GhostRecoveryDuration = math.min(5, math.max(1.25, tonumber(Config.GhostRecoveryDuration) or 2.25))
+Config.GhostRecoveryLongPause = math.min(15, math.max(5, tonumber(Config.GhostRecoveryLongPause) or 8))
+Config.NativeM1FallbackInterval = math.min(0.8, math.max(0.22, tonumber(Config.NativeM1FallbackInterval) or 0.32))
 if Config.SafeMode == nil then Config.SafeMode = true end
 
 repeat
@@ -154,6 +168,19 @@ local RuntimeAlive = true
 local TeamReady = false
 local TeamSetupBusy = false
 local FastAttackBusy = false
+
+-- Forward state cho anti-ghost M1 / bring verification.
+local BringState = nil
+local ResetBringState = nil
+local AttackTelemetry = {
+    SentCount = 0,
+    LastSentAt = 0,
+    LastNativeM1At = 0,
+    SingleTargetUntil = 0,
+    BringPausedUntil = 0,
+    LastRecoveryAt = 0,
+    BlockedSince = 0,
+}
 
 -- Cờ chỉ chạy ghi file hoàn thành đúng 1 lần, tránh spam file/log.
 local FragmentFolderLock = false
@@ -1702,6 +1729,33 @@ local function GetVaseStandCFrame(targetObject, keyName)
 end
 
 
+local function IsVerifiedBroughtEnemy(enemy, enemyRoot)
+    if enemy == CurrentTarget then
+        return true
+    end
+
+    if not BringState or not BringState.Active or not BringState.VerifiedAt then
+        return false
+    end
+
+    local verifiedAt = BringState.VerifiedAt[enemy]
+    if not BringState.Active[enemy]
+        or not verifiedAt
+        or (tick() - verifiedAt) > Config.BringVerifiedTTL
+    then
+        return false
+    end
+
+    if type(isnetworkowner) == "function" then
+        local ok, owned = pcall(isnetworkowner, enemyRoot)
+        if not ok or owned ~= true then
+            return false
+        end
+    end
+
+    return true
+end
+
 local function GetAttackTargets()
     local root = HumanoidRootPart()
     local targets = {}
@@ -1715,29 +1769,45 @@ local function GetAttackTargets()
         return targets
     end
 
+    local singleTargetOnly = tick() < AttackTelemetry.SingleTargetUntil
+
     for _, folder in ipairs(GetEnemyFolders()) do
         for _, enemy in ipairs(folder:GetChildren()) do
             local hum = enemy:FindFirstChildOfClass("Humanoid")
             local enemyRoot = enemy:FindFirstChild("HumanoidRootPart")
-            local head = enemy:FindFirstChild("Head")
             local valid = false
 
-            if hum and enemyRoot and hum.Health > 0 then
+            if hum and enemyRoot and hum.Health > 0 and enemyRoot:IsDescendantOf(Workspace) then
                 if CurrentMode == "BOSS" then
                     valid = enemy == CurrentTarget or IsTyrant(enemy)
                 elseif CurrentMode == "MOBS" then
+                    -- Không quét toàn bộ Tiki mob theo hình ảnh client nữa.
+                    -- Chỉ target thật + mob đã giữ ownership/sync ổn định mới được gửi RegisterHit.
                     valid = IsTikiMob(enemy)
+                        and (not singleTargetOnly or enemy == CurrentTarget)
+                        and IsVerifiedBroughtEnemy(enemy, enemyRoot)
                 end
             end
 
             if valid and (enemyRoot.Position - root.Position).Magnitude <= Config.AttackDistance then
                 targets[#targets + 1] = {
                     enemy,
-                    head or enemyRoot
+                    enemyRoot,
+                    IsCurrent = enemy == CurrentTarget,
+                    Distance = (enemyRoot.Position - root.Position).Magnitude,
                 }
             end
         end
     end
+
+    -- BasePart đầu tiên luôn là target thật. Trước đây một mob ghost có thể đứng đầu
+    -- khiến server từ chối cả gói M1 dù target thật vẫn hợp lệ.
+    table.sort(targets, function(a, b)
+        if a.IsCurrent ~= b.IsCurrent then
+            return a.IsCurrent
+        end
+        return a.Distance < b.Distance
+    end)
 
     return targets
 end
@@ -1772,11 +1842,24 @@ local function LoadAttack()
 
         local char = LocalPlayer.Character
         local hum = char and char:FindFirstChildOfClass("Humanoid")
-        if not char or not hum or hum.Health <= 0 or not char:FindFirstChildWhichIsA("Tool") then
+        local equipped = char and char:FindFirstChildWhichIsA("Tool")
+        if not char or not hum or hum.Health <= 0 or not equipped then
             return false
         end
 
         local now = tick()
+        local stun = char:FindFirstChild("Stun")
+        local busy = char:FindFirstChild("Busy")
+        local blocked = hum.Sit
+            or (stun and tonumber(stun.Value) and tonumber(stun.Value) > 0)
+            or (busy and busy.Value == true)
+        if blocked then
+            if AttackTelemetry.BlockedSince <= 0 then
+                AttackTelemetry.BlockedSince = now
+            end
+            return false
+        end
+        AttackTelemetry.BlockedSince = 0
         if now - lastAttack < Config.AttackDelay then
             return false
         end
@@ -1797,9 +1880,20 @@ local function LoadAttack()
             hitData[2][#hitData[2] + 1] = {data[1], data[2]}
         end
 
+        -- Nguồn Kaitun đầy đủ gửi cooldown thật của Tool vào RegisterAttack.
+        -- Bỏ tham số này có thể làm combo M1 chạy lúc đầu rồi bị server bỏ hit về sau.
+        local attackCooldown = Config.AttackDelay
+        pcall(function()
+            local cooldownValue = equipped:FindFirstChild("Cooldown")
+            local value = cooldownValue and tonumber(cooldownValue.Value)
+            if value and value > 0 then
+                attackCooldown = math.min(1.0, math.max(Config.AttackDelay, value))
+            end
+        end)
+
         FastAttackBusy = true
         local attackOK = pcall(function()
-            registerAttack:FireServer()
+            registerAttack:FireServer(attackCooldown)
         end)
         local hitOK = pcall(function()
             registerHit:FireServer(unpack(hitData))
@@ -1807,7 +1901,12 @@ local function LoadAttack()
         lastAttack = now
         FastAttackBusy = false
 
-        return attackOK and hitOK
+        if attackOK and hitOK then
+            AttackTelemetry.SentCount = AttackTelemetry.SentCount + 1
+            AttackTelemetry.LastSentAt = now
+            return true
+        end
+        return false
     end
 
     ENV.DragonTalonFastAttack = FastAttack
@@ -1825,6 +1924,68 @@ local function LoadAttack()
     return true
 end
 
+
+local function RefreshEquippedToolForM1()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local tool = char and char:FindFirstChildWhichIsA("Tool")
+    if not hum or hum.Health <= 0 or not tool then return false end
+
+    local ok = pcall(function()
+        hum:UnequipTools()
+        task.wait(0.08)
+        if tool.Parent then
+            hum:EquipTool(tool)
+        end
+    end)
+    return ok
+end
+
+local function PulseNativeM1()
+    local now = tick()
+    if now - AttackTelemetry.LastNativeM1At < Config.NativeM1FallbackInterval then
+        return false
+    end
+
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildWhichIsA("Tool")
+    if not tool then return false end
+
+    AttackTelemetry.LastNativeM1At = now
+    local ok = pcall(function()
+        tool:Activate()
+    end)
+    return ok
+end
+
+local function StartGhostM1Recovery(reason, longPause)
+    local now = tick()
+    if now - AttackTelemetry.LastRecoveryAt < 1.0 then
+        return false
+    end
+
+    AttackTelemetry.LastRecoveryAt = now
+    AttackTelemetry.SingleTargetUntil = math.max(
+        AttackTelemetry.SingleTargetUntil,
+        now + Config.GhostRecoveryDuration
+    )
+    AttackTelemetry.BringPausedUntil = math.max(
+        AttackTelemetry.BringPausedUntil,
+        now + (longPause and Config.GhostRecoveryLongPause or Config.GhostRecoveryDuration)
+    )
+
+    if ResetBringState then
+        pcall(ResetBringState)
+    end
+    pcall(StopFollowTween)
+    pcall(RefreshEquippedToolForM1)
+    AttackTelemetry.BlockedSince = 0
+    pcall(PulseNativeM1)
+    SetStatus("M1 không tụt máu - resync target, tạm dừng gom quái")
+    warn("[Auto Tyrant][GhostM1] " .. tostring(reason))
+    return true
+end
+
 local function NormalAttack(duration)
     local started = tick()
 
@@ -1837,10 +1998,10 @@ local function NormalAttack(duration)
             fastUsed = ok and result == true
         end
 
-        if not fastUsed and tool then
-            pcall(function()
-                tool:Activate()
-            end)
+        if tick() < AttackTelemetry.SingleTargetUntil then
+            PulseNativeM1()
+        elseif not fastUsed and tool then
+            PulseNativeM1()
         end
 
         task.wait(Config.AttackDelay)
@@ -2349,6 +2510,9 @@ local function FarmEnemy(enemy, isBoss)
 
     local stuckAt = tick()
     local previousHealth = hum.Health
+    local noDamageSince = tick()
+    local sentAtLastDamage = AttackTelemetry.SentCount
+    local ghostRecoveries = 0
 
     while enemy.Parent and hum.Parent and enemyRoot.Parent and hum.Health > 0 do
         local root = HumanoidRootPart()
@@ -2376,20 +2540,45 @@ local function FarmEnemy(enemy, isBoss)
         if hum.Health < previousHealth then
             previousHealth = hum.Health
             stuckAt = tick()
-        elseif tick() - stuckAt > 15 then
-            -- Không teleport giật về target. Chỉ làm mới follow và tấn công lại.
-            StopFollowTween()
-            if distance > 8 then
-                TweenTo(target, math.max(Config.TweenSpeed, 380))
+            noDamageSince = tick()
+            sentAtLastDamage = AttackTelemetry.SentCount
+            ghostRecoveries = 0
+        else
+            local sentWithoutDamage = AttackTelemetry.SentCount - sentAtLastDamage
+            local blockedTooLong = AttackTelemetry.BlockedSince > 0
+                and (tick() - AttackTelemetry.BlockedSince) >= 2.5
+            if tick() - noDamageSince >= Config.GhostM1NoDamageTimeout
+                and (sentWithoutDamage >= 6 or blockedTooLong)
+                and CurrentMode == "MOBS"
+            then
+                ghostRecoveries = ghostRecoveries + 1
+                StartGhostM1Recovery(
+                    ("target=%s, sends=%d, blocked=%s, recovery=%d"):format(
+                        tostring(enemy.Name), sentWithoutDamage, tostring(blockedTooLong), ghostRecoveries
+                    ),
+                    ghostRecoveries >= 2
+                )
+                noDamageSince = tick()
+                sentAtLastDamage = AttackTelemetry.SentCount
+                NormalAttack(0.65)
+            elseif tick() - stuckAt > 15 then
+                -- Watchdog tổng: làm mới follow nhưng không teleport target/quái.
+                StopFollowTween()
+                if distance > 8 then
+                    TweenTo(target, math.max(Config.TweenSpeed, 380))
+                end
+                NormalAttack(0.5)
+                stuckAt = tick()
             end
-            NormalAttack(0.5)
-            stuckAt = tick()
         end
 
         task.wait(0.08)
     end
 
     StopFollowTween()
+    if ResetBringState then pcall(ResetBringState) end
+    AttackTelemetry.SingleTargetUntil = 0
+    AttackTelemetry.BringPausedUntil = 0
     CurrentTarget = nil
 end
 
@@ -2493,33 +2682,28 @@ end
 -- Stable bring controller.
 -- Chỉ gom quái cùng loại với CurrentTarget, lấy CurrentTarget làm anchor cố định.
 -- Không tính average động, không tween mob chồng, không dùng các thủ thuật ownership/animation cũ.
-local BringState = {
+BringState = {
     Anchor = nil,
     AnchorPosition = nil,
     NextSlot = 1,
     SlotOf = setmetatable({}, {__mode = "k"}),
     Tracked = setmetatable({}, {__mode = "k"}),
+    PendingAt = setmetatable({}, {__mode = "k"}),
+    Active = setmetatable({}, {__mode = "k"}),
+    VerifiedAt = setmetatable({}, {__mode = "k"}),
 }
 
 local function RestoreBroughtMob(root, state)
     if not state then return end
-    local hum = state.Humanoid
-
     pcall(function()
         if root and root.Parent and state.CanCollide ~= nil then
             root.CanCollide = state.CanCollide
         end
     end)
-    pcall(function()
-        if hum and hum.Parent and hum.Health > 0 then
-            if state.WalkSpeed ~= nil then hum.WalkSpeed = state.WalkSpeed end
-            if state.JumpPower ~= nil then hum.JumpPower = state.JumpPower end
-            if state.AutoRotate ~= nil then hum.AutoRotate = state.AutoRotate end
-        end
-    end)
 end
 
-local function ResetBringState()
+ResetBringState = function()
+    if not BringState then return end
     for root, state in pairs(BringState.Tracked) do
         RestoreBroughtMob(root, state)
     end
@@ -2529,17 +2713,17 @@ local function ResetBringState()
     BringState.NextSlot = 1
     BringState.SlotOf = setmetatable({}, {__mode = "k"})
     BringState.Tracked = setmetatable({}, {__mode = "k"})
+    BringState.PendingAt = setmetatable({}, {__mode = "k"})
+    BringState.Active = setmetatable({}, {__mode = "k"})
+    BringState.VerifiedAt = setmetatable({}, {__mode = "k"})
 end
 
-local function TrackBroughtMob(root, hum)
+local function TrackBroughtMob(root)
     local state = BringState.Tracked[root]
     if state then return state end
 
-    state = {Humanoid = hum}
+    state = {}
     pcall(function() state.CanCollide = root.CanCollide end)
-    pcall(function() state.WalkSpeed = hum.WalkSpeed end)
-    pcall(function() state.JumpPower = hum.JumpPower end)
-    pcall(function() state.AutoRotate = hum.AutoRotate end)
     BringState.Tracked[root] = state
     return state
 end
@@ -2578,26 +2762,35 @@ local function GetBringOffset(slot)
     )
 end
 
-local function FreezeBroughtMob(root, hum)
-    TrackBroughtMob(root, hum)
+local function FreezeBroughtMob(root)
+    TrackBroughtMob(root)
 
+    -- Chỉ khóa vật lý phần root. Không đổi WalkSpeed/JumpPower/AutoRotate/State
+    -- vì các state Humanoid bị giữ sai sau nhiều vòng có thể tạo mob ghost phía client.
     pcall(function()
         root.CanCollide = false
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
     end)
-    pcall(function()
-        hum.WalkSpeed = 0
-        hum.JumpPower = 0
-        hum.AutoRotate = false
-    end)
 end
 
-local function RestoreInactiveBroughtMobs(activeRoots)
+local function RestoreInactiveBroughtMobs(activeRoots, activeEnemies)
     for root, state in pairs(BringState.Tracked) do
         if not activeRoots[root] then
             RestoreBroughtMob(root, state)
             BringState.Tracked[root] = nil
+        end
+    end
+
+    for enemy in pairs(BringState.Active) do
+        if not activeEnemies[enemy] then
+            BringState.Active[enemy] = nil
+            BringState.VerifiedAt[enemy] = nil
+        end
+    end
+    for enemy in pairs(BringState.PendingAt) do
+        if not activeEnemies[enemy] then
+            BringState.PendingAt[enemy] = nil
         end
     end
 end
@@ -2618,6 +2811,7 @@ local function SetupBringMobs()
             local enemiesFolder = Workspace:FindFirstChild("Enemies")
 
             local canBring = CurrentMode == "MOBS"
+                and tick() >= AttackTelemetry.BringPausedUntil
                 and not SkillCasting
                 and TeamReady
                 and playerRoot
@@ -2645,7 +2839,7 @@ local function SetupBringMobs()
                         BringState.Anchor = target
                         BringState.AnchorPosition = targetRoot.Position
                     elseif not BringState.AnchorPosition
-                        or (targetRoot.Position - BringState.AnchorPosition).Magnitude >= 2.5
+                        or (targetRoot.Position - BringState.AnchorPosition).Magnitude >= 6
                     then
                         BringState.AnchorPosition = targetRoot.Position
                     end
@@ -2674,6 +2868,7 @@ local function SetupBringMobs()
                                         Humanoid = hum,
                                         Root = enemyRoot,
                                         Distance = distanceToAnchor,
+                                        DistanceToPlayer = distanceToPlayer,
                                         IsAnchor = enemy == target,
                                     }
                                 end
@@ -2689,7 +2884,10 @@ local function SetupBringMobs()
                     end)
 
                     local activeRoots = {}
+                    local activeEnemies = {}
                     local limit = math.min(#candidates, Config.MaxBringMobsPerTick)
+                    local now = tick()
+
                     for index = 1, limit do
                         local data = candidates[index]
                         local enemy = data.Enemy
@@ -2697,25 +2895,44 @@ local function SetupBringMobs()
                         local enemyRoot = data.Root
 
                         if enemy.Parent and hum.Parent and enemyRoot.Parent and hum.Health > 0 then
-                            activeRoots[enemyRoot] = true
-                            FreezeBroughtMob(enemyRoot, hum)
+                            activeEnemies[enemy] = true
 
-                            -- Anchor chỉ được giữ đứng yên; các mob còn lại vào slot cố định quanh anchor.
-                            if enemy ~= target then
+                            if enemy == target then
+                                -- Anchor thật không bị đổi CFrame hay khóa Humanoid.
+                                -- Nó luôn là base hit đầu tiên và là fallback đánh đơn.
+                                BringState.Active[enemy] = true
+                                BringState.VerifiedAt[enemy] = now
+                            else
+                                activeRoots[enemyRoot] = true
+                                FreezeBroughtMob(enemyRoot)
+
                                 local slot = GetBringSlot(enemy)
                                 local desiredPosition = anchorPosition + GetBringOffset(slot)
                                 local distanceToSlot = (enemyRoot.Position - desiredPosition).Magnitude
 
                                 if distanceToSlot > Config.BringSnapTolerance then
+                                    BringState.Active[enemy] = nil
+                                    BringState.VerifiedAt[enemy] = nil
+                                    BringState.PendingAt[enemy] = now
                                     pcall(function()
                                         enemyRoot.CFrame = CFrame.lookAt(desiredPosition, anchorPosition)
                                     end)
+                                else
+                                    local pendingAt = BringState.PendingAt[enemy]
+                                    if not pendingAt then
+                                        BringState.PendingAt[enemy] = now
+                                    elseif now - pendingAt >= Config.BringVerifyDelay
+                                        and CanControlMob(enemyRoot, data.DistanceToPlayer)
+                                    then
+                                        BringState.Active[enemy] = true
+                                        BringState.VerifiedAt[enemy] = now
+                                    end
                                 end
                             end
                         end
                     end
 
-                    RestoreInactiveBroughtMobs(activeRoots)
+                    RestoreInactiveBroughtMobs(activeRoots, activeEnemies)
                 end
             end
         end
