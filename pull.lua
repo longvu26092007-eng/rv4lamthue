@@ -11,16 +11,6 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
     ["FPS"]                = 20,
     ["Black Screen"]       = true,
 
-    -- Đợi UI/game ổn định trước khi chọn team.
-    ["Team Load Delay"]    = 7,
-
-    -- Di chuyển nhẹ hơn để giảm lỗi bị server kéo ngược / security kick.
-    ["Tween Speed"]               = 220,
-    ["Direct Teleport Distance"]  = 25,
-    ["Tween Update Interval"]     = 0.05,
-    ["Tween Correction Limit"]    = 90,
-    ["Tween Retry Cooldown"]      = 2,
-
     ["Use Mirage API"]     = true,
     ["Mirage API"]         = "http://fi12.bot-hosting.cloud:20112/api/name=mirage",
     ["Avoid Full Server"]  = true,
@@ -140,13 +130,6 @@ Config["Boost FPS"]         = Config["Boost FPS"] ~= false
 Config["FPS"]               = Config["FPS"] or 20
 Config["Black Screen"]      = Config["Black Screen"] or false
 
-Config["Team Load Delay"]           = math.max(0, tonumber(Config["Team Load Delay"]) or 7)
-Config["Tween Speed"]               = math.max(80, tonumber(Config["Tween Speed"]) or 220)
-Config["Direct Teleport Distance"]  = math.max(5, tonumber(Config["Direct Teleport Distance"]) or 25)
-Config["Tween Update Interval"]     = math.max(0.03, tonumber(Config["Tween Update Interval"]) or 0.05)
-Config["Tween Correction Limit"]    = math.max(40, tonumber(Config["Tween Correction Limit"]) or 90)
-Config["Tween Retry Cooldown"]      = math.max(0, tonumber(Config["Tween Retry Cooldown"]) or 2)
-
 SetStatus("Waiting game loaded...")
 if not game:IsLoaded() then
     repeat task.wait(0.5) until game:IsLoaded()
@@ -188,34 +171,6 @@ Config["Team"] = TeamConfig.TEAM
 
 repeat task.wait() until game:GetService("Players").LocalPlayer
 repeat task.wait() until game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
-
-local function WaitBeforeChooseTeam()
-    if LocalPlayer.Team ~= nil then
-        return
-    end
-
-    local delaySeconds = math.floor(tonumber(Config["Team Load Delay"]) or 7)
-    for remaining = delaySeconds, 1, -1 do
-        SetStatus("Waiting team UI: " .. tostring(remaining) .. "s")
-        task.wait(1)
-
-        if LocalPlayer.Team ~= nil then
-            return
-        end
-    end
-
-    -- Đợi thêm Main/ChooseTeam xuất hiện nhưng không treo vô hạn.
-    local deadline = os.clock() + 15
-    while LocalPlayer.Team == nil and os.clock() < deadline do
-        local mainGui = LocalPlayer.PlayerGui and LocalPlayer.PlayerGui:FindFirstChild("Main")
-        local chooseTeam = mainGui and mainGui:FindFirstChild("ChooseTeam")
-        if chooseTeam then
-            break
-        end
-        SetStatus("Waiting ChooseTeam UI...")
-        task.wait(0.5)
-    end
-end
 
 local function ChooseTeamByLargeButton()
     if LocalPlayer.Team ~= nil then
@@ -260,7 +215,6 @@ local function ChooseTeamByLargeButton()
     return true
 end
 
-WaitBeforeChooseTeam()
 ChooseTeamByLargeButton()
 
 local function RefreshCharacter()
@@ -736,32 +690,10 @@ local function CaculateDistance(Origin, Destination)
 end
 
 local TweenConn, TweenInstance, TweenGhost, IsTweening = nil, nil, nil, false
-local OriginalCanCollide = {}
-local TweenCooldownUntil = 0
-
-local function RestoreCollisions()
-    for part, oldValue in pairs(OriginalCanCollide) do
-        if part and part.Parent then
-            pcall(function()
-                part.CanCollide = oldValue
-            end)
-        end
-    end
-    table.clear(OriginalCanCollide)
-end
-
 local function NoclipLoop()
-    -- Không noclip liên tục khi đang đứng yên; chỉ bật trong lúc tween.
-    if not IsTweening or not LocalPlayer.Character then
-        return
-    end
-
-    for _, c in LocalPlayer.Character:GetDescendants() do
-        if c:IsA("BasePart") and c.Name ~= "HumanoidRootPart" then
-            if OriginalCanCollide[c] == nil then
-                OriginalCanCollide[c] = c.CanCollide
-            end
-            if c.CanCollide then
+    if LocalPlayer.Character then
+        for _, c in LocalPlayer.Character:GetDescendants() do
+            if c:IsA("BasePart") and c.CanCollide and c.Name ~= "HumanoidRootPart" then
                 c.CanCollide = false
             end
         end
@@ -769,78 +701,47 @@ local function NoclipLoop()
 end
 RunService.Stepped:Connect(NoclipLoop)
 
-local function StopTween(reason)
-    if TweenInstance then
-        pcall(function() TweenInstance:Cancel() end)
-        TweenInstance = nil
-    end
-    if TweenConn then
-        TweenConn:Disconnect()
-        TweenConn = nil
-    end
-    if TweenGhost then
-        pcall(function() TweenGhost:Destroy() end)
-        TweenGhost = nil
-    end
-
-    RestoreCollisions()
+local function StopTween()
+    if TweenInstance then pcall(function() TweenInstance:Cancel() end) TweenInstance = nil end
+    if TweenConn then TweenConn:Disconnect() TweenConn = nil end
+    if TweenGhost then pcall(function() TweenGhost:Destroy() end) TweenGhost = nil end
     IsTweening = false
-
-    if reason and reason ~= "" then
-        warn("[PullLever] Tween stopped: " .. tostring(reason))
-    end
 end
 
 function TweenTo(Position)
-    if os.clock() < TweenCooldownUntil then
-        return
-    end
 
     if not Character or not Character:FindFirstChild("Humanoid")
         or Character.Humanoid.Health <= 0 or not HumanoidRootPart then
-        StopTween("character not ready")
-        return
-    end
-
-    if LocalPlayer.Team == nil then
-        StopTween("team not selected")
+        StopTween()
         return
     end
 
     if Position == false then
-        StopTween("cancelled")
+        StopTween()
         return
     end
     if not Position then return end
 
     Position = typeof(Position) ~= "CFrame" and ConvertTo(CFrame, Position) or Position
     if typeof(Position) == "CFrame" then
-        local p = Position.Position
+        local p = Position.p
         Position = CFrame.new(p.X, math.max(p.Y, 5), p.Z)
     end
 
     local root = HumanoidRootPart
     local dist = (Position.Position - root.Position).Magnitude
-    local directDistance = tonumber(Config["Direct Teleport Distance"]) or 25
-    local tweenSpeed = tonumber(Config["Tween Speed"]) or 220
-    local updateInterval = tonumber(Config["Tween Update Interval"]) or 0.05
-    local correctionLimit = tonumber(Config["Tween Correction Limit"]) or 90
-    local retryCooldown = tonumber(Config["Tween Retry Cooldown"]) or 2
 
-    -- Chỉ dịch chuyển thẳng ở khoảng cách rất ngắn.
-    if dist <= directDistance then
+    if dist <= 200 then
         StopTween()
         pcall(function()
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
-            root.CFrame = Position
         end)
+        root.CFrame = Position
         return
     end
 
-    if IsTweening then
-        return
-    end
+    if IsTweening then return end
     IsTweening = true
 
     local ghost = Instance.new("Part")
@@ -848,72 +749,28 @@ function TweenTo(Position)
     ghost.Transparency = 1
     ghost.Anchored = true
     ghost.CanCollide = false
-    ghost.CanTouch = false
-    ghost.CanQuery = false
-    ghost.Size = Vector3.new(2, 2, 2)
+    ghost.Size = Vector3.new(4, 4, 4)
     ghost.CFrame = root.CFrame
     ghost.Parent = workspace
     TweenGhost = ghost
 
     TweenInstance = TweenService:Create(
         ghost,
-        TweenInfo.new(dist / tweenSpeed, Enum.EasingStyle.Linear),
+        TweenInfo.new(dist / 330, Enum.EasingStyle.Linear),
         { CFrame = Position }
     )
 
-    local accumulator = 0
-    TweenConn = RunService.Heartbeat:Connect(function(dt)
-        accumulator = accumulator + dt
-        if accumulator < updateInterval then
-            return
-        end
-        accumulator = 0
-
-        if not root or not root.Parent or not ghost or not ghost.Parent then
-            StopTween("root/ghost missing")
-            return
-        end
-
-        if not Character or not Character.Parent
-            or not Humanoid or Humanoid.Health <= 0
-            or LocalPlayer.Team == nil then
-            StopTween("character/team changed")
-            return
-        end
-
-        local gap = (root.Position - ghost.Position).Magnitude
-
-        -- Nếu server kéo nhân vật lệch quá xa, không giật ngược về ghost trong 1 frame.
-        -- Dừng và chờ một chút để tránh chuỗi correction/kick.
-        if gap > correctionLimit then
-            TweenCooldownUntil = os.clock() + retryCooldown
-            StopTween("server correction gap=" .. tostring(math.floor(gap)))
-            SetStatus("Movement corrected -> pause " .. tostring(retryCooldown) .. "s")
-            return
-        end
-
-        local ok, err = pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-            root.CFrame = ghost.CFrame
-        end)
-
-        if not ok then
-            TweenCooldownUntil = os.clock() + retryCooldown
-            StopTween("movement error: " .. tostring(err))
-        end
-    end)
-
-    TweenInstance.Completed:Connect(function(playbackState)
-        if playbackState == Enum.PlaybackState.Completed
-            and root and root.Parent
-            and ghost and ghost.Parent then
+    TweenConn = RunService.Heartbeat:Connect(function()
+        if root and root.Parent and ghost and ghost.Parent then
             pcall(function()
                 root.AssemblyLinearVelocity = Vector3.zero
                 root.AssemblyAngularVelocity = Vector3.zero
-                root.CFrame = Position
+                root.CFrame = ghost.CFrame
             end)
         end
+    end)
+
+    TweenInstance.Completed:Connect(function()
         StopTween()
     end)
 
