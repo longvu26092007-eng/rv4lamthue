@@ -1,117 +1,322 @@
 -- ==========================================
--- [ FRAGMENT CHECKER & LOGGER ]
--- Chức năng: Đợi game load -> Mở UI -> Theo dõi Fragment -> Ghi file khi đủ
+-- [ FRAGMENT CHECKER + AUTO SEA 3 ]
+-- Chức năng:
+--   1. Đợi game load
+--   2. Kiểm tra Sea hiện tại
+--   3. Sea 1 -> Sea 2 -> Sea 3
+--   4. Chỉ kiểm Fragment khi đã ở Sea 3
+--   5. Đủ Fragment -> ghi Completed-fragment
 -- ==========================================
 
--- [[ 4. THIẾT LẬP SỐ FRAGMENT YÊU CẦU ]]
--- Nếu chưa có biến getgenv().fragmentchange từ trước, mặc định sẽ là 8000
-getgenv().fragmentchange = getgenv().fragmentchange or 8000 
-local TARGET_FRAG = getgenv().fragmentchange
-local Player = game.Players.LocalPlayer
-local CoreGui = game:GetService("CoreGui")
+repeat
+    task.wait(1)
+until game:IsLoaded()
+    and game:GetService("Players").LocalPlayer
+    and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CoreGui            = game:GetService("CoreGui")
+
+local Player = Players.LocalPlayer
+
+-- ==========================================
+-- [ CẤU HÌNH ]
+-- ==========================================
+
+-- Fragment yêu cầu
+getgenv().fragmentchange = getgenv().fragmentchange or 8000
+local TARGET_FRAG = tonumber(getgenv().fragmentchange) or 8000
+
+-- PlaceId các Sea
+local SEA1_PLACE_IDS = {
+    [2753915549] = true,
+}
+
+local SEA2_PLACE_IDS = {
+    [4442272183] = true,
+    [79091703265657] = true,
+}
+
+local SEA3_PLACE_IDS = {
+    [7449423635] = true,
+    [100117331123089] = true,
+}
+
+-- ==========================================
+-- [ HÀM HỖ TRỢ ]
+-- ==========================================
+
+local function GetCommF()
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    return remotes and remotes:FindFirstChild("CommF_")
+end
 
 local function GetFragments()
-    local val = 0
-    pcall(function() 
-        val = Player.Data.Fragments.Value 
+    local value = 0
+
+    pcall(function()
+        local data = Player:FindFirstChild("Data")
+        local fragments = data and data:FindFirstChild("Fragments")
+
+        if fragments then
+            value = tonumber(fragments.Value) or 0
+        end
     end)
-    return val
+
+    return value
+end
+
+local function GetCurrentSea()
+    local placeId = game.PlaceId
+
+    if SEA1_PLACE_IDS[placeId] then
+        return 1
+    elseif SEA2_PLACE_IDS[placeId] then
+        return 2
+    elseif SEA3_PLACE_IDS[placeId] then
+        return 3
+    end
+
+    -- Kiểm tra thêm bằng thuộc tính MAP nếu PlaceId mới
+    local mapName = tostring(workspace:GetAttribute("MAP") or "")
+
+    if mapName == "Sea1" then
+        return 1
+    elseif mapName == "Sea2" then
+        return 2
+    elseif mapName == "Sea3" then
+        return 3
+    end
+
+    return 0
 end
 
 -- ==========================================
--- [ 1. TẠO UI HIỂN THỊ STATUS ]
+-- [ TẠO UI ]
 -- ==========================================
--- Xóa UI cũ nếu đã từng chạy script
+
 if CoreGui:FindFirstChild("CheckFragUI") then
     CoreGui.CheckFragUI:Destroy()
 end
 
-local ScreenGui = Instance.new("ScreenGui", CoreGui)
+local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "CheckFragUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = CoreGui
 
--- Khung chính
-local MainFrame = Instance.new("Frame", ScreenGui)
-MainFrame.Size             = UDim2.new(0, 320, 0, 110)
-MainFrame.Position         = UDim2.new(0.5, -160, 0.5, -55)
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 340, 0, 135)
+MainFrame.Position = UDim2.new(0.5, -170, 0.5, -67)
 MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-MainFrame.Active           = true
-MainFrame.Draggable        = true
-Instance.new("UIStroke", MainFrame).Color        = Color3.fromRGB(0, 255, 255)
-Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 8)
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
 
--- Tiêu đề
-local Title = Instance.new("TextLabel", MainFrame)
-Title.Size                 = UDim2.new(1, 0, 0, 30)
-Title.Text                 = "Theo Dõi Fragment"
-Title.TextColor3           = Color3.fromRGB(0, 255, 255)
+local Stroke = Instance.new("UIStroke")
+Stroke.Color = Color3.fromRGB(0, 255, 255)
+Stroke.Parent = MainFrame
+
+local Corner = Instance.new("UICorner")
+Corner.CornerRadius = UDim.new(0, 8)
+Corner.Parent = MainFrame
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 30)
 Title.BackgroundTransparency = 1
-Title.Font                 = Enum.Font.GothamBold
-Title.TextSize             = 14
+Title.Text = "Theo Dõi Fragment"
+Title.TextColor3 = Color3.fromRGB(0, 255, 255)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 14
+Title.Parent = MainFrame
 
-local Line = Instance.new("Frame", Title)
-Line.Size              = UDim2.new(1, 0, 0, 1)
-Line.Position          = UDim2.new(0, 0, 1, 0)
-Line.BackgroundColor3  = Color3.fromRGB(0, 255, 255)
-Line.BorderSizePixel   = 0
+local Line = Instance.new("Frame")
+Line.Size = UDim2.new(1, 0, 0, 1)
+Line.Position = UDim2.new(0, 0, 1, 0)
+Line.BackgroundColor3 = Color3.fromRGB(0, 255, 255)
+Line.BorderSizePixel = 0
+Line.Parent = Title
 
--- Dòng hiển thị trạng thái hiện tại
-local ActionStatus = Instance.new("TextLabel", MainFrame)
-ActionStatus.Size                 = UDim2.new(1, -20, 0, 22)
-ActionStatus.Position             = UDim2.new(0, 10, 0, 40)
-ActionStatus.Text                 = "Trạng thái: Đang khởi tạo..."
-ActionStatus.TextColor3           = Color3.fromRGB(200, 200, 200)
-ActionStatus.Font                 = Enum.Font.Gotham
+local SeaLabel = Instance.new("TextLabel")
+SeaLabel.Size = UDim2.new(1, -20, 0, 22)
+SeaLabel.Position = UDim2.new(0, 10, 0, 38)
+SeaLabel.BackgroundTransparency = 1
+SeaLabel.Text = "🌊 Sea hiện tại: Đang kiểm tra..."
+SeaLabel.TextColor3 = Color3.fromRGB(100, 200, 255)
+SeaLabel.Font = Enum.Font.GothamBold
+SeaLabel.TextSize = 12
+SeaLabel.TextXAlignment = Enum.TextXAlignment.Left
+SeaLabel.Parent = MainFrame
+
+local ActionStatus = Instance.new("TextLabel")
+ActionStatus.Size = UDim2.new(1, -20, 0, 22)
+ActionStatus.Position = UDim2.new(0, 10, 0, 63)
 ActionStatus.BackgroundTransparency = 1
-ActionStatus.TextSize             = 12
-ActionStatus.TextXAlignment       = Enum.TextXAlignment.Left
+ActionStatus.Text = "Trạng thái: Đang khởi tạo..."
+ActionStatus.TextColor3 = Color3.fromRGB(200, 200, 200)
+ActionStatus.Font = Enum.Font.Gotham
+ActionStatus.TextSize = 12
+ActionStatus.TextXAlignment = Enum.TextXAlignment.Left
+ActionStatus.Parent = MainFrame
 
--- Dòng hiển thị số lượng Fragment
-local FragLabel = Instance.new("TextLabel", MainFrame)
-FragLabel.Size                 = UDim2.new(1, -20, 0, 22)
-FragLabel.Position             = UDim2.new(0, 10, 0, 65)
-FragLabel.Text                 = "🔮 Fragments: ... / " .. tostring(TARGET_FRAG)
-FragLabel.TextColor3           = Color3.fromRGB(200, 160, 255)
-FragLabel.Font                 = Enum.Font.GothamBold
+local FragLabel = Instance.new("TextLabel")
+FragLabel.Size = UDim2.new(1, -20, 0, 22)
+FragLabel.Position = UDim2.new(0, 10, 0, 88)
 FragLabel.BackgroundTransparency = 1
-FragLabel.TextSize             = 13
-FragLabel.TextXAlignment       = Enum.TextXAlignment.Left
+FragLabel.Text = "🔮 Fragments: ... / " .. tostring(TARGET_FRAG)
+FragLabel.TextColor3 = Color3.fromRGB(200, 160, 255)
+FragLabel.Font = Enum.Font.GothamBold
+FragLabel.TextSize = 13
+FragLabel.TextXAlignment = Enum.TextXAlignment.Left
+FragLabel.Parent = MainFrame
 
 -- ==========================================
--- [ 2 & 3. CHECK FRAGMENT VÀ GHI FILE ]
+-- [ KIỂM TRA VÀ CHUYỂN SEA ]
 -- ==========================================
--- Chạy vòng lặp kiểm tra song song (không làm đứng game)
+
+local function EnsureSea3()
+    local sea = GetCurrentSea()
+
+    if sea == 3 then
+        SeaLabel.Text = "🌊 Sea hiện tại: Sea 3"
+        SeaLabel.TextColor3 = Color3.fromRGB(0, 255, 120)
+        return true
+    end
+
+    local CommF_ = GetCommF()
+
+    if not CommF_ then
+        ActionStatus.Text = "Trạng thái: ❌ Không tìm thấy CommF_"
+        warn("[CheckFrag] Không tìm thấy remote CommF_")
+        return false
+    end
+
+    if sea == 1 then
+        SeaLabel.Text = "🌊 Sea hiện tại: Sea 1"
+        ActionStatus.Text = "Trạng thái: Đang chuyển Sea 1 → Sea 2..."
+
+        for attempt = 1, 3 do
+            warn(
+                "[CheckFrag] TravelDressrosa lần "
+                    .. tostring(attempt)
+                    .. "/3"
+            )
+
+            pcall(function()
+                CommF_:InvokeServer("TravelDressrosa")
+            end)
+
+            task.wait(5)
+
+            if GetCurrentSea() ~= 1 then
+                return false
+            end
+        end
+
+        ActionStatus.Text =
+            "Trạng thái: ⚠ Không thể sang Sea 2, kiểm tra điều kiện mở Sea"
+        return false
+    end
+
+    if sea == 2 then
+        SeaLabel.Text = "🌊 Sea hiện tại: Sea 2"
+        ActionStatus.Text = "Trạng thái: Đang chuyển Sea 2 → Sea 3..."
+
+        for attempt = 1, 3 do
+            warn(
+                "[CheckFrag] TravelZou lần "
+                    .. tostring(attempt)
+                    .. "/3"
+            )
+
+            pcall(function()
+                CommF_:InvokeServer("TravelZou")
+            end)
+
+            task.wait(5)
+
+            if GetCurrentSea() ~= 2 then
+                return false
+            end
+        end
+
+        ActionStatus.Text =
+            "Trạng thái: ⚠ Không thể sang Sea 3, kiểm tra điều kiện mở Sea"
+        return false
+    end
+
+    SeaLabel.Text = "🌊 Sea hiện tại: Không xác định"
+    SeaLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+    ActionStatus.Text =
+        "Trạng thái: Không nhận diện được Sea từ PlaceId/MAP"
+
+    return false
+end
+
+-- Chỉ chạy Fragment Checker khi đã ở Sea 3.
+-- Khi đang teleport, script hiện tại sẽ dừng.
+-- Executor/loader cần tự chạy lại script sau teleport.
+if not EnsureSea3() then
+    warn(
+        "[CheckFrag] Chưa ở Sea 3. "
+            .. "Sau khi teleport, hãy để loader tự chạy lại script."
+    )
+    return
+end
+
+-- ==========================================
+-- [ CHECK FRAGMENT VÀ GHI FILE ]
+-- ==========================================
+
 task.spawn(function()
-    while true do
+    while task.wait(3) do
         local currentFrag = GetFragments()
-        FragLabel.Text = "🔮 Fragments: " .. tostring(currentFrag) .. " / " .. tostring(TARGET_FRAG)
+
+        FragLabel.Text =
+            "🔮 Fragments: "
+            .. tostring(currentFrag)
+            .. " / "
+            .. tostring(TARGET_FRAG)
 
         if currentFrag >= TARGET_FRAG then
-            -- Khi đã đủ hoặc vượt mức yêu cầu
             FragLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
-            ActionStatus.Text = "Trạng thái: Đang ghi log..."
-            
-            -- Ghi file
+            ActionStatus.Text = "Trạng thái: Đang ghi file..."
+
             local success, err = pcall(function()
-                writefile(Player.Name .. ".txt", "Completed-fragment")
+                if type(writefile) ~= "function" then
+                    error("Executor không hỗ trợ writefile")
+                end
+
+                writefile(
+                    tostring(Player.Name) .. ".txt",
+                    "Completed-fragment"
+                )
             end)
 
             if success then
-                ActionStatus.Text = "Trạng thái: ✅ HOÀN THÀNH (Đã ghi file)"
-                warn("[CheckFrag] Đã ghi thành công file: " .. Player.Name .. ".txt")
+                ActionStatus.Text =
+                    "Trạng thái: ✅ HOÀN THÀNH (Đã ghi file)"
+
+                warn(
+                    "[CheckFrag] Đã ghi "
+                        .. tostring(Player.Name)
+                        .. ".txt = Completed-fragment"
+                )
             else
                 ActionStatus.Text = "Trạng thái: ❌ Lỗi ghi file!"
-                warn("[CheckFrag] Lỗi khi tạo file: " .. tostring(err))
+
+                warn(
+                    "[CheckFrag] Lỗi khi tạo file: "
+                        .. tostring(err)
+                )
             end
-            
-            -- Dừng vòng lặp sau khi hoàn thành nhiệm vụ
+
             break
-        else
-            -- Khi chưa đủ, tiếp tục cập nhật UI và chờ
-            FragLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
-            ActionStatus.Text = "Trạng thái: Đang đợi farm đủ Fragment..."
         end
-        
-        -- Dừng 3 giây mỗi lần check để tối ưu hóa, không làm drop FPS
-        task.wait(3)
+
+        FragLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+        ActionStatus.Text =
+            "Trạng thái: Đang đợi farm đủ Fragment..."
     end
 end)
