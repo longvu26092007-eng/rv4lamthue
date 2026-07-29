@@ -327,17 +327,116 @@ local function RefreshPlayerData()
     end
 end
 
-local function RefreshInventory()
-    local ok, list = pcall(function()
-        return CommF_:InvokeServer("getInventory")
+-- ============================================================
+-- INVENTORY (update moi): doc qua ItemReplicationService +
+-- Inventory controller + ItemConfig thay cho CommF_ getInventory
+-- (getInventory khong con tra Mirror Fractal sau update).
+--   Backpack[<Display.Name>] = { Name=, Count=, Category=, ItemId= }
+-- ============================================================
+local InvModules = {
+    Inventory   = nil,
+    ItemConfig  = nil,
+    ItemService = nil,
+    KEYS        = nil,
+    Ready       = false,
+}
+
+local function LoadInventoryModules()
+    if InvModules.Ready then return true end
+
+    local ok = pcall(function()
+        InvModules.Inventory   = require(ReplicatedStorage.Controllers.UI.Inventory)
+        InvModules.ItemConfig  = require(ReplicatedStorage.ItemConfig)
+        InvModules.ItemService = require(ReplicatedStorage.ItemReplicationService)
+        InvModules.KEYS        = require(ReplicatedStorage.ItemReplicationService.KEYS)
     end)
-    ConChoChisiti36.Backpack = {}
-    if ok and type(list) == "table" then
-        for _, v in list do
-            if type(v) == "table" and v.Name then
-                ConChoChisiti36.Backpack[v.Name] = v
+
+    if not ok then
+        InvModules.Inventory, InvModules.ItemConfig = nil, nil
+        InvModules.ItemService, InvModules.KEYS = nil, nil
+        return false
+    end
+
+    InvModules.Ready = true
+    return true
+end
+
+local function InventoryModulesInitialized()
+    if not InvModules.Ready then return false end
+    local ok, res = pcall(function()
+        return InvModules.Inventory:GetIfInitialized()
+            and InvModules.ItemService.IsInitialized == true
+    end)
+    return ok and res == true
+end
+
+local function RefreshInventory()
+    if not LoadInventoryModules() then
+        warn("[Inventory] Khong require duoc module inventory")
+        return
+    end
+
+    if not InventoryModulesInitialized() then
+        return
+    end
+
+    local Inventory   = InvModules.Inventory
+    local ItemConfig  = InvModules.ItemConfig
+    local ItemService  = InvModules.ItemService
+    local KEYS        = InvModules.KEYS
+
+    -- So luong theo ItemId
+    local amounts = {}
+    local okQty, qtyList = pcall(function()
+        return ItemService:GetItems(KEYS.QUANTITY)
+    end)
+    if okQty and type(qtyList) == "table" then
+        for _, item in pairs(qtyList) do
+            if type(item) == "table" and item.ItemId then
+                amounts[item.ItemId] = (amounts[item.ItemId] or 0)
+                    + (tonumber(item.Value) or 0)
             end
         end
+    end
+
+    local okTiles, tiles = pcall(function() return Inventory:GetTiles() end)
+    if not okTiles or type(tiles) ~= "table" then
+        warn("[Inventory] GetTiles that bai")
+        return
+    end
+
+    local backpack, seen, total = {}, {}, 0
+
+    for _, tile in pairs(tiles) do
+        local id = type(tile) == "table" and tile.ItemId or nil
+
+        if id and not seen[id] then
+            seen[id] = true
+
+            local okCfg, config = pcall(function()
+                return ItemConfig.match(id):unwrap()
+            end)
+
+            if okCfg and type(config) == "table" and config.Display then
+                local name = config.Display.Name
+                    or (config.Index and config.Index.StorageKey)
+                    or tostring(id)
+
+                backpack[tostring(name)] = {
+                    Name     = tostring(name),
+                    Count    = amounts[id] or 1,
+                    Category = config.Display.Category,
+                    ItemId   = id,
+                }
+                total = total + 1
+            end
+        end
+    end
+
+    -- Chi ghi de khi doc duoc it nhat 1 item, tranh xoa trang cache
+    -- khi inventory chua replicate xong.
+    if total > 0 then
+        ConChoChisiti36.Backpack = backpack
     end
 end
 
