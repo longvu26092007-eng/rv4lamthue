@@ -35,7 +35,9 @@ local function SetStatus(text)
     print("[PullLever] " .. text)
 
     if _statusLabel then
-        _statusLabel.Text = "Status: " .. text
+        -- Ghi vao CoreGui/gethui co the loi neu thread dang o identity
+        -- thap (sau khi require module game) -> khong de no giet script.
+        pcall(function() _statusLabel.Text = "Status: " .. text end)
     end
 end
 
@@ -328,6 +330,34 @@ local function RefreshPlayerData()
 end
 
 -- ============================================================
+-- THREAD IDENTITY
+-- require(...) module cua game se ha identity cua thread hien tai
+-- xuong muc script game -> sau do ghi vao CoreGui/gethui bi loi
+-- "cannot access 'Instance' (lacking capability Plugin)".
+-- Boc lai de luon tra identity ve muc cao sau khi require.
+-- ============================================================
+local _setidentity = setthreadidentity or setidentity or set_thread_identity
+    or (syn and syn.set_thread_identity)
+local _getidentity = getthreadidentity or getidentity or get_thread_identity
+    or (syn and syn.get_thread_identity)
+
+local function RaiseIdentity()
+    if not _setidentity then return nil end
+    local prev
+    if _getidentity then
+        local ok, v = pcall(_getidentity)
+        if ok then prev = v end
+    end
+    pcall(_setidentity, 8)
+    return prev
+end
+
+local function RestoreIdentity(prev)
+    if not _setidentity then return end
+    pcall(_setidentity, prev or 8)
+end
+
+-- ============================================================
 -- INVENTORY (update moi): doc qua ItemReplicationService +
 -- Inventory controller + ItemConfig thay cho CommF_ getInventory
 -- (getInventory khong con tra Mirror Fractal sau update).
@@ -341,24 +371,82 @@ local InvModules = {
     Ready       = false,
 }
 
+-- Tim node theo duong dan, khong index truc tiep de loi bao ro rang
+-- thay vi treo hoac "attempt to index nil".
+local function ResolvePath(root, path)
+    local node = root
+    for _, name in ipairs(path) do
+        if typeof(node) ~= "Instance" then return nil, name end
+        local child = node:FindFirstChild(name)
+        if not child then return nil, name end
+        node = child
+    end
+    return node
+end
+
+local _invLoadWarned = false
+local _invTilesWarned = false
+
 local function LoadInventoryModules()
     if InvModules.Ready then return true end
 
-    local ok = pcall(function()
-        InvModules.Inventory   = require(ReplicatedStorage.Controllers.UI.Inventory)
-        InvModules.ItemConfig  = require(ReplicatedStorage.ItemConfig)
-        InvModules.ItemService = require(ReplicatedStorage.ItemReplicationService)
-        InvModules.KEYS        = require(ReplicatedStorage.ItemReplicationService.KEYS)
-    end)
+    local paths = {
+        Inventory   = { "Controllers", "UI", "Inventory" },
+        ItemConfig  = { "ItemConfig" },
+        ItemService = { "ItemReplicationService" },
+        KEYS        = { "ItemReplicationService", "KEYS" },
+    }
 
-    if not ok then
-        InvModules.Inventory, InvModules.ItemConfig = nil, nil
-        InvModules.ItemService, InvModules.KEYS = nil, nil
-        return false
+    local nodes = {}
+    for key, path in pairs(paths) do
+        local node, missing = ResolvePath(ReplicatedStorage, path)
+        if not node then
+            if not _invLoadWarned then
+                _invLoadWarned = true
+                warn("[Inventory] Khong tim thay ReplicatedStorage."
+                    .. table.concat(path, ".")
+                    .. " (thieu '" .. tostring(missing) .. "')")
+            end
+            return false
+        end
+        nodes[key] = node
     end
 
-    InvModules.Ready = true
-    return true
+    -- require module cua game co the doi identity khac nhau tuy
+    -- executor. Thu lan luot 2 (script game) -> 8 -> giu nguyen.
+    -- Dung `false` lam sentinel "khong doi identity": neu de nil trong
+    -- table constructor thi ipairs se cat mat phan tu do.
+    local candidates = _setidentity and {2, 8, false} or {false}
+    local lastErr
+
+    for _, ident in ipairs(candidates) do
+        local prev = RaiseIdentity()
+        if ident and _setidentity then pcall(_setidentity, ident) end
+        local ok, err = pcall(function()
+            InvModules.Inventory   = require(nodes.Inventory)
+            InvModules.ItemConfig  = require(nodes.ItemConfig)
+            InvModules.ItemService = require(nodes.ItemService)
+            InvModules.KEYS        = require(nodes.KEYS)
+        end)
+
+        RestoreIdentity(prev)
+
+        if ok and type(InvModules.Inventory) == "table"
+            and type(InvModules.ItemService) == "table" then
+            InvModules.Ready = true
+            return true
+        end
+
+        lastErr = err
+        InvModules.Inventory, InvModules.ItemConfig = nil, nil
+        InvModules.ItemService, InvModules.KEYS = nil, nil
+    end
+
+    if not _invLoadWarned then
+        _invLoadWarned = true
+        warn("[Inventory] require that bai: " .. tostring(lastErr))
+    end
+    return false
 end
 
 local function InventoryModulesInitialized()
@@ -370,9 +458,10 @@ local function InventoryModulesInitialized()
     return ok and res == true
 end
 
-local function RefreshInventory()
+local function _RefreshInventoryInner()
+    -- LoadInventoryModules da tu warn mot lan roi, khong warn lai o day
+    -- vi main loop goi moi 1s -> spam console.
     if not LoadInventoryModules() then
-        warn("[Inventory] Khong require duoc module inventory")
         return
     end
 
@@ -401,9 +490,14 @@ local function RefreshInventory()
 
     local okTiles, tiles = pcall(function() return Inventory:GetTiles() end)
     if not okTiles or type(tiles) ~= "table" then
-        warn("[Inventory] GetTiles that bai")
+        -- Chi warn mot lan: main loop goi moi 1s.
+        if not _invTilesWarned then
+            _invTilesWarned = true
+            warn("[Inventory] GetTiles that bai: " .. tostring(tiles))
+        end
         return
     end
+    _invTilesWarned = false
 
     local backpack, seen, total = {}, {}, 0
 
@@ -437,6 +531,17 @@ local function RefreshInventory()
     -- khi inventory chua replicate xong.
     if total > 0 then
         ConChoChisiti36.Backpack = backpack
+    end
+end
+
+-- Goi vao module cua game co the ha identity giua duong. Luon tra
+-- identity ve muc cao sau khi doc xong, ke ca khi loi.
+local function RefreshInventory()
+    local prev = RaiseIdentity()
+    local ok, err = pcall(_RefreshInventoryInner)
+    RestoreIdentity(prev)
+    if not ok then
+        warn("[Inventory] RefreshInventory loi: " .. tostring(err))
     end
 end
 
@@ -970,7 +1075,7 @@ pcall(MakeUI)
 
 local _lastUiRefresh = 0
 
-local function UIUpdateTick()
+local function _UIUpdateTickInner()
     local now = os.time()
     if now - _lastUiRefresh < 1 then return end
     _lastUiRefresh = now
@@ -998,6 +1103,18 @@ local function UIUpdateTick()
     _doorLabel.Text    = "Temple Door: "     .. (ok and tostring(door) or "?")
     local ok2, prog = pcall(function() return CommF_:InvokeServer("RaceV4Progress", "Check") end)
     _progressLabel.Text = "RaceV4 Check: "   .. (ok2 and tostring(prog) or "?")
+end
+
+-- Ghi vao label o CoreGui/gethui can identity cao. Neu mot require
+-- truoc do da ha identity thi day la cho no no ra loi, nen luon
+-- raise identity + pcall: UI loi khong duoc lam chet main loop.
+local function UIUpdateTick()
+    local prev = RaiseIdentity()
+    local ok, err = pcall(_UIUpdateTickInner)
+    RestoreIdentity(prev)
+    if not ok then
+        warn("[UI] UIUpdateTick loi: " .. tostring(err))
+    end
 end
 
 while task.wait(1) do
