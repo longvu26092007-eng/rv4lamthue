@@ -12,9 +12,13 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
     ["Black Screen"]       = true,
 
     ["Use Mirage API"]     = true,
-    ["Mirage API"]         = "http://fi12.bot-hosting.cloud:20112/api/name=mirage",
+    ["Mirage API"]         = "https://baorph.pythonanywhere.com/jobid/mirage/token?token=8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8&api_key=baorapi",
     ["Avoid Full Server"]  = true,
     ["Max Players"]        = 11,
+
+    -- Lay 30 server MOI NHAT, join lan luot tung cai, cach nhau 1.5s
+    ["Fetch Count"]        = 30,
+    ["Hop Delay"]          = 1.5,
 }
 
 LPH_NO_VIRTUALIZE(function()
@@ -126,6 +130,8 @@ if tostring(Config["Mirage API"] or "") == "" then
 end
 Config["Avoid Full Server"] = Config["Avoid Full Server"] ~= false
 Config["Max Players"]       = Config["Max Players"] or 11
+Config["Fetch Count"]       = math.max(1, math.floor(tonumber(Config["Fetch Count"]) or 30))
+Config["Hop Delay"]         = math.max(0.1, tonumber(Config["Hop Delay"]) or 1.5)
 Config["Boost FPS"]         = Config["Boost FPS"] ~= false
 Config["FPS"]               = Config["FPS"] or 20
 Config["Black Screen"]      = Config["Black Screen"] or false
@@ -415,73 +421,53 @@ local function JsonDecodeSafe(body)
     return nil
 end
 
+-- ============================================================
+-- MIRAGE API (baorph): schema snake_case
+--   { count = N, items = { { raw_job_id, place_id, players,
+--                            timestamp, type, age_s, sea }, ... } }
+-- Lay FETCH_COUNT server MOI NHAT (timestamp giam dan).
+-- ============================================================
 local function NormalizeServerEntry(v)
-
-    if type(v) == "string" then
-        local s = v:gsub("^%s+", ""):gsub("%s+$", "")
-        if s == "" then return nil end
-        return {
-            JobId   = s,
-            PlaceId = nil,
-            Players = 0,
-            Region  = nil,
-            Raw     = v,
-        }
-    end
-
     if type(v) ~= "table" then return nil end
 
-    local jobId   = v.JobId or v.jobId or v.jobid or v.job_id or v.id
-    local placeId = v.PlaceId or v.placeId or v.placeid or v.place_id or v.place
-    local players = v.Players or v.players or v.player or v.Count or v.count or v.playerCount
-    local region  = v.Region or v.region
-
-    if type(players) == "string" then
-        local n = tostring(players):match("^(%d+)")
-        players = tonumber(n) or players
-    end
-
-    if not jobId then return nil end
+    local jobId = v.raw_job_id or v.job_id or v.jobid or v.JobId or v.id
+    if not jobId or tostring(jobId) == "" then return nil end
 
     return {
-        JobId   = tostring(jobId),
-        PlaceId = tonumber(placeId),
-        Players = tonumber(players) or 0,
-        Region  = region,
-        Raw     = v,
+        JobId     = tostring(jobId),
+        PlaceId   = tonumber(v.place_id or v.placeid or v.PlaceId),
+        Players   = tonumber(v.players or v.player or v.Players) or 0,
+        Timestamp = tonumber(v.timestamp or v.time) or 0,
+        Sea       = v.sea,
+        Type      = v.type,
     }
 end
 
 local function ExtractServerList(data)
     local list = {}
-
-    if type(data) == "string" then
-        local one = NormalizeServerEntry(data)
-        if one then table.insert(list, one) end
-        return list
-    end
-
     if type(data) ~= "table" then return list end
 
-    local source = data.data or data.servers or data.result or data.results or data
-
-    if type(source) == "string" then
-        local one = NormalizeServerEntry(source)
-        if one then table.insert(list, one) end
-        return list
-    end
-
+    local source = data.items or data.data or data.servers
     if type(source) ~= "table" then return list end
 
-    if source.JobId or source.jobId or source.job_id or source.id then
-        local one = NormalizeServerEntry(source)
-        if one then table.insert(list, one) end
-        return list
-    end
-
-    for _, v in pairs(source) do
+    for _, v in ipairs(source) do
         local one = NormalizeServerEntry(v)
         if one then table.insert(list, one) end
+    end
+
+    -- MOI NHAT truoc. Neu API khong tra timestamp -> dao mang
+    -- (baorph tra timestamp tang dan, phan tu cuoi la moi nhat).
+    local hasTs = false
+    for _, s in ipairs(list) do
+        if s.Timestamp > 0 then hasTs = true break end
+    end
+
+    if hasTs then
+        table.sort(list, function(a, b) return a.Timestamp > b.Timestamp end)
+    else
+        local rev = {}
+        for i = #list, 1, -1 do rev[#rev + 1] = list[i] end
+        list = rev
     end
 
     return list
@@ -494,9 +480,12 @@ local CachedMiragePlaceId = nil
 local function GetMirageServersFromAPI()
     local cfg = getgenv().PullLeverConfig or {}
     local url = tostring(cfg["Mirage API"] or "")
+
     if url == "" then
-        url = ""
+        warn("[MirageAPI] Mirage API url rong -> bo qua")
+        return {}
     end
+
     local currentPlaceId = tonumber(game.PlaceId)
 
     if CachedMirageServers
@@ -505,7 +494,6 @@ local function GetMirageServersFromAPI()
         return CachedMirageServers
     end
 
-    print("[MirageAPI] GET " .. tostring(url))
     SetStatus("Fetching Mirage API...")
 
     local ok, res = HttpRequest({
@@ -532,31 +520,13 @@ local function GetMirageServersFromAPI()
         return {}
     end
 
-    local servers = {}
-
     local data = JsonDecodeSafe(body)
-    if data then
-        servers = ExtractServerList(data)
-    else
+    if not data then
         warn("[MirageAPI] JSON decode failed. Body head: " .. tostring(body):sub(1, 300))
+        return {}
     end
 
-    if #servers == 0 then
-        local seen = {}
-        for guid in tostring(body):gmatch("%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x") do
-            if not seen[guid] then
-                seen[guid] = true
-                table.insert(servers, {
-                    JobId   = guid,
-                    PlaceId = nil,
-                    Players = 0,
-                })
-            end
-        end
-        if #servers > 0 then
-            warn("[MirageAPI] Fallback: trich " .. tostring(#servers) .. " JobId tho tu body")
-        end
-    end
+    local servers = ExtractServerList(data)
 
     if #servers > 0 then
         LastMirageApiFetch = os.time()
@@ -564,40 +534,41 @@ local function GetMirageServersFromAPI()
         CachedMirageServers = servers
     end
 
-    print("[MirageAPI] Parsed " .. tostring(#servers) .. " server(s)")
+    print("[MirageAPI] Parsed " .. tostring(#servers) .. " server(s), moi nhat truoc")
     SetStatus("Mirage API servers: " .. tostring(#servers))
     return servers
 end
 
-local JoinedMirageJobs = {}
-
 JoinJobIdByServerBrowser = function(jobId)
     if not jobId or tostring(jobId) == "" then
-        warn("[ServerBrowser] JobId rỗng -> bỏ qua")
         return false
     end
 
     if tostring(jobId) == tostring(game.JobId) then
-        warn("[ServerBrowser] Đang ở đúng JobId " .. tostring(jobId) .. " rồi -> bỏ qua")
+        return false
+    end
+
+    local sb = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+    if not sb then
+        warn("[ServerBrowser] Khong tim thay __ServerBrowser")
         return false
     end
 
     local ok, result = pcall(function()
-        return game:GetService("ReplicatedStorage")
-            :WaitForChild("__ServerBrowser")
-            :InvokeServer("teleport", tostring(jobId))
+        return sb:InvokeServer("teleport", tostring(jobId))
     end)
 
     if not ok then
-        warn("[ServerBrowser] Join JobId lỗi: " .. tostring(result))
+        warn("[ServerBrowser] Join JobId loi: " .. tostring(result))
         return false
     end
 
-    warn("[ServerBrowser] Đã gửi lệnh join JobId=" .. tostring(jobId) .. " | Result=" .. tostring(result))
-    task.wait(8)
     return true
 end
 
+-- Lay 30 server moi nhat -> join lan luot tu gan nhat den thu 30,
+-- moi lan cach nhau Hop Delay (1.5s). Neu het danh sach van chua
+-- vao duoc server nao -> return false de main loop refresh lai.
 local function HopMirageByAPI()
     local cfg = getgenv().PullLeverConfig or {}
 
@@ -607,32 +578,33 @@ local function HopMirageByAPI()
 
     local servers = GetMirageServersFromAPI()
     if type(servers) ~= "table" or #servers <= 0 then
-        SetStatus("Mirage API empty -> fallback")
+        SetStatus("Mirage API empty -> refresh")
         return false
     end
 
     local currentPlaceId = tonumber(game.PlaceId)
-    local maxPlayers = tonumber(cfg["Max Players"] or 11) or 11
-    local avoidFull  = cfg["Avoid Full Server"] ~= false
-    local candidates = {}
-    local samePlaceCount = 0
+    local maxPlayers     = tonumber(cfg["Max Players"] or 11) or 11
+    local avoidFull      = cfg["Avoid Full Server"] ~= false
+    local fetchCount     = math.max(1, math.floor(tonumber(cfg["Fetch Count"]) or 30))
+    local hopDelay       = math.max(0.1, tonumber(cfg["Hop Delay"]) or 1.5)
+
+    local candidates, samePlaceCount = {}, 0
 
     for _, server in ipairs(servers) do
-        local jobId   = server.JobId
         local placeId = tonumber(server.PlaceId)
-        local players = tonumber(server.Players or 0) or 0
+        local players = tonumber(server.Players) or 0
 
-        local samePlace  = placeId ~= nil and placeId == currentPlaceId
-        local notSameJob = tostring(jobId) ~= tostring(game.JobId)
-        local notVisited = not JoinedMirageJobs[tostring(jobId)]
+        -- placeId nil = API khong tra -> coi nhu cung place (ServerBrowser
+        -- teleport trong place hien tai nen khong gay Error 773).
+        local samePlace  = (placeId == nil) or (placeId == currentPlaceId)
+        local notSameJob = tostring(server.JobId) ~= tostring(game.JobId)
         local notFull    = (not avoidFull) or players <= maxPlayers
 
-        if samePlace then
-            samePlaceCount = samePlaceCount + 1
-        end
+        if samePlace then samePlaceCount = samePlaceCount + 1 end
 
-        if jobId and samePlace and notSameJob and notVisited and notFull then
-            table.insert(candidates, server)
+        if samePlace and notSameJob and notFull then
+            candidates[#candidates + 1] = server
+            if #candidates >= fetchCount then break end
         end
     end
 
@@ -640,37 +612,38 @@ local function HopMirageByAPI()
         SetStatus(
             "No Mirage JobId for PlaceId=" .. tostring(currentPlaceId)
             .. " | SamePlace=" .. tostring(samePlaceCount)
-            .. " -> fallback"
+            .. " -> refresh"
         )
         return false
     end
 
-    local server = candidates[math.random(1, #candidates)]
-    local jobId = tostring(server.JobId)
-    local players = tonumber(server.Players or 0) or 0
-    local placeId = tonumber(server.PlaceId)
+    SetStatus("Mirage: thu " .. tostring(#candidates) .. " server (moi nhat -> cu)")
 
-    JoinedMirageJobs[jobId] = true
+    for i, server in ipairs(candidates) do
+        local jobId = tostring(server.JobId)
 
-    SetStatus(
-        "Join Mirage | PlaceId=" .. tostring(placeId)
-        .. " | Players=" .. tostring(players)
-        .. " | Candidates=" .. tostring(#candidates)
-    )
-    print(
-        "[MirageAPI] CurrentPlaceId=" .. tostring(currentPlaceId)
-        .. " PickPlaceId=" .. tostring(placeId)
-        .. " JobId=" .. tostring(jobId)
-        .. " Players=" .. tostring(players)
-        .. " Region=" .. tostring(server.Region)
-    )
+        SetStatus(
+            "Join Mirage " .. tostring(i) .. "/" .. tostring(#candidates)
+            .. " | Players=" .. tostring(server.Players)
+            .. " | " .. jobId:sub(1, 8)
+        )
+        print(
+            "[MirageAPI] #" .. tostring(i)
+            .. " JobId=" .. jobId
+            .. " PlaceId=" .. tostring(server.PlaceId)
+            .. " Players=" .. tostring(server.Players)
+            .. " Timestamp=" .. tostring(server.Timestamp)
+        )
 
-    local joined = JoinJobIdByServerBrowser(jobId)
-    if joined then
-        return true
+        JoinJobIdByServerBrowser(jobId)
+
+        -- Teleport la fire-and-forget: neu thanh cong thi phien bi reset
+        -- ngay trong lucwait nay. Con song sau khi cho => join that bai
+        -- -> sang server ke tiep.
+        task.wait(hopDelay)
     end
 
-    task.wait(2)
+    SetStatus("Da thu het " .. tostring(#candidates) .. " server -> refresh")
     return false
 end
 
