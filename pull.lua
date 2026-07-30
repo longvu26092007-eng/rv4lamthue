@@ -12,7 +12,7 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
     ["Black Screen"]       = true,
 
     ["Use Mirage API"]     = true,
-    ["Mirage API"]         = "https://baorph.pythonanywhere.com/jobid/mirage/token?token=8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8&api_key=baorapi",
+    ["Mirage API"]         = "https://baorph.pythonanywhere.com/token?token=8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8&api_key=baorapi&key=mirage",
     ["Avoid Full Server"]  = true,
     ["Max Players"]        = 11,
 
@@ -626,24 +626,33 @@ local function JsonDecodeSafe(body)
 end
 
 -- ============================================================
--- MIRAGE API (baorph): schema snake_case
---   { count = N, items = { { raw_job_id, place_id, players,
---                            timestamp, type, age_s, sea }, ... } }
--- Lay FETCH_COUNT server MOI NHAT (timestamp giam dan).
+-- MIRAGE API (baorph): schema moi (2026-07)
+--   { count = N, ok = true, key = "island",
+--     items = [ "job id: <GUID>; player: <N>[/12]; placeid: <N|None>", ... ] }
+-- items la mang STRING, khong phai object.
+-- Giu nguyen thu tu API tra ve (khong sort).
 -- ============================================================
 local function NormalizeServerEntry(v)
+    -- Schema moi: string
+    if type(v) == "string" then
+        local jobId   = v:match("job%s*id:%s*([%x%-]+)")
+        local players = tonumber(v:match("player:%s*(%d+)")) or 0
+        local placeId = tonumber(v:match("placeid:%s*(%d+)"))  -- "None" -> nil
+        if not jobId or jobId == "" then return nil end
+        return {
+            JobId   = jobId,
+            PlaceId = placeId,
+            Players = players,
+        }
+    end
+    -- Du phong: object (schema cu)
     if type(v) ~= "table" then return nil end
-
     local jobId = v.raw_job_id or v.job_id or v.jobid or v.JobId or v.id
     if not jobId or tostring(jobId) == "" then return nil end
-
     return {
-        JobId     = tostring(jobId),
-        PlaceId   = tonumber(v.place_id or v.placeid or v.PlaceId),
-        Players   = tonumber(v.players or v.player or v.Players) or 0,
-        Timestamp = tonumber(v.timestamp or v.time) or 0,
-        Sea       = v.sea,
-        Type      = v.type,
+        JobId   = tostring(jobId),
+        PlaceId = tonumber(v.place_id or v.placeid or v.PlaceId),
+        Players = tonumber(v.players or v.player or v.Players) or 0,
     }
 end
 
@@ -657,21 +666,6 @@ local function ExtractServerList(data)
     for _, v in ipairs(source) do
         local one = NormalizeServerEntry(v)
         if one then table.insert(list, one) end
-    end
-
-    -- MOI NHAT truoc. Neu API khong tra timestamp -> dao mang
-    -- (baorph tra timestamp tang dan, phan tu cuoi la moi nhat).
-    local hasTs = false
-    for _, s in ipairs(list) do
-        if s.Timestamp > 0 then hasTs = true break end
-    end
-
-    if hasTs then
-        table.sort(list, function(a, b) return a.Timestamp > b.Timestamp end)
-    else
-        local rev = {}
-        for i = #list, 1, -1 do rev[#rev + 1] = list[i] end
-        list = rev
     end
 
     return list
