@@ -126,46 +126,89 @@ function CheckSea(n)
 end
 
 -- ======================================================================
--- [ INVENTORY REPLICATION DETECTOR ]
--- Dùng Inventory + ItemReplicationService thay hoàn toàn getInventory remote.
--- Material được nhận dạng bằng ItemConfig.Display.Category == "Material".
+-- [ INVENTORY REPLICATION DETECTOR — ĐÚNG MẪU USER GỬI ]
+-- Chỉ detect Material bằng Inventory + ItemReplicationService.
+-- Không dùng CommF_:InvokeServer("getInventory") cho bất kỳ material nào.
 -- ======================================================================
-local Inventory = require(ReplicatedStorage.Controllers.UI.Inventory)
-local ItemConfig = require(ReplicatedStorage.ItemConfig)
-local ItemService = require(ReplicatedStorage.ItemReplicationService)
-local ITEM_KEYS = require(ReplicatedStorage.ItemReplicationService.KEYS)
+local RS = game:GetService("ReplicatedStorage")
 
-repeat task.wait(0.2)
-until Inventory:GetIfInitialized()
-    and ItemService.IsInitialized == true
+local Inventory = require(RS.Controllers.UI.Inventory)
+local ItemConfig = require(RS.ItemConfig)
+local ItemService = require(RS.ItemReplicationService)
+local KEYS = require(RS.ItemReplicationService.KEYS)
 
+-- Không chặn luồng tạo UI. Worker này chờ đúng điều kiện từ code mẫu.
+local MaterialDetectorReady = false
+local MaterialDetectorError = nil
+
+task.spawn(function()
+    local ok, err = pcall(function()
+        repeat task.wait(0.2)
+        until Inventory:GetIfInitialized()
+            and ItemService.IsInitialized == true
+
+        MaterialDetectorReady = true
+    end)
+
+    if not ok then
+        MaterialDetectorError = tostring(err)
+        warn("[MaterialDetector] Init error: " .. MaterialDetectorError)
+    end
+end)
+
+local MaterialCache = {}
+local MaterialCacheTime = 0
 local MATERIAL_CACHE_TTL = 0.5
-local _materialCache = {}
-local _inventoryItemCache = {}
-local _materialCacheTime = 0
 
-local function RefreshReplicatedInventory(force)
-    if not force and (tick() - _materialCacheTime) < MATERIAL_CACHE_TTL then
-        return _materialCache
-    end
-
-    local amounts = {}
-    for _, item in pairs(ItemService:GetItems(ITEM_KEYS.QUANTITY) or {}) do
-        local id = item.ItemId
-        if id then
-            amounts[id] = (amounts[id] or 0) + (tonumber(item.Value) or 0)
+local function WaitMaterialDetector()
+    while not MaterialDetectorReady do
+        if MaterialDetectorError then
+            return false, MaterialDetectorError
         end
+        task.wait(0.2)
+    end
+    return true
+end
+
+-- Logic bên trong giữ đúng cấu trúc đoạn code user gửi:
+-- 1) lấy QUANTITY theo ItemId
+-- 2) duyệt Inventory:GetTiles()
+-- 3) ItemConfig.match(id):unwrap()
+-- 4) chỉ nhận Display.Category == "Material"
+local function ScanMaterials(force)
+    if not force and (tick() - MaterialCacheTime) < MATERIAL_CACHE_TTL then
+        return MaterialCache
     end
 
-    local materials = {}
-    local allItems = {}
-    local checked = {}
+    local ready, initErr = WaitMaterialDetector()
+    if not ready then
+        warn("[MaterialDetector] Not ready: " .. tostring(initErr))
+        return MaterialCache
+    end
+
+    local Groups = {
+        ["Sword"] = {},
+        ["Gun"] = {},
+        ["Accessory"] = {},
+        ["Material"] = {},
+        ["Blox Fruit"] = {}
+    }
+
+    local Amounts = {}
+
+    for _, item in pairs(ItemService:GetItems(KEYS.QUANTITY) or {}) do
+        Amounts[item.ItemId] =
+            (Amounts[item.ItemId] or 0)
+            + (tonumber(item.Value) or 0)
+    end
+
+    local Checked = {}
 
     for _, tile in pairs(Inventory:GetTiles() or {}) do
         local id = tile.ItemId
 
-        if id and not checked[id] then
-            checked[id] = true
+        if id and not Checked[id] then
+            Checked[id] = true
 
             local success, config = pcall(function()
                 return ItemConfig.match(id):unwrap()
@@ -173,69 +216,36 @@ local function RefreshReplicatedInventory(force)
 
             if success and config and config.Display then
                 local category = config.Display.Category
-                local name = config.Display.Name
-                    or (config.Index and config.Index.StorageKey)
-                    or tostring(id)
-                local amount = amounts[id] or 1
 
-                allItems[name] = {
-                    ItemId = id,
-                    Name = name,
-                    Type = category,
-                    Count = amount,
-                }
+                if Groups[category] then
+                    local name =
+                        config.Display.Name
+                        or config.Index.StorageKey
+                        or tostring(id)
 
-                if category == "Material" then
-                    materials[name] = amount
+                    Groups[category][name] = Amounts[id] or 1
                 end
             end
         end
     end
 
-    _materialCache = materials
-    _inventoryItemCache = allItems
-    _materialCacheTime = tick()
-    return _materialCache
+    MaterialCache = Groups["Material"]
+    MaterialCacheTime = tick()
+    return MaterialCache
 end
 
--- Snapshot dạng: ["Dark Fragment"] = 2, ["Vampire Fang"] = 20, ...
 function GetMaterialSnapshot(force)
-    return RefreshReplicatedInventory(force == true)
+    return ScanMaterials(force == true)
 end
 
-function CheckMaterial(matName)
-    local materials = RefreshReplicatedInventory(false)
+function CheckMaterial(matName, force)
+    local materials = ScanMaterials(force == true)
     return tonumber(materials[matName]) or 0
 end
 
 function GetMaterialCount(matName, materials)
-    materials = materials or RefreshReplicatedInventory(false)
+    materials = materials or ScanMaterials(false)
     return tonumber(materials[matName]) or 0
-end
-
--- Giữ helper cũ để các phần khác/script ngoài không bị gãy,
--- nhưng dữ liệu cũng lấy từ hệ replication mới, không gọi getInventory remote.
-function GetInventory(force)
-    RefreshReplicatedInventory(force == true)
-    local inventory = {}
-
-    for _, item in pairs(_inventoryItemCache) do
-        inventory[#inventory + 1] = item
-    end
-
-    return inventory
-end
-
-function CheckInventory(...)
-    RefreshReplicatedInventory(false)
-
-    for _, name in ipairs({...}) do
-        if _inventoryItemCache[name] then
-            return true
-        end
-    end
-
-    return false
 end
 
 function CheckTool(v)
@@ -678,24 +688,46 @@ local function SetStatus(txt, color)
 end
 
 local function UpdateMaterials()
-    local inv = GetMaterialSnapshot(true)
-    for _, data in ipairs(MaterialChecks) do
-        local count = GetMaterialCount(data[1], inv)
-        local label = matLabels[data[1]]
-        if label then
-            label.Text = string.format("📦 %s: %d/%d", data[1], count, data[2])
-            label.TextColor3 = (count >= data[2]) and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(200, 200, 200)
+    local ok, err = pcall(function()
+        local materials = GetMaterialSnapshot(true)
+
+        for _, data in ipairs(MaterialChecks) do
+            local count = GetMaterialCount(data[1], materials)
+            local label = matLabels[data[1]]
+
+            if label then
+                label.Text = string.format("📦 %s: %d/%d", data[1], count, data[2])
+                label.TextColor3 = (count >= data[2])
+                    and Color3.fromRGB(0, 255, 0)
+                    or Color3.fromRGB(200, 200, 200)
+            end
         end
-    end
-    local fragCount = 0
-    pcall(function() fragCount = Player.Data.Fragments.Value end)
-    if matLabels["Fragment"] then
-        matLabels["Fragment"].Text = string.format("💎 Fragment: %d/5000", fragCount)
-        matLabels["Fragment"].TextColor3 = (fragCount >= 5000) and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(200, 200, 200)
+
+        local fragCount = 0
+        pcall(function()
+            fragCount = Player.Data.Fragments.Value
+        end)
+
+        if matLabels["Fragment"] then
+            matLabels["Fragment"].Text = string.format("💎 Fragment: %d/5000", fragCount)
+            matLabels["Fragment"].TextColor3 = (fragCount >= 5000)
+                and Color3.fromRGB(0, 255, 0)
+                or Color3.fromRGB(200, 200, 200)
+        end
+    end)
+
+    if not ok then
+        warn("[UpdateMaterials] " .. tostring(err))
     end
 end
-UpdateMaterials()
-task.spawn(function() while task.wait(10) do UpdateMaterials() end end)
+
+-- Không gọi đồng bộ ở top-level để tránh một lỗi detector làm đứng toàn bộ UI/script.
+task.spawn(function()
+    UpdateMaterials()
+    while task.wait(10) do
+        UpdateMaterials()
+    end
+end)
 
 services.UserInputService.InputBegan:Connect(function(input, gpe)
     if not gpe and input.KeyCode == Enum.KeyCode.LeftAlt then MainFrame.Visible = not MainFrame.Visible end
