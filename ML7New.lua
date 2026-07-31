@@ -125,33 +125,117 @@ function CheckSea(n)
     return num ~= nil and n == num
 end
 
--- inventory cache (TTL 1s) — giảm spam getInventory tới server
-local _invCache, _invTime = nil, 0
+-- ======================================================================
+-- [ INVENTORY REPLICATION DETECTOR ]
+-- Dùng Inventory + ItemReplicationService thay hoàn toàn getInventory remote.
+-- Material được nhận dạng bằng ItemConfig.Display.Category == "Material".
+-- ======================================================================
+local Inventory = require(ReplicatedStorage.Controllers.UI.Inventory)
+local ItemConfig = require(ReplicatedStorage.ItemConfig)
+local ItemService = require(ReplicatedStorage.ItemReplicationService)
+local ITEM_KEYS = require(ReplicatedStorage.ItemReplicationService.KEYS)
+
+repeat task.wait(0.2)
+until Inventory:GetIfInitialized()
+    and ItemService.IsInitialized == true
+
+local MATERIAL_CACHE_TTL = 0.5
+local _materialCache = {}
+local _inventoryItemCache = {}
+local _materialCacheTime = 0
+
+local function RefreshReplicatedInventory(force)
+    if not force and (tick() - _materialCacheTime) < MATERIAL_CACHE_TTL then
+        return _materialCache
+    end
+
+    local amounts = {}
+    for _, item in pairs(ItemService:GetItems(ITEM_KEYS.QUANTITY) or {}) do
+        local id = item.ItemId
+        if id then
+            amounts[id] = (amounts[id] or 0) + (tonumber(item.Value) or 0)
+        end
+    end
+
+    local materials = {}
+    local allItems = {}
+    local checked = {}
+
+    for _, tile in pairs(Inventory:GetTiles() or {}) do
+        local id = tile.ItemId
+
+        if id and not checked[id] then
+            checked[id] = true
+
+            local success, config = pcall(function()
+                return ItemConfig.match(id):unwrap()
+            end)
+
+            if success and config and config.Display then
+                local category = config.Display.Category
+                local name = config.Display.Name
+                    or (config.Index and config.Index.StorageKey)
+                    or tostring(id)
+                local amount = amounts[id] or 1
+
+                allItems[name] = {
+                    ItemId = id,
+                    Name = name,
+                    Type = category,
+                    Count = amount,
+                }
+
+                if category == "Material" then
+                    materials[name] = amount
+                end
+            end
+        end
+    end
+
+    _materialCache = materials
+    _inventoryItemCache = allItems
+    _materialCacheTime = tick()
+    return _materialCache
+end
+
+-- Snapshot dạng: ["Dark Fragment"] = 2, ["Vampire Fang"] = 20, ...
+function GetMaterialSnapshot(force)
+    return RefreshReplicatedInventory(force == true)
+end
+
+function CheckMaterial(matName)
+    local materials = RefreshReplicatedInventory(false)
+    return tonumber(materials[matName]) or 0
+end
+
+function GetMaterialCount(matName, materials)
+    materials = materials or RefreshReplicatedInventory(false)
+    return tonumber(materials[matName]) or 0
+end
+
+-- Giữ helper cũ để các phần khác/script ngoài không bị gãy,
+-- nhưng dữ liệu cũng lấy từ hệ replication mới, không gọi getInventory remote.
 function GetInventory(force)
-    if not force and _invCache and (tick() - _invTime) < 1 then return _invCache end
-    local ok, inv = pcall(function() return COMMF_:InvokeServer("getInventory") end)
-    if ok and type(inv) == "table" then _invCache, _invTime = inv, tick() return inv end
-    return _invCache or {}
-end
-function CheckMaterial(x)
-    for _, v in ipairs(GetInventory()) do
-        if v.Type == "Material" and v.Name == x then return v.Count or 0 end
+    RefreshReplicatedInventory(force == true)
+    local inventory = {}
+
+    for _, item in pairs(_inventoryItemCache) do
+        inventory[#inventory + 1] = item
     end
-    return 0
+
+    return inventory
 end
+
 function CheckInventory(...)
-    local names = {...}
-    for _, v in ipairs(GetInventory()) do
-        for _, n in ipairs(names) do if v.Name == n then return true end end
+    RefreshReplicatedInventory(false)
+
+    for _, name in ipairs({...}) do
+        if _inventoryItemCache[name] then
+            return true
+        end
     end
+
     return false
-end
-function GetMaterialCount(matName, inv)
-    inv = inv or GetInventory()
-    for _, item in ipairs(inv) do
-        if item.Name == matName then return item.Count or 0 end
-    end
-    return 0
 end
 
 function CheckTool(v)
@@ -594,7 +678,7 @@ local function SetStatus(txt, color)
 end
 
 local function UpdateMaterials()
-    local inv = GetInventory(true)
+    local inv = GetMaterialSnapshot(true)
     for _, data in ipairs(MaterialChecks) do
         local count = GetMaterialCount(data[1], inv)
         local label = matLabels[data[1]]
@@ -1042,7 +1126,7 @@ task.spawn(function()
 
     -- NHÁNH B: farm nguyên liệu
     print("[P1B] SA chưa active → check nguyên liệu...")
-    local inv = GetInventory(true)
+    local inv = GetMaterialSnapshot(true)
     local dfCount = GetMaterialCount("Dark Fragment", inv)
 
     if dfCount >= DF_TARGET then
@@ -1067,7 +1151,7 @@ task.spawn(function()
                 LoadMaterialFarm("Demonic Wisp")
                 task.spawn(function()
                     while task.wait(15) do
-                        local ci = GetInventory(true)
+                        local ci = GetMaterialSnapshot(true)
                         SetStatus(string.format("DW %d/20 | VF %d/20 | DF %d/%d",
                             GetMaterialCount("Demonic Wisp", ci), GetMaterialCount("Vampire Fang", ci),
                             GetMaterialCount("Dark Fragment", ci), DF_TARGET))
