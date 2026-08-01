@@ -126,9 +126,7 @@ function CheckSea(n)
 end
 
 -- ======================================================================
--- [ INVENTORY REPLICATION DETECTOR — ĐÚNG MẪU USER GỬI ]
--- Chỉ detect Material bằng Inventory + ItemReplicationService.
--- Không dùng CommF_:InvokeServer("getInventory") cho bất kỳ material nào.
+-- [ INVENTORY DETECTOR — DÙNG ĐÚNG CÁCH USER GỬI ]
 -- ======================================================================
 local RS = game:GetService("ReplicatedStorage")
 
@@ -137,61 +135,28 @@ local ItemConfig = require(RS.ItemConfig)
 local ItemService = require(RS.ItemReplicationService)
 local KEYS = require(RS.ItemReplicationService.KEYS)
 
--- Không chặn luồng tạo UI. Worker này chờ đúng điều kiện từ code mẫu.
-local MaterialDetectorReady = false
-local MaterialDetectorError = nil
+-- Chờ đồng bộ đúng như đoạn test gốc của user.
+repeat task.wait(0.2)
+until Inventory:GetIfInitialized()
+    and ItemService.IsInitialized == true
 
-task.spawn(function()
-    local ok, err = pcall(function()
-        repeat task.wait(0.2)
-        until Inventory:GetIfInitialized()
-            and ItemService.IsInitialized == true
-
-        MaterialDetectorReady = true
-    end)
-
-    if not ok then
-        MaterialDetectorError = tostring(err)
-        warn("[MaterialDetector] Init error: " .. MaterialDetectorError)
-    end
-end)
-
-local MaterialCache = {}
-local MaterialCacheTime = 0
-local MATERIAL_CACHE_TTL = 0.5
-
-local function WaitMaterialDetector()
-    while not MaterialDetectorReady do
-        if MaterialDetectorError then
-            return false, MaterialDetectorError
-        end
-        task.wait(0.2)
-    end
-    return true
-end
-
--- Logic bên trong giữ đúng cấu trúc đoạn code user gửi:
--- 1) lấy QUANTITY theo ItemId
--- 2) duyệt Inventory:GetTiles()
--- 3) ItemConfig.match(id):unwrap()
--- 4) chỉ nhận Display.Category == "Material"
-local function ScanMaterials(force)
-    if not force and (tick() - MaterialCacheTime) < MATERIAL_CACHE_TTL then
-        return MaterialCache
-    end
-
-    local ready, initErr = WaitMaterialDetector()
-    if not ready then
-        warn("[MaterialDetector] Not ready: " .. tostring(initErr))
-        return MaterialCache
-    end
-
+-- Toàn bộ phần đọc inventory bên trong giữ đúng cấu trúc đoạn user gửi.
+-- Không dùng cache cũ; mỗi lần cần số lượng sẽ đọc lại từ ItemReplicationService.
+local function ScanInventoryGroups()
     local Groups = {
         ["Sword"] = {},
         ["Gun"] = {},
         ["Accessory"] = {},
         ["Material"] = {},
         ["Blox Fruit"] = {}
+    }
+
+    local Order = {
+        "Sword",
+        "Gun",
+        "Accessory",
+        "Material",
+        "Blox Fruit"
     }
 
     local Amounts = {}
@@ -229,23 +194,25 @@ local function ScanMaterials(force)
         end
     end
 
-    MaterialCache = Groups["Material"]
-    MaterialCacheTime = tick()
-    return MaterialCache
+    return Groups
 end
 
-function GetMaterialSnapshot(force)
-    return ScanMaterials(force == true)
+-- Trả về toàn bộ Groups, giống bảng Groups trong code test.
+function GetInventoryGroups()
+    return ScanInventoryGroups()
 end
 
-function CheckMaterial(matName, force)
-    local materials = ScanMaterials(force == true)
-    return tonumber(materials[matName]) or 0
+-- Tất cả chỗ detect Material trong script đều đi qua hàm này.
+function CheckMaterial(materialName)
+    local Groups = ScanInventoryGroups()
+    return tonumber(Groups["Material"][materialName]) or 0
 end
 
-function GetMaterialCount(matName, materials)
-    materials = materials or ScanMaterials(false)
-    return tonumber(materials[matName]) or 0
+-- Tương thích các đoạn orchestration/UI đang truyền snapshot Groups.
+function GetMaterialCount(materialName, Groups)
+    Groups = Groups or ScanInventoryGroups()
+    local materials = Groups["Material"] or {}
+    return tonumber(materials[materialName]) or 0
 end
 
 function CheckTool(v)
@@ -688,46 +655,24 @@ local function SetStatus(txt, color)
 end
 
 local function UpdateMaterials()
-    local ok, err = pcall(function()
-        local materials = GetMaterialSnapshot(true)
-
-        for _, data in ipairs(MaterialChecks) do
-            local count = GetMaterialCount(data[1], materials)
-            local label = matLabels[data[1]]
-
-            if label then
-                label.Text = string.format("📦 %s: %d/%d", data[1], count, data[2])
-                label.TextColor3 = (count >= data[2])
-                    and Color3.fromRGB(0, 255, 0)
-                    or Color3.fromRGB(200, 200, 200)
-            end
+    local inv = GetInventoryGroups(true)
+    for _, data in ipairs(MaterialChecks) do
+        local count = GetMaterialCount(data[1], inv)
+        local label = matLabels[data[1]]
+        if label then
+            label.Text = string.format("📦 %s: %d/%d", data[1], count, data[2])
+            label.TextColor3 = (count >= data[2]) and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(200, 200, 200)
         end
-
-        local fragCount = 0
-        pcall(function()
-            fragCount = Player.Data.Fragments.Value
-        end)
-
-        if matLabels["Fragment"] then
-            matLabels["Fragment"].Text = string.format("💎 Fragment: %d/5000", fragCount)
-            matLabels["Fragment"].TextColor3 = (fragCount >= 5000)
-                and Color3.fromRGB(0, 255, 0)
-                or Color3.fromRGB(200, 200, 200)
-        end
-    end)
-
-    if not ok then
-        warn("[UpdateMaterials] " .. tostring(err))
+    end
+    local fragCount = 0
+    pcall(function() fragCount = Player.Data.Fragments.Value end)
+    if matLabels["Fragment"] then
+        matLabels["Fragment"].Text = string.format("💎 Fragment: %d/5000", fragCount)
+        matLabels["Fragment"].TextColor3 = (fragCount >= 5000) and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(200, 200, 200)
     end
 end
-
--- Không gọi đồng bộ ở top-level để tránh một lỗi detector làm đứng toàn bộ UI/script.
-task.spawn(function()
-    UpdateMaterials()
-    while task.wait(10) do
-        UpdateMaterials()
-    end
-end)
+UpdateMaterials()
+task.spawn(function() while task.wait(10) do UpdateMaterials() end end)
 
 services.UserInputService.InputBegan:Connect(function(input, gpe)
     if not gpe and input.KeyCode == Enum.KeyCode.LeftAlt then MainFrame.Visible = not MainFrame.Visible end
@@ -1158,7 +1103,7 @@ task.spawn(function()
 
     -- NHÁNH B: farm nguyên liệu
     print("[P1B] SA chưa active → check nguyên liệu...")
-    local inv = GetMaterialSnapshot(true)
+    local inv = GetInventoryGroups(true)
     local dfCount = GetMaterialCount("Dark Fragment", inv)
 
     if dfCount >= DF_TARGET then
@@ -1183,7 +1128,7 @@ task.spawn(function()
                 LoadMaterialFarm("Demonic Wisp")
                 task.spawn(function()
                     while task.wait(15) do
-                        local ci = GetMaterialSnapshot(true)
+                        local ci = GetInventoryGroups(true)
                         SetStatus(string.format("DW %d/20 | VF %d/20 | DF %d/%d",
                             GetMaterialCount("Demonic Wisp", ci), GetMaterialCount("Vampire Fang", ci),
                             GetMaterialCount("Dark Fragment", ci), DF_TARGET))
