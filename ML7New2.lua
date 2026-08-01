@@ -126,9 +126,7 @@ function CheckSea(n)
 end
 
 -- ======================================================================
--- [ MATERIAL DETECTOR — Inventory + ItemReplicationService ]
--- Dùng đúng luồng quét: QUANTITY -> GetTiles -> ItemConfig -> Groups.
--- Khởi tạo ở task riêng để không chặn UI và toàn bộ orchestration.
+-- [ MATERIAL DETECTOR — ĐÚNG NGUYÊN CÁCH USER GỬI ]
 -- ======================================================================
 local RS = game:GetService("ReplicatedStorage")
 
@@ -137,74 +135,11 @@ local ItemConfig = require(RS.ItemConfig)
 local ItemService = require(RS.ItemReplicationService)
 local KEYS = require(RS.ItemReplicationService.KEYS)
 
-local MaterialDetectorReady = false
-local MaterialDetectorError = nil
+repeat task.wait(0.2)
+until Inventory:GetIfInitialized()
+    and ItemService.IsInitialized == true
 
--- Không khóa cứng vào GetIfInitialized vì controller này có server trả false
--- dù GetTiles và ItemReplicationService đã có dữ liệu dùng được.
--- Vẫn ưu tiên đúng điều kiện gốc, sau đó xác nhận trực tiếp bằng chính 2 nguồn dữ liệu.
-local function IsMaterialDetectorReady()
-    local okInitialized, initialized = pcall(function()
-        return Inventory:GetIfInitialized()
-    end)
-
-    local okTiles, tiles = pcall(function()
-        return Inventory:GetTiles() or {}
-    end)
-
-    local okItems, items = pcall(function()
-        return ItemService:GetItems(KEYS.QUANTITY) or {}
-    end)
-
-    if okInitialized and initialized and ItemService.IsInitialized == true then
-        return true
-    end
-
-    return okTiles
-        and type(tiles) == "table"
-        and next(tiles) ~= nil
-        and okItems
-        and type(items) == "table"
-        and (ItemService.IsInitialized == true or next(items) ~= nil)
-end
-
-task.spawn(function()
-    local successInit, initError = pcall(function()
-        repeat task.wait(0.2)
-        until IsMaterialDetectorReady()
-
-        MaterialDetectorReady = true
-    end)
-
-    if not successInit then
-        MaterialDetectorError = tostring(initError)
-        warn("[MaterialDetector] Init error: " .. MaterialDetectorError)
-    end
-end)
-
-local function WaitMaterialDetector()
-    while not MaterialDetectorReady do
-        if MaterialDetectorError then
-            error("[MaterialDetector] " .. MaterialDetectorError)
-        end
-        task.wait(0.2)
-    end
-end
-
--- Cache ngắn chỉ để vòng Darkbeard 0.2s không quét toàn bộ inventory mỗi frame.
--- Nội dung của mỗi lần quét vẫn dùng nguyên cách Inventory replication bên dưới.
-local MaterialGroupsCache = nil
-local MaterialGroupsCacheTime = 0
-local MATERIAL_CACHE_TTL = 0.5
-
-local function ScanInventoryGroups(force)
-    WaitMaterialDetector()
-
-    if not force and MaterialGroupsCache
-        and (tick() - MaterialGroupsCacheTime) < MATERIAL_CACHE_TTL then
-        return MaterialGroupsCache
-    end
-
+local function ScanInventoryGroups()
     local Groups = {
         ["Sword"] = {},
         ["Gun"] = {},
@@ -256,23 +191,17 @@ local function ScanInventoryGroups(force)
         end
     end
 
-    MaterialGroupsCache = Groups
-    MaterialGroupsCacheTime = tick()
     return Groups
 end
 
-function GetInventoryGroups(force)
-    return ScanInventoryGroups(force == true)
-end
-
-function CheckMaterial(materialName, force)
-    local Groups = ScanInventoryGroups(force == true)
+function CheckMaterial(materialName)
+    local Groups = ScanInventoryGroups()
     return tonumber(Groups["Material"][materialName]) or 0
 end
 
 function GetMaterialCount(materialName, Groups)
-    Groups = Groups or ScanInventoryGroups(false)
-    return tonumber((Groups["Material"] or {})[materialName]) or 0
+    Groups = Groups or ScanInventoryGroups()
+    return tonumber(Groups["Material"][materialName]) or 0
 end
 
 function CheckTool(v)
@@ -715,9 +644,9 @@ local function SetStatus(txt, color)
 end
 
 local function UpdateMaterials()
-    local Groups = GetInventoryGroups(true)
+    local inv = ScanInventoryGroups()
     for _, data in ipairs(MaterialChecks) do
-        local count = GetMaterialCount(data[1], Groups)
+        local count = GetMaterialCount(data[1], inv)
         local label = matLabels[data[1]]
         if label then
             label.Text = string.format("📦 %s: %d/%d", data[1], count, data[2])
@@ -731,15 +660,8 @@ local function UpdateMaterials()
         matLabels["Fragment"].TextColor3 = (fragCount >= 5000) and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(200, 200, 200)
     end
 end
-
--- Không gọi đồng bộ ở top-level: detector có thể đang chờ Inventory init.
--- Chạy nền để UI, character wait và các phase khác không bị khóa.
-task.spawn(function()
-    UpdateMaterials()
-    while task.wait(10) do
-        UpdateMaterials()
-    end
-end)
+UpdateMaterials()
+task.spawn(function() while task.wait(10) do UpdateMaterials() end end)
 
 services.UserInputService.InputBegan:Connect(function(input, gpe)
     if not gpe and input.KeyCode == Enum.KeyCode.LeftAlt then MainFrame.Visible = not MainFrame.Visible end
@@ -1170,15 +1092,15 @@ task.spawn(function()
 
     -- NHÁNH B: farm nguyên liệu
     print("[P1B] SA chưa active → check nguyên liệu...")
-    local Groups = GetInventoryGroups(true)
-    local dfCount = GetMaterialCount("Dark Fragment", Groups)
+    local inv = ScanInventoryGroups()
+    local dfCount = GetMaterialCount("Dark Fragment", inv)
 
     if dfCount >= DF_TARGET then
         SetStatus("DF " .. dfCount .. "/" .. DF_TARGET .. " ✅ → check VF...", Color3.fromRGB(0, 255, 0))
-        local vfCount = GetMaterialCount("Vampire Fang", Groups)
+        local vfCount = GetMaterialCount("Vampire Fang", inv)
 
         if vfCount >= 20 then
-            local dwCount = GetMaterialCount("Demonic Wisp", Groups)
+            local dwCount = GetMaterialCount("Demonic Wisp", inv)
             if dwCount >= 20 then
                 SetStatus("Đủ materials! Đợi SA active...", Color3.fromRGB(0, 255, 0))
                 task.spawn(function()
@@ -1195,10 +1117,10 @@ task.spawn(function()
                 LoadMaterialFarm("Demonic Wisp")
                 task.spawn(function()
                     while task.wait(15) do
-                        local CurrentGroups = GetInventoryGroups(true)
+                        local ci = ScanInventoryGroups()
                         SetStatus(string.format("DW %d/20 | VF %d/20 | DF %d/%d",
-                            GetMaterialCount("Demonic Wisp", CurrentGroups), GetMaterialCount("Vampire Fang", CurrentGroups),
-                            GetMaterialCount("Dark Fragment", CurrentGroups), DF_TARGET))
+                            GetMaterialCount("Demonic Wisp", ci), GetMaterialCount("Vampire Fang", ci),
+                            GetMaterialCount("Dark Fragment", ci), DF_TARGET))
                         if PollSA() then saActive = true
                             SetStatus("SA Active! → GetSA...", Color3.fromRGB(0, 255, 0))
                             RunGetSA(); break
