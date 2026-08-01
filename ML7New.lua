@@ -125,9 +125,23 @@ function CheckSea(n)
     return num ~= nil and n == num
 end
 
--- ======================================================================
--- [ MATERIAL DETECTOR — ĐÚNG NGUYÊN CÁCH USER GỬI ]
--- ======================================================================
+-- inventory cache cũ: giữ nguyên cho item không phải Material
+local _invCache, _invTime = nil, 0
+function GetInventory(force)
+    if not force and _invCache and (tick() - _invTime) < 1 then return _invCache end
+    local ok, inv = pcall(function() return COMMF_:InvokeServer("getInventory") end)
+    if ok and type(inv) == "table" then _invCache, _invTime = inv, tick() return inv end
+    return _invCache or {}
+end
+function CheckInventory(...)
+    local names = {...}
+    for _, v in ipairs(GetInventory()) do
+        for _, n in ipairs(names) do if v.Name == n then return true end end
+    end
+    return false
+end
+
+-- Detect Material theo đúng Inventory + ItemReplicationService
 local RS = game:GetService("ReplicatedStorage")
 
 local Inventory = require(RS.Controllers.UI.Inventory)
@@ -139,21 +153,19 @@ repeat task.wait(0.2)
 until Inventory:GetIfInitialized()
     and ItemService.IsInitialized == true
 
-local function ScanInventoryGroups()
+local _materialCache, _materialTime = nil, 0
+
+local function GetMaterialInventory(force)
+    if not force and _materialCache and (tick() - _materialTime) < 1 then
+        return _materialCache
+    end
+
     local Groups = {
         ["Sword"] = {},
         ["Gun"] = {},
         ["Accessory"] = {},
         ["Material"] = {},
         ["Blox Fruit"] = {}
-    }
-
-    local Order = {
-        "Sword",
-        "Gun",
-        "Accessory",
-        "Material",
-        "Blox Fruit"
     }
 
     local Amounts = {}
@@ -191,17 +203,19 @@ local function ScanInventoryGroups()
         end
     end
 
-    return Groups
+    _materialCache = Groups["Material"]
+    _materialTime = tick()
+    return _materialCache
 end
 
-function CheckMaterial(materialName)
-    local Groups = ScanInventoryGroups()
-    return tonumber(Groups["Material"][materialName]) or 0
+function CheckMaterial(x)
+    local materials = GetMaterialInventory(false)
+    return tonumber(materials[x]) or 0
 end
 
-function GetMaterialCount(materialName, Groups)
-    Groups = Groups or ScanInventoryGroups()
-    return tonumber(Groups["Material"][materialName]) or 0
+function GetMaterialCount(matName, inv)
+    inv = inv or GetMaterialInventory(false)
+    return tonumber(inv[matName]) or 0
 end
 
 function CheckTool(v)
@@ -644,7 +658,7 @@ local function SetStatus(txt, color)
 end
 
 local function UpdateMaterials()
-    local inv = ScanInventoryGroups()
+    local inv = GetMaterialInventory(true)
     for _, data in ipairs(MaterialChecks) do
         local count = GetMaterialCount(data[1], inv)
         local label = matLabels[data[1]]
@@ -1092,7 +1106,7 @@ task.spawn(function()
 
     -- NHÁNH B: farm nguyên liệu
     print("[P1B] SA chưa active → check nguyên liệu...")
-    local inv = ScanInventoryGroups()
+    local inv = GetMaterialInventory(true)
     local dfCount = GetMaterialCount("Dark Fragment", inv)
 
     if dfCount >= DF_TARGET then
@@ -1117,7 +1131,7 @@ task.spawn(function()
                 LoadMaterialFarm("Demonic Wisp")
                 task.spawn(function()
                     while task.wait(15) do
-                        local ci = ScanInventoryGroups()
+                        local ci = GetMaterialInventory(true)
                         SetStatus(string.format("DW %d/20 | VF %d/20 | DF %d/%d",
                             GetMaterialCount("Demonic Wisp", ci), GetMaterialCount("Vampire Fang", ci),
                             GetMaterialCount("Dark Fragment", ci), DF_TARGET))
