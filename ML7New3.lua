@@ -1,11 +1,11 @@
 -- ======================================================================
 --  AUTO KAITUN ML7 — VFAndSA / Sanguine Art  (Blox Fruits)
 --  Bản TỐI ƯU TOÀN BỘ — By Vu Nguyen
---  • Module Inventory MỚI: Tích hợp Client Controllers & ItemReplicationService
---  • Helpers: cache inventory mới, detect boss kiểu Banana (RS trước), nil-guard
+--  • Helpers: cache inventory, detect boss kiểu Banana (RS trước), nil-guard
 --  • HopServer: best-of-both (fallback nhiều tầng) + cooldown chống spam
 --               + visited-cache 15p (writefile) + return true/false
 --  • Darkbeard farm: module sạch (join-gate, depletion-gate, IsDisabled/island)
+--    thay cho khối "KAITUNBOSS FULL SOURCE" cũ (bỏ ~400 dòng lặp + bug)
 --  • Giữ nguyên orchestration đa-phase + mọi URL load ngoài
 -- ======================================================================
 
@@ -15,7 +15,7 @@
 getgenv().Team = "Pirates"
 getgenv().Key  = getgenv().Key or "NHAP_KEY_VAO_DAY"
 getgenv().Settings = getgenv().Settings or {
-    ["Max Chests"]                = 30,  -- nhặt tối đa N chest/server rồi hop
+    ["Max Chests"]                 = 30,  -- nhặt tối đa N chest/server rồi hop
     ["Reset After Collect Chests"] = 15,  -- cứ N chest thì tự reset (anti-kick)
     ["Min Chests On Join"]         = 20,  -- #1: mới vào mà chest < N -> hop ngay
 }
@@ -29,7 +29,7 @@ getgenv().HOP_CONFIG = getgenv().HOP_CONFIG or {
     Verbose       = false, -- true = in log hop chi tiết
 }
 
--- Hằng số cố định
+-- Hằng số cố định (theo yêu cầu)
 local LOW_CHEST_LEFT  = 10      -- #2: còn < N chest mà chưa đủ quota -> hop
 local REVISIT_SECONDS = 15 * 60 -- #3: không vào lại server cũ trong 15 phút
 local DF_TARGET       = 2       -- đủ Dark Fragment thì sang bước SA
@@ -111,173 +111,13 @@ task.spawn(function()
     end, function(err) warn("[Team]", err) end)
 end)
 
--- ==========================================
--- [ MATERIAL DETECTOR — ItemReplicationService ]
--- Giữ nguyên các hàm GetInventory / GetMaterialCount / CheckMaterial
--- để toàn bộ logic phía dưới không phải thay đổi.
--- ==========================================
-local RS = game:GetService("ReplicatedStorage")
-
-local Inventory = require(RS.Controllers.UI.Inventory)
-local ItemConfig = require(RS.ItemConfig)
-local ItemService = require(RS.ItemReplicationService)
-local KEYS = require(RS.ItemReplicationService.KEYS)
-
-local MaterialTracker = {
-    Counts = {},          -- key tên đã normalize -> số lượng
-    DisplayNames = {},    -- key tên đã normalize -> tên hiển thị gốc
-    NamesById = {},       -- tostring(ItemId) -> tên item
-    CategoriesById = {},  -- tostring(ItemId) -> category
-    LastRefresh = 0,
-    Ready = false,
-}
-
-local MATERIAL_REFRESH = 0.6
-
-local function NormalizeMaterialName(value)
-    return tostring(value or "")
-        :gsub("^%s+", "")
-        :gsub("%s+$", "")
-        :lower()
-end
-
-local function ResolveItemInfo(itemId)
-    if itemId == nil then return nil, nil end
-
-    local cacheKey = tostring(itemId)
-    if MaterialTracker.NamesById[cacheKey] ~= nil then
-        return MaterialTracker.NamesById[cacheKey], MaterialTracker.CategoriesById[cacheKey]
-    end
-
-    local ok, config = pcall(function()
-        return ItemConfig.match(itemId):unwrap()
-    end)
-
-    if not ok or not config then
-        return nil, nil
-    end
-
-    local display = config.Display or {}
-    local index = config.Index or {}
-    local name = display.Name or index.StorageKey or tostring(itemId)
-    local category = display.Category
-
-    MaterialTracker.NamesById[cacheKey] = name
-    MaterialTracker.CategoriesById[cacheKey] = category
-    return name, category
-end
-
-local function IsMaterialCategory(category)
-    return NormalizeMaterialName(category) == "material"
-end
-
-local function WaitForItemService(timeout)
-    local deadline = os.clock() + (timeout or 0)
-
-    repeat
-        if ItemService.IsInitialized == true then
-            return true
-        end
-        task.wait(0.2)
-    until os.clock() >= deadline
-
-    return ItemService.IsInitialized == true
-end
-
-local function RefreshMaterialCounts(force)
-    if not force and MaterialTracker.Ready
-        and (os.clock() - MaterialTracker.LastRefresh) < MATERIAL_REFRESH then
-        return true
-    end
-
-    -- Không dùng Inventory:GetIfInitialized() làm điều kiện bắt buộc.
-    -- ItemReplicationService mới là nguồn số lượng thật; GetTiles chỉ hỗ trợ seed metadata.
-    if ItemService.IsInitialized ~= true then
-        if not force or not WaitForItemService(10) then
-            return false
-        end
-    end
-
-    local amountsById = {}
-    local originalIdByKey = {}
-
-    local okItems, quantityItems = pcall(function()
-        return ItemService:GetItems(KEYS.QUANTITY) or {}
-    end)
-
-    if not okItems or type(quantityItems) ~= "table" then
-        return false
-    end
-
-    for _, item in pairs(quantityItems) do
-        if item and item.ItemId ~= nil then
-            local idKey = tostring(item.ItemId)
-            amountsById[idKey] = (amountsById[idKey] or 0) + (tonumber(item.Value) or 0)
-            originalIdByKey[idKey] = item.ItemId
-        end
-    end
-
-    local totals = {}
-    local displayNames = {}
-    local checkedIds = {}
-
-    local function AddMaterial(itemId, fallbackAmount)
-        if itemId == nil then return end
-
-        local idKey = tostring(itemId)
-        if checkedIds[idKey] then return end
-        checkedIds[idKey] = true
-
-        local name, category = ResolveItemInfo(itemId)
-        if not name or not IsMaterialCategory(category) then
-            return
-        end
-
-        local normalizedName = NormalizeMaterialName(name)
-        if normalizedName == "" then return end
-
-        local amount = amountsById[idKey]
-        if amount == nil then
-            amount = tonumber(fallbackAmount) or 1
-        end
-
-        totals[normalizedName] = (totals[normalizedName] or 0) + amount
-        displayNames[normalizedName] = tostring(name)
-    end
-
-    -- Đúng luồng code mẫu: lấy Amounts trước, sau đó duyệt Inventory:GetTiles().
-    -- GetTiles được pcall vì có lúc controller chưa báo initialized dù quantity đã có dữ liệu.
-    local okTiles, tiles = pcall(function()
-        return Inventory:GetTiles() or {}
-    end)
-
-    if okTiles and type(tiles) == "table" then
-        for _, tile in pairs(tiles) do
-            if tile and tile.ItemId ~= nil then
-                AddMaterial(tile.ItemId, 1)
-            end
-        end
-    end
-
-    -- Phần tham khảo từ DarkFragmentFarm_Optimized:
-    -- resolve trực tiếp MỌI ItemId trong KEYS.QUANTITY.
-    -- Nhờ vậy material vẫn được detect nếu GetTiles thiếu tile hoặc khởi tạo chậm.
-    for idKey, itemId in pairs(originalIdByKey) do
-        if not checkedIds[idKey] then
-            AddMaterial(itemId, amountsById[idKey])
-        end
-    end
-
-    MaterialTracker.Counts = totals
-    MaterialTracker.DisplayNames = displayNames
-    MaterialTracker.LastRefresh = os.clock()
-    MaterialTracker.Ready = true
-    return true
-end
+-- LƯU Ý: đoạn "chờ nhân vật spawn" được dời xuống SAU khi tạo UI
+-- (tránh kẹt luồng chính khiến UI không bao giờ hiện).
 
 -- ==========================================
 -- [ HELPER FUNCTIONS ]
 -- ==========================================
+-- nil-guard: không crash khi attribute MAP chưa có
 function CheckSea(n)
     local map = workspace:GetAttribute("MAP")
     if type(map) ~= "string" then return false end
@@ -285,66 +125,188 @@ function CheckSea(n)
     return num ~= nil and n == num
 end
 
--- Giữ kiểu dữ liệu list cũ để các đoạn orchestration/UI bên dưới không đổi logic.
-function GetInventory(force)
-    RefreshMaterialCounts(force == true)
+-- ================================================================
+-- [ MATERIAL DETECTOR — chạy nền, không chặn luồng UI/orchestration ]
+-- Dùng đúng Inventory + ItemReplicationService theo đoạn code mẫu.
+-- ================================================================
+local MaterialState = {
+    Ready = false,
+    Groups = {
+        ["Sword"] = {},
+        ["Gun"] = {},
+        ["Accessory"] = {},
+        ["Material"] = {},
+        ["Blox Fruit"] = {},
+    },
+    LastError = nil,
+}
 
+local function NormalizeItemName(value)
+    return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""):lower()
+end
+
+-- Quét đúng theo code người dùng gửi:
+-- 1) Amounts từ KEYS.QUANTITY
+-- 2) Duyệt Inventory:GetTiles()
+-- 3) ItemConfig.match(id):unwrap()
+-- 4) Phân loại theo config.Display.Category
+local function ScanInventoryGroups(Inventory, ItemConfig, ItemService, KEYS)
+    local Groups = {
+        ["Sword"] = {},
+        ["Gun"] = {},
+        ["Accessory"] = {},
+        ["Material"] = {},
+        ["Blox Fruit"] = {},
+    }
+
+    local Amounts = {}
+    local QuantityItems = ItemService:GetItems(KEYS.QUANTITY) or {}
+
+    for _, item in pairs(QuantityItems) do
+        if item and item.ItemId ~= nil then
+            Amounts[item.ItemId] =
+                (Amounts[item.ItemId] or 0)
+                + (tonumber(item.Value) or 0)
+        end
+    end
+
+    local Checked = {}
+
+    local function AddItemId(id)
+        if id == nil or Checked[id] then return end
+        Checked[id] = true
+
+        local success, config = pcall(function()
+            return ItemConfig.match(id):unwrap()
+        end)
+
+        if success and config and config.Display then
+            local category = config.Display.Category
+
+            if Groups[category] then
+                local name =
+                    config.Display.Name
+                    or (config.Index and config.Index.StorageKey)
+                    or tostring(id)
+
+                Groups[category][name] = Amounts[id] or 1
+            end
+        end
+    end
+
+    for _, tile in pairs(Inventory:GetTiles() or {}) do
+        if tile then
+            AddItemId(tile.ItemId)
+        end
+    end
+
+    -- Fallback tham khảo DarkFragmentFarm_Optimized:
+    -- nếu GetTiles thiếu tile, vẫn resolve ItemId có trong KEYS.QUANTITY.
+    for _, item in pairs(QuantityItems) do
+        if item then
+            AddItemId(item.ItemId)
+        end
+    end
+
+    return Groups
+end
+
+-- Toàn bộ chờ initialized và GetItems chạy trong task riêng.
+-- Vì vậy nếu controller khởi tạo chậm, UI và logic Fragment/Melee không bị đứng ở "...".
+task.spawn(function()
+    local ok, err = xpcall(function()
+        local RS = game:GetService("ReplicatedStorage")
+
+        local Inventory = require(RS.Controllers.UI.Inventory)
+        local ItemConfig = require(RS.ItemConfig)
+        local ItemService = require(RS.ItemReplicationService)
+        local KEYS = require(RS.ItemReplicationService.KEYS)
+
+        repeat task.wait(0.2)
+        until Inventory:GetIfInitialized()
+            and ItemService.IsInitialized == true
+
+        while true do
+            local scanOk, groupsOrError = pcall(function()
+                return ScanInventoryGroups(Inventory, ItemConfig, ItemService, KEYS)
+            end)
+
+            if scanOk and type(groupsOrError) == "table" then
+                MaterialState.Groups = groupsOrError
+                MaterialState.Ready = true
+                MaterialState.LastError = nil
+            else
+                MaterialState.LastError = tostring(groupsOrError)
+                warn("[MaterialDetector] " .. MaterialState.LastError)
+            end
+
+            task.wait(0.6)
+        end
+    end, debug.traceback)
+
+    if not ok then
+        MaterialState.LastError = tostring(err)
+        warn("[MaterialDetector Init] " .. MaterialState.LastError)
+    end
+end)
+
+-- Snapshot dạng list để giữ nguyên chữ ký hàm và toàn bộ logic phía dưới.
+function GetInventory(_force)
     local list = {}
-    for normalizedName, count in pairs(MaterialTracker.Counts) do
+
+    for name, count in pairs(MaterialState.Groups["Material"] or {}) do
         list[#list + 1] = {
-            Name = MaterialTracker.DisplayNames[normalizedName] or normalizedName,
+            Name = name,
             Count = tonumber(count) or 0,
             Type = "Material",
             Category = "Material",
         }
     end
+
     return list
 end
 
 function GetMaterialCount(matName, inv)
-    local wanted = NormalizeMaterialName(matName)
+    local wanted = NormalizeItemName(matName)
+    inv = inv or GetInventory(false)
 
-    -- Khi caller truyền snapshot (inv), vẫn đọc snapshot như logic gốc.
-    if type(inv) == "table" then
-        for _, item in ipairs(inv) do
-            if NormalizeMaterialName(item and item.Name) == wanted then
-                return tonumber(item.Count) or 0
-            end
+    for _, item in ipairs(inv) do
+        if NormalizeItemName(item and item.Name) == wanted then
+            return tonumber(item.Count) or 0
         end
-        return 0
     end
 
-    RefreshMaterialCounts(false)
-    return tonumber(MaterialTracker.Counts[wanted]) or 0
+    return 0
 end
 
 function CheckMaterial(x)
     return GetMaterialCount(x)
 end
 
+-- Hàm này được giữ để không làm gãy code ngoài; trong source hiện tại không dùng cho Material.
 function CheckInventory(...)
     local names = {...}
-    local inv = GetInventory(false)
+    local wanted = {}
 
-    for _, wanted in ipairs(names) do
-        local normalizedWanted = NormalizeMaterialName(wanted)
-        for _, item in ipairs(inv) do
-            if NormalizeMaterialName(item and item.Name) == normalizedWanted then
-                return true
-            end
+    for _, name in ipairs(names) do
+        wanted[NormalizeItemName(name)] = true
+    end
+
+    for _, item in ipairs(GetInventory(false)) do
+        if wanted[NormalizeItemName(item and item.Name)] then
+            return true
         end
     end
 
     return false
 end
 
--- Làm nóng metadata/count ở nền; không chặn hoặc thay đổi state machine chính.
-task.spawn(function()
-    while true do
-        pcall(RefreshMaterialCounts, false)
-        task.wait(MATERIAL_REFRESH)
+local function WaitMaterialReady()
+    while not MaterialState.Ready do
+        task.wait(0.2)
     end
-end)
+    return true
+end
 
 function CheckTool(v)
     for _, x in next, {LocalPlayer.Backpack, Character} do
@@ -357,6 +319,8 @@ function CheckTool(v)
     return false
 end
 
+-- detect boss kiểu Banana (GetConnectionEnemies): quét ReplicatedStorage TRƯỚC
+-- (boss được replicate vào RS ngay khi spawn) -> bắt sớm hơn. Nhận nhiều tên.
 function CheckMonster(...)
     local names = {...}
     local function match(m)
@@ -387,9 +351,12 @@ function EquipWeapon(v)
     end
 end
 
--- FastAttack
+-- FastAttack (giữ nguyên cơ chế obfuscated gốc)
 local remoteAttack, idremote
 local seed = 0
+-- FIX UI: InvokeServer YIELD — để TOP-LEVEL mà remote 'seed' treo sẽ CHẶN luồng chính → UI (tạo bên
+-- dưới) KHÔNG BAO GIỜ hiện ("load team không lên UI"). Đẩy vào task.spawn → seed lấy nền, luồng chính
+-- chạy thẳng tới tạo UI. FastAttack đọc seed (mặc định 0) → set đúng sau ~tích tắc, không ảnh hưởng.
 task.spawn(function()
     pcall(function() seed = ReplicatedStorage.Modules.Net.seed:InvokeServer() end)
 end)
@@ -440,7 +407,7 @@ function FastAttack(x)
 end
 
 -- ==========================================
--- [ TWEEN ]
+-- [ TWEEN (ghost-part, có instant-tp khi gần) ]
 -- ==========================================
 local function getCFrame(v)
     if not v then return nil end
@@ -562,6 +529,7 @@ function KillMonster(x)
                 end
             end
         end
+        -- boss còn ở ReplicatedStorage -> bay tới (kiểu Banana)
         for _, v in next, ReplicatedStorage:GetChildren() do
             local vhrp = v:FindFirstChild("HumanoidRootPart")
             if v:IsA("Model") and vhrp and v.Name == x then Tween(vhrp.CFrame) return end
@@ -583,7 +551,8 @@ local function PressSpace()
 end
 
 -- ======================================================================
--- [ VISITED SERVERS ]
+-- [ VISITED SERVERS — không vào lại server cũ trong 15 phút (#3) ]
+--   Lưu ra file vì RAM bị xoá mỗi lần hop.
 -- ======================================================================
 local VISITED_FILE = "AutoKaitunML7_Visited.json"
 local function _loadVisited()
@@ -614,7 +583,9 @@ local function IsRecentlyVisited(jobId)
 end
 
 -- ======================================================================
--- [ HOP SERVER ]
+-- [ HOP SERVER — BEST-OF-BOTH ]
+--   cooldown chống spam + return true/false + pcall + stale-cache
+--   + fallback nhiều tầng (region -> visited -> toàn bộ -> random teleport)
 -- ======================================================================
 local function HopLog(...) if getgenv().HOP_CONFIG.Verbose then print("[HOP]", ...) end end
 
@@ -672,11 +643,11 @@ function HopServer(reason, MaxPlayers, ForcedRegion)
         return out
     end
 
-    local filtered = collect(true, true, true)
+    local filtered = collect(true, true, true)                              -- MaxPlayers + Region + chưa vào 15p
     HopLog("Tầng1:", #filtered)
     if #filtered == 0 then filtered = collect(false, true, true)  HopLog("Tầng2 (bỏ region):", #filtered) end
     if #filtered == 0 then filtered = collect(false, false, true) HopLog("Tầng3 (bỏ visited):", #filtered) end
-    if #filtered == 0 then filtered = arr                         HopLog("Tầng4 (toàn bộ):", #filtered) end
+    if #filtered == 0 then filtered = arr                          HopLog("Tầng4 (toàn bộ):", #filtered) end
 
     local pick = filtered[math.random(1, #filtered)]
     HopLog("Chọn:", pick.JobId, "| Players:", pick.Players, "| Region:", pick.Region)
@@ -684,11 +655,12 @@ function HopServer(reason, MaxPlayers, ForcedRegion)
     return true
 end
 
+-- Cho BananaHub / script ngoài gọi được
 getgenv().GetServers = GetServers
 getgenv().HopServer  = HopServer
 
 -- ==========================================
--- [ ERROR HANDLING ]
+-- [ ERROR HANDLING (cooldown trong HopServer chặn spam) ]
 -- ==========================================
 TeleportService.TeleportInitFailed:Connect(function(_, result, message)
     if result == Enum.TeleportResult.GameFull then
@@ -776,7 +748,20 @@ local function SetStatus(txt, color)
 end
 
 local function UpdateMaterials()
-    local inv = GetInventory(true)
+    -- Fragment luôn cập nhật trước và không phụ thuộc ItemReplicationService.
+    local fragCount = 0
+    pcall(function() fragCount = Player.Data.Fragments.Value end)
+    if matLabels["Fragment"] then
+        matLabels["Fragment"].Text = string.format("💎 Fragment: %d/5000", fragCount)
+        matLabels["Fragment"].TextColor3 = (fragCount >= 5000) and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(200, 200, 200)
+    end
+
+    -- Không gọi GetItems tại luồng UI. Chỉ đọc snapshot đã được task detector cập nhật.
+    if not MaterialState.Ready then
+        return
+    end
+
+    local inv = GetInventory(false)
     for _, data in ipairs(MaterialChecks) do
         local count = GetMaterialCount(data[1], inv)
         local label = matLabels[data[1]]
@@ -785,15 +770,15 @@ local function UpdateMaterials()
             label.TextColor3 = (count >= data[2]) and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(200, 200, 200)
         end
     end
-    local fragCount = 0
-    pcall(function() fragCount = Player.Data.Fragments.Value end)
-    if matLabels["Fragment"] then
-        matLabels["Fragment"].Text = string.format("💎 Fragment: %d/5000", fragCount)
-        matLabels["Fragment"].TextColor3 = (fragCount >= 5000) and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(200, 200, 200)
-    end
 end
+
+-- Hàm này giờ không yield nên có thể gọi ngay mà không khóa phần code phía dưới.
 UpdateMaterials()
-task.spawn(function() while task.wait(10) do UpdateMaterials() end end)
+task.spawn(function()
+    while task.wait(0.5) do
+        UpdateMaterials()
+    end
+end)
 
 services.UserInputService.InputBegan:Connect(function(input, gpe)
     if not gpe and input.KeyCode == Enum.KeyCode.LeftAlt then MainFrame.Visible = not MainFrame.Visible end
@@ -801,7 +786,7 @@ end)
 
 print("[VFAndSA] ✅ Loaded | LeftAlt ẩn/hiện")
 
--- Chờ nhân vật sẵn sàng
+-- Chờ nhân vật sẵn sàng — CÓ TIMEOUT 90s để KHÔNG bao giờ kẹt cứng luồng
 do
     SetStatus("Đợi nhân vật spawn...", Color3.fromRGB(0, 150, 255))
     local t0 = tick()
@@ -811,14 +796,14 @@ do
         and Character:IsDescendantOf(workspace:FindFirstChild("Characters") or workspace))
         or (tick() - t0 > 90)
     if not (Character and Character:FindFirstChild("HumanoidRootPart")) then
-        warn("[VFAndSA] Hết 90s chờ nhân vật — vẫn chạy tiếp")
+        warn("[VFAndSA] Hết 90s chờ nhân vật — vẫn chạy tiếp (có thể cần chọn team thủ công)")
     end
 end
 
 SetStatus("Status: Checking Fragment...", Color3.fromRGB(0, 150, 255))
 
 -- ==========================================
--- [ CHECK FRAGMENT ]
+-- [ CHECK FRAGMENT (farm Katakuri tới 5000) ]
 -- ==========================================
 local fragmentOk = false
 task.spawn(function()
@@ -884,6 +869,7 @@ task.spawn(function()
     saChecked = true
 end)
 
+-- helper: check SA active (dùng nhiều nơi)
 local function PollSA()
     local ok, res = pcall(function() return COMMF_:InvokeServer("BuySanguineArt", true) end)
     if ok then
@@ -1025,6 +1011,7 @@ local function RunGetSA()
     end
 end
 
+-- helper: load BananaHub farm material (dùng cho VF / DW)
 local function LoadMaterialFarm(matName)
     task.spawn(function()
         loadstring(game:HttpGet("https://raw.githubusercontent.com/longvu26092007-eng/ml7/refs/heads/main/ultmiaxrada.lua"))()
@@ -1043,11 +1030,13 @@ local function LoadMaterialFarm(matName)
 end
 
 -- ======================================================================
--- [ MODULE: DARKBEARD FARM ]
+-- [ MODULE: DARKBEARD FARM (blackbeard tối ưu — dùng chung helper) ]
+--   #1 join-gate | #2 depletion-gate | IsDisabled/island | spawn+kill
 -- ======================================================================
 local DARKBEARD_NAMES = { "Darkbeard", "DarkBeard" }
 local DARKBEARD_ARENA = CFrame.new(3677.08203125, 62.751937866211, -3144.8332519531)
 
+-- gom + sort chest hợp lệ (tag + CanTouch + tên Chest + not IsDisabled + island)
 local function GetValidChests()
     local IslandRoot = getgenv().Settings.IslandRoot
     local chests = {}
@@ -1070,6 +1059,7 @@ local function CollectChests()
         return
     end
     local chests = GetValidChests()
+    -- #2: còn < 10 chest mà chưa đủ quota -> hop server giàu hơn
     if #chests < LOW_CHEST_LEFT then
         if not CheckTool("Fist of Darkness") and not CheckMonster("Darkbeard") then
             SetStatus(("Còn %d chest (<%d) | quota %d/%d → hop"):format(#chests, LOW_CHEST_LEFT, chestsAll, getgenv().Settings["Max Chests"]), Color3.fromRGB(0, 180, 255))
@@ -1106,6 +1096,7 @@ local function CollectChests()
     if not CheckTool("Fist of Darkness") and not CheckMonster("Darkbeard") then HopServer("server cleared") end
 end
 
+-- #1 join-gate: mới vào mà chest < Min -> hop
 local function JoinGate()
     if CheckMaterial("Dark Fragment") >= DF_TARGET then return end
     if CheckTool("Fist of Darkness") then return end
@@ -1123,10 +1114,12 @@ local function JoinGate()
     end
 end
 
+-- chạy farm Darkbeard tới khi đủ DF (monitor kick rejoin / getSA khi SA active)
 local function StartDarkbeardFarm()
     SetStatus("P1B: DF " .. CheckMaterial("Dark Fragment") .. "/" .. DF_TARGET .. " → Farm Darkbeard...", Color3.fromRGB(255, 200, 0))
     local stop = false
 
+    -- monitor: SA active -> getSA | đủ DF -> kick rejoin
     task.spawn(function()
         while not stop and task.wait(10) do
             local df = CheckMaterial("Dark Fragment")
@@ -1146,6 +1139,7 @@ local function StartDarkbeardFarm()
         end
     end)
 
+    -- buy haki (giúp đánh nhanh)
     task.spawn(function()
         while not stop and task.wait(4) do
             xpcall(function()
@@ -1163,6 +1157,7 @@ local function StartDarkbeardFarm()
 
     JoinGate()
 
+    -- vòng farm chính
     task.spawn(function()
         while not stop and task.wait(0.2) do
             xpcall(function()
@@ -1205,14 +1200,20 @@ end
 task.spawn(function()
     repeat task.wait(1) until saChecked
 
+    -- NHÁNH A: SA đã active -> getSA luôn, không cần chờ Material.
     if saActive then
         print("[P1] SA active từ đầu → RunGetSA")
         RunGetSA()
         return
     end
 
-    print("[P1B] SA chưa active → check nguyên liệu...")
-    local inv = GetInventory(true)
+    -- NHÁNH B: farm nguyên liệu. Chỉ nhánh này mới cần đợi detector sẵn sàng.
+    print("[P1B] SA chưa active → chờ material replication...")
+    SetStatus("Đang chờ Material replication...", Color3.fromRGB(0, 150, 255))
+    WaitMaterialReady()
+
+    print("[P1B] Material ready → check nguyên liệu...")
+    local inv = GetInventory(false)
     local dfCount = GetMaterialCount("Dark Fragment", inv)
 
     if dfCount >= DF_TARGET then
@@ -1237,7 +1238,7 @@ task.spawn(function()
                 LoadMaterialFarm("Demonic Wisp")
                 task.spawn(function()
                     while task.wait(15) do
-                        local ci = GetInventory(true)
+                        local ci = GetInventory(false)
                         SetStatus(string.format("DW %d/20 | VF %d/20 | DF %d/%d",
                             GetMaterialCount("Demonic Wisp", ci), GetMaterialCount("Vampire Fang", ci),
                             GetMaterialCount("Dark Fragment", ci), DF_TARGET))
@@ -1269,6 +1270,7 @@ task.spawn(function()
             end)
         end
     else
+        -- PHẦN 1B: chưa đủ DF -> farm Darkbeard (module tối ưu)
         StartDarkbeardFarm()
     end
 end)
