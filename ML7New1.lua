@@ -112,58 +112,168 @@ task.spawn(function()
 end)
 
 -- ==========================================
--- [ NEW INVENTORY MODULE ]
+-- [ MATERIAL DETECTOR — ItemReplicationService ]
+-- Giữ nguyên các hàm GetInventory / GetMaterialCount / CheckMaterial
+-- để toàn bộ logic phía dưới không phải thay đổi.
 -- ==========================================
-local InventoryModule = {}
-task.spawn(function()
-    xpcall(function()
-        local RS = game:GetService("ReplicatedStorage")
-        local InventoryController = require(RS:WaitForChild("Controllers"):WaitForChild("UI"):WaitForChild("Inventory"))
-        local ItemConfig          = require(RS:WaitForChild("ItemConfig"))
-        local ItemService         = require(RS:WaitForChild("ItemReplicationService"))
-        local KEYS                = require(RS:WaitForChild("ItemReplicationService"):WaitForChild("KEYS"))
+local RS = game:GetService("ReplicatedStorage")
 
-        repeat task.wait(0.2)
-        until InventoryController:GetIfInitialized() and ItemService.IsInitialized == true
+local Inventory = require(RS.Controllers.UI.Inventory)
+local ItemConfig = require(RS.ItemConfig)
+local ItemService = require(RS.ItemReplicationService)
+local KEYS = require(RS.ItemReplicationService.KEYS)
 
-        InventoryModule.GetItems = function()
-            local itemsDict = {}
-            local Amounts = {}
+local MaterialTracker = {
+    Counts = {},          -- key tên đã normalize -> số lượng
+    DisplayNames = {},    -- key tên đã normalize -> tên hiển thị gốc
+    NamesById = {},       -- tostring(ItemId) -> tên item
+    CategoriesById = {},  -- tostring(ItemId) -> category
+    LastRefresh = 0,
+    Ready = false,
+}
 
-            for _, item in pairs(ItemService:GetItems(KEYS.QUANTITY) or {}) do
-                Amounts[item.ItemId] = (Amounts[item.ItemId] or 0) + (tonumber(item.Value) or 0)
-            end
+local MATERIAL_REFRESH = 0.6
 
-            local Checked = {}
-            for _, tile in pairs(InventoryController:GetTiles() or {}) do
-                local id = tile.ItemId
-                if id and not Checked[id] then
-                    Checked[id] = true
-                    local ok, config = pcall(function()
-                        return ItemConfig.match(id):unwrap()
-                    end)
+local function NormalizeMaterialName(value)
+    return tostring(value or "")
+        :gsub("^%s+", "")
+        :gsub("%s+$", "")
+        :lower()
+end
 
-                    if ok and config and config.Display then
-                        local category = config.Display.Category
-                        local name = config.Display.Name or config.Index.StorageKey or tostring(id)
-                        local count = Amounts[id] or 1
+local function ResolveItemInfo(itemId)
+    if itemId == nil then return nil, nil end
 
-                        itemsDict[name] = {
-                            Name = name,
-                            Count = count,
-                            Category = category,
-                            Type = category
-                        }
-                    end
-                end
-            end
-            return itemsDict
-        end
-        InventoryModule.Initialized = true
-    end, function(err)
-        warn("[InventoryModule Error]:", err)
+    local cacheKey = tostring(itemId)
+    if MaterialTracker.NamesById[cacheKey] ~= nil then
+        return MaterialTracker.NamesById[cacheKey], MaterialTracker.CategoriesById[cacheKey]
+    end
+
+    local ok, config = pcall(function()
+        return ItemConfig.match(itemId):unwrap()
     end)
-end)
+
+    if not ok or not config then
+        return nil, nil
+    end
+
+    local display = config.Display or {}
+    local index = config.Index or {}
+    local name = display.Name or index.StorageKey or tostring(itemId)
+    local category = display.Category
+
+    MaterialTracker.NamesById[cacheKey] = name
+    MaterialTracker.CategoriesById[cacheKey] = category
+    return name, category
+end
+
+local function IsMaterialCategory(category)
+    return NormalizeMaterialName(category) == "material"
+end
+
+local function WaitForItemService(timeout)
+    local deadline = os.clock() + (timeout or 0)
+
+    repeat
+        if ItemService.IsInitialized == true then
+            return true
+        end
+        task.wait(0.2)
+    until os.clock() >= deadline
+
+    return ItemService.IsInitialized == true
+end
+
+local function RefreshMaterialCounts(force)
+    if not force and MaterialTracker.Ready
+        and (os.clock() - MaterialTracker.LastRefresh) < MATERIAL_REFRESH then
+        return true
+    end
+
+    -- Không dùng Inventory:GetIfInitialized() làm điều kiện bắt buộc.
+    -- ItemReplicationService mới là nguồn số lượng thật; GetTiles chỉ hỗ trợ seed metadata.
+    if ItemService.IsInitialized ~= true then
+        if not force or not WaitForItemService(10) then
+            return false
+        end
+    end
+
+    local amountsById = {}
+    local originalIdByKey = {}
+
+    local okItems, quantityItems = pcall(function()
+        return ItemService:GetItems(KEYS.QUANTITY) or {}
+    end)
+
+    if not okItems or type(quantityItems) ~= "table" then
+        return false
+    end
+
+    for _, item in pairs(quantityItems) do
+        if item and item.ItemId ~= nil then
+            local idKey = tostring(item.ItemId)
+            amountsById[idKey] = (amountsById[idKey] or 0) + (tonumber(item.Value) or 0)
+            originalIdByKey[idKey] = item.ItemId
+        end
+    end
+
+    local totals = {}
+    local displayNames = {}
+    local checkedIds = {}
+
+    local function AddMaterial(itemId, fallbackAmount)
+        if itemId == nil then return end
+
+        local idKey = tostring(itemId)
+        if checkedIds[idKey] then return end
+        checkedIds[idKey] = true
+
+        local name, category = ResolveItemInfo(itemId)
+        if not name or not IsMaterialCategory(category) then
+            return
+        end
+
+        local normalizedName = NormalizeMaterialName(name)
+        if normalizedName == "" then return end
+
+        local amount = amountsById[idKey]
+        if amount == nil then
+            amount = tonumber(fallbackAmount) or 1
+        end
+
+        totals[normalizedName] = (totals[normalizedName] or 0) + amount
+        displayNames[normalizedName] = tostring(name)
+    end
+
+    -- Đúng luồng code mẫu: lấy Amounts trước, sau đó duyệt Inventory:GetTiles().
+    -- GetTiles được pcall vì có lúc controller chưa báo initialized dù quantity đã có dữ liệu.
+    local okTiles, tiles = pcall(function()
+        return Inventory:GetTiles() or {}
+    end)
+
+    if okTiles and type(tiles) == "table" then
+        for _, tile in pairs(tiles) do
+            if tile and tile.ItemId ~= nil then
+                AddMaterial(tile.ItemId, 1)
+            end
+        end
+    end
+
+    -- Phần tham khảo từ DarkFragmentFarm_Optimized:
+    -- resolve trực tiếp MỌI ItemId trong KEYS.QUANTITY.
+    -- Nhờ vậy material vẫn được detect nếu GetTiles thiếu tile hoặc khởi tạo chậm.
+    for idKey, itemId in pairs(originalIdByKey) do
+        if not checkedIds[idKey] then
+            AddMaterial(itemId, amountsById[idKey])
+        end
+    end
+
+    MaterialTracker.Counts = totals
+    MaterialTracker.DisplayNames = displayNames
+    MaterialTracker.LastRefresh = os.clock()
+    MaterialTracker.Ready = true
+    return true
+end
 
 -- ==========================================
 -- [ HELPER FUNCTIONS ]
@@ -175,39 +285,37 @@ function CheckSea(n)
     return num ~= nil and n == num
 end
 
--- Inventory Cache (TTL 1s) dùng Module mới, tự động fallback về CommF_ nếu Module chưa init
-local _invCache, _invTime = {}, 0
+-- Giữ kiểu dữ liệu list cũ để các đoạn orchestration/UI bên dưới không đổi logic.
 function GetInventory(force)
-    if not force and _invCache and (tick() - _invTime) < 1 then return _invCache end
+    RefreshMaterialCounts(force == true)
 
-    if InventoryModule.Initialized and InventoryModule.GetItems then
-        local ok, data = pcall(InventoryModule.GetItems)
-        if ok and data then
-            local list = {}
-            for _, item in pairs(data) do
-                table.insert(list, item)
-            end
-            _invCache, _invTime = list, tick()
-            return _invCache
-        end
+    local list = {}
+    for normalizedName, count in pairs(MaterialTracker.Counts) do
+        list[#list + 1] = {
+            Name = MaterialTracker.DisplayNames[normalizedName] or normalizedName,
+            Count = tonumber(count) or 0,
+            Type = "Material",
+            Category = "Material",
+        }
     end
-
-    -- Fallback cũ nếu Module Client chưa khởi chạy xong
-    local ok, inv = pcall(function() return COMMF_:InvokeServer("getInventory") end)
-    if ok and type(inv) == "table" then 
-        _invCache, _invTime = inv, tick() 
-        return inv 
-    end
-
-    return _invCache or {}
+    return list
 end
 
 function GetMaterialCount(matName, inv)
-    inv = inv or GetInventory()
-    for _, item in ipairs(inv) do
-        if item.Name == matName then return item.Count or 0 end
+    local wanted = NormalizeMaterialName(matName)
+
+    -- Khi caller truyền snapshot (inv), vẫn đọc snapshot như logic gốc.
+    if type(inv) == "table" then
+        for _, item in ipairs(inv) do
+            if NormalizeMaterialName(item and item.Name) == wanted then
+                return tonumber(item.Count) or 0
+            end
+        end
+        return 0
     end
-    return 0
+
+    RefreshMaterialCounts(false)
+    return tonumber(MaterialTracker.Counts[wanted]) or 0
 end
 
 function CheckMaterial(x)
@@ -216,11 +324,27 @@ end
 
 function CheckInventory(...)
     local names = {...}
-    for _, v in ipairs(GetInventory()) do
-        for _, n in ipairs(names) do if v.Name == n then return true end end
+    local inv = GetInventory(false)
+
+    for _, wanted in ipairs(names) do
+        local normalizedWanted = NormalizeMaterialName(wanted)
+        for _, item in ipairs(inv) do
+            if NormalizeMaterialName(item and item.Name) == normalizedWanted then
+                return true
+            end
+        end
     end
+
     return false
 end
+
+-- Làm nóng metadata/count ở nền; không chặn hoặc thay đổi state machine chính.
+task.spawn(function()
+    while true do
+        pcall(RefreshMaterialCounts, false)
+        task.wait(MATERIAL_REFRESH)
+    end
+end)
 
 function CheckTool(v)
     for _, x in next, {LocalPlayer.Backpack, Character} do
