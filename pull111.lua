@@ -19,7 +19,6 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
     -- Lay 30 server MOI NHAT, join lan luot tung cai, cach nhau 1.5s
     ["Fetch Count"]        = 30,
     ["Hop Delay"]          = 1.5,
-
 }
 
 LPH_NO_VIRTUALIZE(function()
@@ -155,10 +154,299 @@ local TweenService      = game:GetService("TweenService")
 local HttpService       = game:GetService("HttpService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local StarterPlayer     = game:GetService("StarterPlayer")
-local TeleportService   = game:GetService("TeleportService")
 
 local LocalPlayer = Players.LocalPlayer
 local Character, Humanoid, HumanoidRootPart
+
+-- ============================================================
+-- SHARED MIRAGE SERVER BLACKLIST
+-- 20 client trên cùng máy dùng chung workspace executor.
+--
+-- Không dùng một file JSON chung cho blacklist/claim.
+-- Mỗi JobId có file riêng để tránh 20 client đọc-sửa-ghi đè nhau:
+--   mirage_shared/blacklist/<jobId>.txt
+--   mirage_shared/join_fail/<jobId>.txt
+--   mirage_shared/claim/<jobId>.txt
+--
+-- TTL khóa cứng trong source:
+--   Không có Mirage: 15 phút
+--   Join thất bại:     2 phút
+--   Claim JobId:       35 giây
+-- ============================================================
+local MIRAGE_BLACKLIST_TTL = 15 * 60
+local MIRAGE_JOIN_FAIL_TTL = 2 * 60
+local MIRAGE_CLAIM_TTL = 35
+
+local MIRAGE_SHARED_ROOT = "mirage_shared"
+local MIRAGE_BLACKLIST_DIR = MIRAGE_SHARED_ROOT .. "/blacklist"
+local MIRAGE_JOIN_FAIL_DIR = MIRAGE_SHARED_ROOT .. "/join_fail"
+local MIRAGE_CLAIM_DIR = MIRAGE_SHARED_ROOT .. "/claim"
+
+local MirageFileIOReady =
+    type(writefile) == "function"
+    and type(readfile) == "function"
+    and type(isfile) == "function"
+
+local MirageFolderMode =
+    MirageFileIOReady
+    and type(makefolder) == "function"
+
+local MirageClientToken = table.concat({
+    tostring(LocalPlayer.UserId),
+    tostring(os.time()),
+    tostring(math.random(100000, 999999))
+}, "_")
+
+local function MirageSafeJobId(jobId)
+    return tostring(jobId or ""):gsub("[^%w%-_]", "_")
+end
+
+local function MirageEnsureFolder(path)
+    if not MirageFolderMode then
+        return false
+    end
+
+    local exists = false
+
+    if type(isfolder) == "function" then
+        local ok, result = pcall(isfolder, path)
+        exists = ok and result == true
+    end
+
+    if not exists then
+        pcall(makefolder, path)
+    end
+
+    return true
+end
+
+if MirageFolderMode then
+    MirageEnsureFolder(MIRAGE_SHARED_ROOT)
+    MirageEnsureFolder(MIRAGE_BLACKLIST_DIR)
+    MirageEnsureFolder(MIRAGE_JOIN_FAIL_DIR)
+    MirageEnsureFolder(MIRAGE_CLAIM_DIR)
+end
+
+local function MirageRecordPath(kind, jobId)
+    local safeJobId = MirageSafeJobId(jobId)
+
+    if MirageFolderMode then
+        local folder =
+            kind == "blacklist" and MIRAGE_BLACKLIST_DIR
+            or kind == "join_fail" and MIRAGE_JOIN_FAIL_DIR
+            or MIRAGE_CLAIM_DIR
+
+        return folder .. "/" .. safeJobId .. ".txt"
+    end
+
+    -- Fallback cho executor có file API nhưng không có makefolder.
+    return "mirage_" .. tostring(kind) .. "_" .. safeJobId .. ".txt"
+end
+
+local function MirageDeleteFile(path)
+    if type(delfile) ~= "function" then
+        return
+    end
+
+    pcall(function()
+        if isfile(path) then
+            delfile(path)
+        end
+    end)
+end
+
+local function MirageReadRecord(kind, jobId)
+    if not MirageFileIOReady then
+        return nil, nil, nil
+    end
+
+    local path = MirageRecordPath(kind, jobId)
+
+    local existsOk, exists = pcall(isfile, path)
+    if not existsOk or not exists then
+        return nil, nil, path
+    end
+
+    local ok, body = pcall(readfile, path)
+    if not ok or type(body) ~= "string" then
+        return nil, nil, path
+    end
+
+    local timestamp, owner =
+        body:match("^(%d+)|([^|]*)")
+
+    return tonumber(timestamp), owner, path
+end
+
+local function MirageWriteRecord(kind, jobId, owner, reason)
+    if not MirageFileIOReady then
+        return false
+    end
+
+    local path = MirageRecordPath(kind, jobId)
+    local body = table.concat({
+        tostring(os.time()),
+        tostring(owner or MirageClientToken),
+        tostring(reason or "")
+    }, "|")
+
+    local ok = pcall(writefile, path, body)
+    return ok
+end
+
+local function MirageRecordIsActive(kind, jobId, ttl)
+    local timestamp, owner, path =
+        MirageReadRecord(kind, jobId)
+
+    if not timestamp then
+        return false, nil, 0
+    end
+
+    local age = math.max(0, os.time() - timestamp)
+
+    if age >= ttl then
+        MirageDeleteFile(path)
+        return false, nil, 0
+    end
+
+    return true, owner, ttl - age
+end
+
+local function IsMirageServerBlacklisted(jobId)
+    local active = MirageRecordIsActive(
+        "blacklist",
+        jobId,
+        MIRAGE_BLACKLIST_TTL
+    )
+    return active == true
+end
+
+local function IsMirageJoinFailedRecently(jobId)
+    local active = MirageRecordIsActive(
+        "join_fail",
+        jobId,
+        MIRAGE_JOIN_FAIL_TTL
+    )
+    return active == true
+end
+
+local function IsMirageServerClaimedByOther(jobId)
+    local active, owner = MirageRecordIsActive(
+        "claim",
+        jobId,
+        MIRAGE_CLAIM_TTL
+    )
+
+    return active == true
+        and owner ~= nil
+        and owner ~= MirageClientToken
+end
+
+local function BlacklistMirageServer(jobId, reason)
+    if not jobId or tostring(jobId) == "" then
+        return false
+    end
+
+    local written = MirageWriteRecord(
+        "blacklist",
+        jobId,
+        MirageClientToken,
+        reason or "no_mirage"
+    )
+
+    if written then
+        warn(
+            "[MirageBlacklist] Blacklist 15m: "
+            .. tostring(jobId)
+            .. " | "
+            .. tostring(reason or "no_mirage")
+        )
+    end
+
+    return written
+end
+
+local function MarkMirageJoinFailed(jobId, reason)
+    if not jobId or tostring(jobId) == "" then
+        return false
+    end
+
+    return MirageWriteRecord(
+        "join_fail",
+        jobId,
+        MirageClientToken,
+        reason or "join_failed"
+    )
+end
+
+local function ReleaseMirageClaim(jobId)
+    if not MirageFileIOReady then
+        return
+    end
+
+    local _, owner, path =
+        MirageReadRecord("claim", jobId)
+
+    if owner == MirageClientToken and path then
+        MirageDeleteFile(path)
+    end
+end
+
+local function TryClaimMirageServer(jobId)
+    if not MirageFileIOReady then
+        -- Không có file API thì giữ hành vi cũ.
+        return true
+    end
+
+    if IsMirageServerClaimedByOther(jobId) then
+        return false
+    end
+
+    -- Jitter nhỏ, ổn định theo UserId để 20 client không ghi cùng một lúc.
+    local jitter =
+        0.04
+        + ((tonumber(LocalPlayer.UserId) or 0) % 11) * 0.011
+        + math.random() * 0.05
+
+    task.wait(jitter)
+
+    if IsMirageServerClaimedByOther(jobId) then
+        return false
+    end
+
+    if not MirageWriteRecord(
+        "claim",
+        jobId,
+        MirageClientToken,
+        "joining"
+    ) then
+        return true
+    end
+
+    -- Cho các client cùng tranh JobId có thời gian ghi.
+    task.wait(0.12 + math.random() * 0.06)
+
+    local active, owner = MirageRecordIsActive(
+        "claim",
+        jobId,
+        MIRAGE_CLAIM_TTL
+    )
+
+    return active == true and owner == MirageClientToken
+end
+
+local function CurrentServerConfirmedNoMirage()
+    -- Kiểm tra lại vài lần trước khi blacklist để tránh Map vừa replicate dở.
+    for _ = 1, 3 do
+        local map = workspace:FindFirstChild("Map")
+        if map and map:FindFirstChild("MysticIsland") then
+            return false
+        end
+        task.wait(0.35)
+    end
+
+    return true
+end
 
 SetStatus("Creating UI...")
 pcall(MakeUI)
@@ -562,348 +850,6 @@ local function IfTableHaveIndex(t)
     for _ in t do return true end
 end
 
--- ============================================================
--- INTERNAL FIXED SETTINGS
--- Cac gia tri nay KHONG doc tu getgenv/config, nen client ben ngoai
--- khong the tang/giam toc do hoac TTL trong luc script dang chay.
--- Muc tween duoc chon can bang: khong qua nhanh, khong qua cham.
--- ============================================================
-local FIXED_TWEEN_SPEED = 215
-local FIXED_TWEEN_ACCELERATION = 480
-local FIXED_TWEEN_DECELERATION = 650
-local FIXED_TWEEN_ARRIVAL = 6
-local FIXED_TWEEN_MIN_SPEED = 34
-
--- 20 client cung mot workspace: blacklist/claim/cache dung chung.
-local MIRAGE_BLACKLIST_TTL = 15 * 60
-local MIRAGE_JOIN_FAIL_TTL = 2 * 60
-local MIRAGE_CLAIM_TTL = 35
-local MIRAGE_API_CACHE_TTL = 15
-local MIRAGE_API_LOCK_TTL = 8
-local MIRAGE_JOIN_CONFIRM_WAIT = 4.0
-local MIRAGE_NO_ISLAND_CHECKS = 3
-local MIRAGE_NO_ISLAND_CHECK_DELAY = 1.25
-local MIRAGE_JITTER_MIN = 0.20
-local MIRAGE_JITTER_MAX = 0.85
-
-local MIRAGE_SHARED_ROOT = "mirage_shared"
-local MIRAGE_USE_FOLDERS = type(makefolder) == "function"
-local MIRAGE_BLACKLIST_DIR = MIRAGE_SHARED_ROOT .. "/blacklist"
-local MIRAGE_FAIL_DIR = MIRAGE_SHARED_ROOT .. "/join_fail"
-local MIRAGE_CLAIM_DIR = MIRAGE_SHARED_ROOT .. "/claim"
-local MIRAGE_API_CACHE_FILE = MIRAGE_USE_FOLDERS
-    and (MIRAGE_SHARED_ROOT .. "/api_cache.json")
-    or "mirage_shared_api_cache.json"
-local MIRAGE_API_LOCK_FILE = MIRAGE_USE_FOLDERS
-    and (MIRAGE_SHARED_ROOT .. "/api_fetch.lock")
-    or "mirage_shared_api_fetch.lock"
-
-local MIRAGE_CLIENT_TOKEN = table.concat({
-    tostring(LocalPlayer.UserId or 0),
-    tostring(math.random(100000, 999999)),
-    tostring(os.time()),
-}, ":")
-
-local function SharedFilesReady()
-    return type(isfile) == "function"
-        and type(readfile) == "function"
-        and type(writefile) == "function"
-end
-
-local function EnsureSharedFolders()
-    if type(makefolder) ~= "function" then
-        return false
-    end
-
-    for _, folder in ipairs({
-        MIRAGE_SHARED_ROOT,
-        MIRAGE_BLACKLIST_DIR,
-        MIRAGE_FAIL_DIR,
-        MIRAGE_CLAIM_DIR,
-    }) do
-        pcall(function()
-            if type(isfolder) ~= "function" or not isfolder(folder) then
-                makefolder(folder)
-            end
-        end)
-    end
-
-    return true
-end
-
-EnsureSharedFolders()
-
-local function SafeJobId(jobId)
-    return tostring(jobId or "")
-        :gsub("[^%w%-_]", "_")
-end
-
-local function DeleteFileSafe(path)
-    if type(delfile) == "function" then
-        pcall(function()
-            if type(isfile) ~= "function" or isfile(path) then
-                delfile(path)
-            end
-        end)
-    end
-end
-
-local function ReadFileSafe(path)
-    if not SharedFilesReady() then return nil end
-
-    local ok, value = pcall(function()
-        if not isfile(path) then return nil end
-        return readfile(path)
-    end)
-
-    return ok and value or nil
-end
-
-local function WriteFileSafe(path, value)
-    if not SharedFilesReady() then return false end
-    local ok = pcall(function()
-        writefile(path, tostring(value or ""))
-    end)
-    return ok
-end
-
-local function TimedPathActive(path, ttl)
-    local raw = ReadFileSafe(path)
-    if type(raw) ~= "string" then return false end
-
-    local stamp = tonumber(raw:match("^(%d+)"))
-    if not stamp then
-        DeleteFileSafe(path)
-        return false
-    end
-
-    if os.time() - stamp < ttl then
-        return true
-    end
-
-    DeleteFileSafe(path)
-    return false
-end
-
-local function BlacklistPath(jobId)
-    local safe = SafeJobId(jobId)
-    return MIRAGE_USE_FOLDERS
-        and (MIRAGE_BLACKLIST_DIR .. "/" .. safe .. ".txt")
-        or ("mirage_shared_blacklist_" .. safe .. ".txt")
-end
-
-local function JoinFailPath(jobId)
-    local safe = SafeJobId(jobId)
-    return MIRAGE_USE_FOLDERS
-        and (MIRAGE_FAIL_DIR .. "/" .. safe .. ".txt")
-        or ("mirage_shared_join_fail_" .. safe .. ".txt")
-end
-
-local function ClaimPath(jobId)
-    local safe = SafeJobId(jobId)
-    return MIRAGE_USE_FOLDERS
-        and (MIRAGE_CLAIM_DIR .. "/" .. safe .. ".txt")
-        or ("mirage_shared_claim_" .. safe .. ".txt")
-end
-
-local function IsMirageBlacklisted(jobId)
-    return TimedPathActive(BlacklistPath(jobId), MIRAGE_BLACKLIST_TTL)
-end
-
-local function MarkMirageBlacklisted(jobId, reason)
-    if not jobId or tostring(jobId) == "" then return false end
-    local content = tostring(os.time()) .. "|" .. tostring(reason or "no_mirage")
-    local ok = WriteFileSafe(BlacklistPath(jobId), content)
-    if ok then
-        warn("[MirageShared] Blacklist 15m: " .. tostring(jobId):sub(1, 8)
-            .. " | " .. tostring(reason or "no_mirage"))
-    end
-    return ok
-end
-
-local function IsJoinFailCoolingDown(jobId)
-    return TimedPathActive(JoinFailPath(jobId), MIRAGE_JOIN_FAIL_TTL)
-end
-
-local function MarkJoinFail(jobId, reason)
-    if not jobId or tostring(jobId) == "" then return false end
-    local ok = WriteFileSafe(
-        JoinFailPath(jobId),
-        tostring(os.time()) .. "|" .. tostring(reason or "join_failed")
-    )
-    if ok then
-        warn("[MirageShared] Join fail cooldown 2m: "
-            .. tostring(jobId):sub(1, 8))
-    end
-    return ok
-end
-
-local function ReadClaim(jobId)
-    local raw = ReadFileSafe(ClaimPath(jobId))
-    if type(raw) ~= "string" then return nil, nil end
-
-    local owner, stamp = raw:match("^([^|]+)|(%d+)$")
-    stamp = tonumber(stamp)
-
-    if not owner or not stamp then
-        DeleteFileSafe(ClaimPath(jobId))
-        return nil, nil
-    end
-
-    if os.time() - stamp >= MIRAGE_CLAIM_TTL then
-        DeleteFileSafe(ClaimPath(jobId))
-        return nil, nil
-    end
-
-    return owner, stamp
-end
-
-local function IsMirageClaimed(jobId)
-    local owner = ReadClaim(jobId)
-    return owner ~= nil and owner ~= MIRAGE_CLIENT_TOKEN
-end
-
-local function TryClaimMirageJob(jobId)
-    if not SharedFilesReady() then
-        return true
-    end
-
-    local owner = ReadClaim(jobId)
-    if owner and owner ~= MIRAGE_CLIENT_TOKEN then
-        return false
-    end
-
-    -- Jitter nho truoc khi ghi de 20 client khong cung va cham file.
-    task.wait(MIRAGE_JITTER_MIN
-        + math.random() * (MIRAGE_JITTER_MAX - MIRAGE_JITTER_MIN))
-
-    local path = ClaimPath(jobId)
-    if not WriteFileSafe(path, MIRAGE_CLIENT_TOKEN .. "|" .. tostring(os.time())) then
-        return false
-    end
-
-    -- Doc lai: client ghi sau cung la client duy nhat duoc di tiep.
-    task.wait(0.08 + math.random() * 0.08)
-    local verifiedOwner = ReadClaim(jobId)
-    return verifiedOwner == MIRAGE_CLIENT_TOKEN
-end
-
-local function ReleaseMirageClaim(jobId)
-    local owner = ReadClaim(jobId)
-    if owner == MIRAGE_CLIENT_TOKEN then
-        DeleteFileSafe(ClaimPath(jobId))
-    end
-end
-
-local function RotateServersForClient(list)
-    if type(list) ~= "table" or #list <= 1 then
-        return list
-    end
-
-    local rotated = {}
-    local offset = (math.abs(tonumber(LocalPlayer.UserId) or 0) % #list) + 1
-
-    for step = 0, #list - 1 do
-        local index = ((offset - 1 + step) % #list) + 1
-        rotated[#rotated + 1] = list[index]
-    end
-
-    return rotated
-end
-
-local function ReadSharedApiCache(placeId)
-    local raw = ReadFileSafe(MIRAGE_API_CACHE_FILE)
-    if type(raw) ~= "string" or raw == "" then return nil end
-
-    local ok, data = pcall(function()
-        return HttpService:JSONDecode(raw)
-    end)
-
-    if not ok or type(data) ~= "table" then
-        return nil
-    end
-
-    if tonumber(data.PlaceId) ~= tonumber(placeId)
-        or os.time() - (tonumber(data.Timestamp) or 0) >= MIRAGE_API_CACHE_TTL
-        or type(data.Servers) ~= "table"
-    then
-        return nil
-    end
-
-    return data.Servers
-end
-
-local function WriteSharedApiCache(placeId, servers)
-    if not SharedFilesReady() or type(servers) ~= "table" then return false end
-
-    local ok, encoded = pcall(function()
-        return HttpService:JSONEncode({
-            Timestamp = os.time(),
-            PlaceId = tonumber(placeId),
-            Servers = servers,
-        })
-    end)
-
-    return ok and WriteFileSafe(MIRAGE_API_CACHE_FILE, encoded)
-end
-
-local function TryAcquireApiFetchLock()
-    if not SharedFilesReady() then return true end
-
-    local raw = ReadFileSafe(MIRAGE_API_LOCK_FILE)
-    if type(raw) == "string" then
-        local owner, stamp = raw:match("^([^|]+)|(%d+)$")
-        stamp = tonumber(stamp)
-        if owner and stamp and os.time() - stamp < MIRAGE_API_LOCK_TTL
-            and owner ~= MIRAGE_CLIENT_TOKEN
-        then
-            return false
-        end
-    end
-
-    WriteFileSafe(
-        MIRAGE_API_LOCK_FILE,
-        MIRAGE_CLIENT_TOKEN .. "|" .. tostring(os.time())
-    )
-    task.wait(0.08 + math.random() * 0.08)
-
-    local verify = ReadFileSafe(MIRAGE_API_LOCK_FILE)
-    return type(verify) == "string"
-        and verify:match("^([^|]+)|") == MIRAGE_CLIENT_TOKEN
-end
-
-local function ReleaseApiFetchLock()
-    local raw = ReadFileSafe(MIRAGE_API_LOCK_FILE)
-    if type(raw) == "string"
-        and raw:match("^([^|]+)|") == MIRAGE_CLIENT_TOKEN
-    then
-        DeleteFileSafe(MIRAGE_API_LOCK_FILE)
-    end
-end
-
-local CurrentServerNoMirageHandled = false
-local function ConfirmAndBlacklistCurrentServerNoMirage()
-    if CurrentServerNoMirageHandled then
-        return IsMirageBlacklisted(game.JobId)
-    end
-
-    CurrentServerNoMirageHandled = true
-
-    if IsMirageBlacklisted(game.JobId) then
-        return true
-    end
-
-    for _ = 1, MIRAGE_NO_ISLAND_CHECKS do
-        local map = workspace:FindFirstChild("Map")
-        if map and map:FindFirstChild("MysticIsland") then
-            return false
-        end
-        task.wait(MIRAGE_NO_ISLAND_CHECK_DELAY)
-    end
-
-    return MarkMirageBlacklisted(game.JobId, "joined_but_no_mirage")
-end
-
 local CachedServers, LastServersDataPulled
 local function GetServers()
     if LastServersDataPulled and os.time() - LastServersDataPulled < 60 then
@@ -923,51 +869,16 @@ end
 local function Hop(Reason)
     print("[PullLever] Hop: " .. tostring(Reason))
     local Servers = GetServers()
-    if not Servers then return false end
-
-    local candidates = {}
+    if not Servers then return end
+    local List = {}
     for JobId, v in Servers do
-        local players = tonumber(v.Count) or 0
-        local jobId = tostring(JobId)
-        if jobId ~= tostring(game.JobId)
-            and players <= 11
-            and not IsMirageBlacklisted(jobId)
-            and not IsJoinFailCoolingDown(jobId)
-            and not IsMirageClaimed(jobId)
-        then
-            candidates[#candidates + 1] = {
-                JobId = jobId,
-                Players = players,
-                Region = v.Region,
-            }
-        end
+        table.insert(List, { JobId = JobId, Players = v.Count, Region = v.Region })
     end
-
-    candidates = RotateServersForClient(candidates)
-
-    for _, data in ipairs(candidates) do
-        if TryClaimMirageJob(data.JobId) then
-            SetStatus("Fallback join | " .. data.JobId:sub(1, 8))
-            local beforeJob = tostring(game.JobId)
-            local ok = pcall(function()
-                ReplicatedStorage:FindFirstChild("__ServerBrowser")
-                    :InvokeServer("teleport", data.JobId)
-            end)
-
-            if not ok then
-                MarkJoinFail(data.JobId, "invoke_error")
-                ReleaseMirageClaim(data.JobId)
-            else
-                task.wait(MIRAGE_JOIN_CONFIRM_WAIT)
-                if tostring(game.JobId) == beforeJob then
-                    MarkJoinFail(data.JobId, "session_still_alive")
-                    ReleaseMirageClaim(data.JobId)
-                end
-            end
-        end
-    end
-
-    return false
+    if #List == 0 then return end
+    local data = List[math.random(1, #List)]
+    pcall(function()
+        ReplicatedStorage:FindFirstChild("__ServerBrowser"):InvokeServer("teleport", data.JobId)
+    end)
 end
 
 local JoinJobIdByServerBrowser
@@ -1067,33 +978,8 @@ local function GetMirageServersFromAPI()
 
     if CachedMirageServers
         and CachedMiragePlaceId == currentPlaceId
-        and os.time() - LastMirageApiFetch < MIRAGE_API_CACHE_TTL
-    then
+        and os.time() - LastMirageApiFetch < 20 then
         return CachedMirageServers
-    end
-
-    local shared = ReadSharedApiCache(currentPlaceId)
-    if type(shared) == "table" and #shared > 0 then
-        CachedMirageServers = shared
-        CachedMiragePlaceId = currentPlaceId
-        LastMirageApiFetch = os.time()
-        SetStatus("Mirage shared cache: " .. tostring(#shared))
-        return shared
-    end
-
-    local ownsFetchLock = TryAcquireApiFetchLock()
-    if not ownsFetchLock then
-        -- Mot client khac dang fetch. Doi cache chung toi da 3 giay.
-        for _ = 1, 12 do
-            task.wait(0.25)
-            shared = ReadSharedApiCache(currentPlaceId)
-            if type(shared) == "table" and #shared > 0 then
-                CachedMirageServers = shared
-                CachedMiragePlaceId = currentPlaceId
-                LastMirageApiFetch = os.time()
-                return shared
-            end
-        end
     end
 
     SetStatus("Fetching Mirage API...")
@@ -1108,7 +994,6 @@ local function GetMirageServersFromAPI()
     })
 
     if not ok then
-        ReleaseApiFetchLock()
         warn("[MirageAPI] Request failed: " .. tostring(res))
         return {}
     end
@@ -1119,14 +1004,12 @@ local function GetMirageServersFromAPI()
     print("[MirageAPI] Status=" .. tostring(statusCode) .. " BodyLen=" .. tostring(#body))
 
     if statusCode ~= 0 and (statusCode < 200 or statusCode >= 300) then
-        ReleaseApiFetchLock()
         warn("[MirageAPI] Bad status: " .. tostring(statusCode))
         return {}
     end
 
     local data = JsonDecodeSafe(body)
     if not data then
-        ReleaseApiFetchLock()
         warn("[MirageAPI] JSON decode failed. Body head: " .. tostring(body):sub(1, 300))
         return {}
     end
@@ -1137,10 +1020,7 @@ local function GetMirageServersFromAPI()
         LastMirageApiFetch = os.time()
         CachedMiragePlaceId = currentPlaceId
         CachedMirageServers = servers
-        WriteSharedApiCache(currentPlaceId, servers)
     end
-
-    ReleaseApiFetchLock()
 
     print("[MirageAPI] Parsed " .. tostring(#servers) .. " server(s), moi nhat truoc")
     SetStatus("Mirage API servers: " .. tostring(#servers))
@@ -1177,17 +1057,6 @@ end
 -- Lay 30 server moi nhat -> join lan luot tu gan nhat den thu 30,
 -- moi lan cach nhau Hop Delay (1.5s). Neu het danh sach van chua
 -- vao duoc server nao -> return false de main loop refresh lai.
-local PendingMirageJoin = nil
-
-TeleportService.TeleportInitFailed:Connect(function(player, result, message)
-    if player ~= LocalPlayer or not PendingMirageJoin then return end
-
-    local jobId = PendingMirageJoin.JobId
-    MarkJoinFail(jobId, tostring(result) .. ":" .. tostring(message))
-    ReleaseMirageClaim(jobId)
-    PendingMirageJoin = nil
-end)
-
 local function HopMirageByAPI()
     local cfg = getgenv().PullLeverConfig or {}
 
@@ -1202,106 +1071,99 @@ local function HopMirageByAPI()
     end
 
     local currentPlaceId = tonumber(game.PlaceId)
-    local maxPlayers = tonumber(cfg["Max Players"] or 11) or 11
-    local avoidFull = cfg["Avoid Full Server"] ~= false
-    local fetchCount = math.max(1, math.floor(tonumber(cfg["Fetch Count"]) or 30))
+    local maxPlayers     = tonumber(cfg["Max Players"] or 11) or 11
+    local avoidFull      = cfg["Avoid Full Server"] ~= false
+    local fetchCount     = math.max(1, math.floor(tonumber(cfg["Fetch Count"]) or 30))
+    local hopDelay       = math.max(0.1, tonumber(cfg["Hop Delay"]) or 1.5)
 
-    local candidates = {}
-    local samePlaceCount = 0
-    local skippedBlacklist = 0
-    local skippedClaim = 0
-    local skippedFail = 0
+    local candidates, samePlaceCount = {}, 0
 
     for _, server in ipairs(servers) do
         local placeId = tonumber(server.PlaceId)
         local players = tonumber(server.Players) or 0
-        local jobId = tostring(server.JobId or "")
 
-        local samePlace = (placeId == nil) or (placeId == currentPlaceId)
-        local notSameJob = jobId ~= "" and jobId ~= tostring(game.JobId)
-        local notFull = (not avoidFull) or players <= maxPlayers
+        -- placeId nil = API khong tra -> coi nhu cung place (ServerBrowser
+        -- teleport trong place hien tai nen khong gay Error 773).
+        local samePlace  = (placeId == nil) or (placeId == currentPlaceId)
+        local notSameJob = tostring(server.JobId) ~= tostring(game.JobId)
+        local notFull    = (not avoidFull) or players <= maxPlayers
+        local notBlacklisted =
+            not IsMirageServerBlacklisted(server.JobId)
+        local notJoinFailed =
+            not IsMirageJoinFailedRecently(server.JobId)
+        local notClaimed =
+            not IsMirageServerClaimedByOther(server.JobId)
 
         if samePlace then samePlaceCount = samePlaceCount + 1 end
 
-        if samePlace and notSameJob and notFull then
-            if IsMirageBlacklisted(jobId) then
-                skippedBlacklist = skippedBlacklist + 1
-            elseif IsJoinFailCoolingDown(jobId) then
-                skippedFail = skippedFail + 1
-            elseif IsMirageClaimed(jobId) then
-                skippedClaim = skippedClaim + 1
-            else
-                candidates[#candidates + 1] = server
-                if #candidates >= fetchCount then break end
-            end
+        if samePlace
+            and notSameJob
+            and notFull
+            and notBlacklisted
+            and notJoinFailed
+            and notClaimed
+        then
+            candidates[#candidates + 1] = server
+            if #candidates >= fetchCount then break end
         end
     end
 
-    candidates = RotateServersForClient(candidates)
-
     if #candidates == 0 then
         SetStatus(
-            "No candidate | BL=" .. tostring(skippedBlacklist)
-            .. " Claim=" .. tostring(skippedClaim)
-            .. " Fail=" .. tostring(skippedFail)
+            "No Mirage JobId for PlaceId=" .. tostring(currentPlaceId)
+            .. " | SamePlace=" .. tostring(samePlaceCount)
+            .. " -> refresh"
         )
         return false
     end
 
-    SetStatus(
-        "Mirage candidates=" .. tostring(#candidates)
-        .. " | BL=" .. tostring(skippedBlacklist)
-        .. " Claim=" .. tostring(skippedClaim)
-    )
+    SetStatus("Mirage: thu " .. tostring(#candidates) .. " server (moi nhat -> cu)")
 
     for i, server in ipairs(candidates) do
         local jobId = tostring(server.JobId)
 
-        -- Doc lai ngay truoc claim vi client khac co the vua ghi file.
-        if not IsMirageBlacklisted(jobId)
-            and not IsJoinFailCoolingDown(jobId)
-            and TryClaimMirageJob(jobId)
+        SetStatus(
+            "Join Mirage " .. tostring(i) .. "/" .. tostring(#candidates)
+            .. " | Players=" .. tostring(server.Players)
+            .. " | " .. jobId:sub(1, 8)
+        )
+        print(
+            "[MirageAPI] #" .. tostring(i)
+            .. " JobId=" .. jobId
+            .. " PlaceId=" .. tostring(server.PlaceId)
+            .. " Players=" .. tostring(server.Players)
+            .. " Timestamp=" .. tostring(server.Timestamp)
+        )
+
+        if IsMirageServerBlacklisted(jobId)
+            or IsMirageJoinFailedRecently(jobId)
         then
-            SetStatus(
-                "Join Mirage " .. tostring(i) .. "/" .. tostring(#candidates)
-                .. " | P=" .. tostring(server.Players)
-                .. " | " .. jobId:sub(1, 8)
-            )
-
-            print(
-                "[MirageAPI] #" .. tostring(i)
-                .. " JobId=" .. jobId
-                .. " PlaceId=" .. tostring(server.PlaceId)
-                .. " Players=" .. tostring(server.Players)
-            )
-
-            local beforeJob = tostring(game.JobId)
-            PendingMirageJoin = {
-                JobId = jobId,
-                StartedAt = tick(),
-            }
-
-            local invoked = JoinJobIdByServerBrowser(jobId)
-
-            if not invoked then
-                MarkJoinFail(jobId, "invoke_failed")
-                ReleaseMirageClaim(jobId)
-                PendingMirageJoin = nil
-            else
-                task.wait(MIRAGE_JOIN_CONFIRM_WAIT)
-
-                -- Teleport thanh cong se reset phien. Con o JobId cu sau 4s
-                -- thi chi cooldown 2 phut, KHONG blacklist 15 phut.
-                if tostring(game.JobId) == beforeJob then
-                    MarkJoinFail(jobId, "session_still_alive")
-                    ReleaseMirageClaim(jobId)
-                    PendingMirageJoin = nil
-                end
-            end
+            print("[MirageBlacklist] Skip stale candidate: " .. jobId)
+            continue
         end
+
+        if not TryClaimMirageServer(jobId) then
+            print("[MirageClaim] Client khac da claim: " .. jobId)
+            continue
+        end
+
+        local joinStarted = JoinJobIdByServerBrowser(jobId)
+
+        -- Giữ nguyên cơ chế fire-and-forget cũ.
+        -- Nếu session vẫn còn sống sau Hop Delay thì coi lần join này thất bại,
+        -- cooldown ngắn 2 phút và nhả claim để client khác không lặp ngay.
+        task.wait(hopDelay)
+
+        if joinStarted then
+            MarkMirageJoinFailed(jobId, "session_alive_after_hop_delay")
+        else
+            MarkMirageJoinFailed(jobId, "invoke_failed")
+        end
+
+        ReleaseMirageClaim(jobId)
     end
 
-    SetStatus("Da thu het candidate -> refresh")
+    SetStatus("Da thu het " .. tostring(#candidates) .. " server -> refresh")
     return false
 end
 
@@ -1320,32 +1182,11 @@ local function CaculateDistance(Origin, Destination)
     return (a - b).Magnitude
 end
 
--- ============================================================
--- SAFE VELOCITY TWEEN
--- Giữ nguyên chữ ký TweenTo(Position), nhưng:
---   * không tạo TweenGhost;
---   * không set HumanoidRootPart.CFrame mỗi Heartbeat;
---   * không snap thẳng ở khoảng cách <= 200;
---   * tăng tốc và phanh mượt bằng BodyVelocity;
---   * BodyGyro chỉ xoay theo trục Y để tránh rung/ngửa nhân vật.
--- ============================================================
-local SafeMoveTarget = nil
-local SafeMoveEnabled = false
-local SafeMoveRoot = nil
-local SafeMoveVelocity = Vector3.zero
-local SafeMoveLastDistance = math.huge
-local SafeMoveLastProgressAt = 0
-
-local SAFE_MOVE_VELOCITY_NAME = "PullLeverSafeVelocity"
-local SAFE_MOVE_GYRO_NAME = "PullLeverSafeGyro"
-
+local TweenConn, TweenInstance, TweenGhost, IsTweening = nil, nil, nil, false
 local function NoclipLoop()
     if LocalPlayer.Character then
         for _, c in LocalPlayer.Character:GetDescendants() do
-            if c:IsA("BasePart")
-                and c.CanCollide
-                and c.Name ~= "HumanoidRootPart"
-            then
+            if c:IsA("BasePart") and c.CanCollide and c.Name ~= "HumanoidRootPart" then
                 c.CanCollide = false
             end
         end
@@ -1353,266 +1194,80 @@ local function NoclipLoop()
 end
 RunService.Stepped:Connect(NoclipLoop)
 
-local function MoveVectorTowards(current, target, maximumChange)
-    local difference = target - current
-    local magnitude = difference.Magnitude
-
-    if magnitude <= maximumChange or magnitude <= 1e-4 then
-        return target
-    end
-
-    return current + difference.Unit * maximumChange
-end
-
-local function GetSafeMoveActuators(root)
-    if not root or not root.Parent then
-        return nil, nil
-    end
-
-    local velocity = root:FindFirstChild(SAFE_MOVE_VELOCITY_NAME)
-
-    if not velocity then
-        velocity = Instance.new("BodyVelocity")
-        velocity.Name = SAFE_MOVE_VELOCITY_NAME
-        velocity.P = 1500
-        velocity.MaxForce = Vector3.new(1e9, 1e9, 1e9)
-        velocity.Velocity = Vector3.zero
-        velocity.Parent = root
-    end
-
-    local gyro = root:FindFirstChild(SAFE_MOVE_GYRO_NAME)
-
-    if not gyro then
-        gyro = Instance.new("BodyGyro")
-        gyro.Name = SAFE_MOVE_GYRO_NAME
-        gyro.P = 5000
-        gyro.D = 900
-        gyro.MaxTorque = Vector3.new(0, 1e9, 0)
-        gyro.CFrame = root.CFrame
-        gyro.Parent = root
-    end
-
-    return velocity, gyro
-end
-
 local function StopTween()
-    SafeMoveEnabled = false
-    SafeMoveTarget = nil
-    SafeMoveVelocity = Vector3.zero
-    SafeMoveLastDistance = math.huge
-    SafeMoveLastProgressAt = 0
-
-    local char = LocalPlayer.Character
-    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-
-    if humanoid then
-        humanoid.AutoRotate = true
-    end
-
-    if root then
-        local velocity = root:FindFirstChild(SAFE_MOVE_VELOCITY_NAME)
-        local gyro = root:FindFirstChild(SAFE_MOVE_GYRO_NAME)
-
-        if velocity then
-            pcall(function()
-                velocity:Destroy()
-            end)
-        end
-
-        if gyro then
-            pcall(function()
-                gyro:Destroy()
-            end)
-        end
-
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-    end
-
-    SafeMoveRoot = nil
+    if TweenInstance then pcall(function() TweenInstance:Cancel() end) TweenInstance = nil end
+    if TweenConn then TweenConn:Disconnect() TweenConn = nil end
+    if TweenGhost then pcall(function() TweenGhost:Destroy() end) TweenGhost = nil end
+    IsTweening = false
 end
-
-RunService.Heartbeat:Connect(function(deltaTime)
-    if not SafeMoveEnabled or typeof(SafeMoveTarget) ~= "CFrame" then
-        return
-    end
-
-    local char = LocalPlayer.Character
-    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-
-    if not char
-        or not humanoid
-        or humanoid.Health <= 0
-        or not root
-        or not root:IsDescendantOf(workspace)
-    then
-        StopTween()
-        return
-    end
-
-    if SafeMoveRoot ~= root then
-        SafeMoveRoot = root
-        SafeMoveVelocity = Vector3.zero
-        SafeMoveLastDistance = math.huge
-        SafeMoveLastProgressAt = tick()
-    end
-
-    humanoid.Sit = false
-    humanoid.AutoRotate = false
-
-    local velocityMover, gyro = GetSafeMoveActuators(root)
-
-    if not velocityMover or not gyro then
-        return
-    end
-
-    deltaTime = math.clamp(tonumber(deltaTime) or 0.016, 0.001, 0.10)
-
-    local targetPosition = SafeMoveTarget.Position
-    local offset = targetPosition - root.Position
-    local distance = offset.Magnitude
-    local arrivalDistance =
-        FIXED_TWEEN_ARRIVAL
-
-    -- Không snap CFrame ở đích. Chỉ dừng khi đã bay thật sự tới gần.
-    if distance <= arrivalDistance then
-        velocityMover.Velocity = Vector3.zero
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        StopTween()
-        return
-    end
-
-    local maximumSpeed =
-        FIXED_TWEEN_SPEED
-
-    local acceleration =
-        FIXED_TWEEN_ACCELERATION
-
-    local deceleration =
-        FIXED_TWEEN_DECELERATION
-
-    local minimumCruise =
-        FIXED_TWEEN_MIN_SPEED
-
-    local brakingDistance = math.max(distance - arrivalDistance, 0)
-    local brakingSpeed = math.sqrt(2 * deceleration * brakingDistance)
-    local desiredSpeed = math.min(maximumSpeed, brakingSpeed)
-
-    if distance > 30 then
-        desiredSpeed =
-            math.max(desiredSpeed, math.min(maximumSpeed, minimumCruise))
-    end
-
-    local desiredVelocity =
-        distance > 1e-3
-        and offset.Unit * desiredSpeed
-        or Vector3.zero
-
-    local changeRate =
-        desiredVelocity.Magnitude < SafeMoveVelocity.Magnitude
-        and deceleration
-        or acceleration
-
-    SafeMoveVelocity = MoveVectorTowards(
-        SafeMoveVelocity,
-        desiredVelocity,
-        changeRate * deltaTime
-    )
-
-    -- Nếu bị giữ tại một vị trí quá lâu, chỉ reset gia tốc.
-    -- Không dịch CFrame để thoát kẹt.
-    if distance < SafeMoveLastDistance - 1 then
-        SafeMoveLastDistance = distance
-        SafeMoveLastProgressAt = tick()
-    elseif SafeMoveLastProgressAt == 0 then
-        SafeMoveLastProgressAt = tick()
-    elseif tick() - SafeMoveLastProgressAt >= 3 then
-        SafeMoveVelocity =
-            offset.Unit * math.min(maximumSpeed, minimumCruise + 25)
-
-        SafeMoveLastProgressAt = tick()
-        SafeMoveLastDistance = distance
-    end
-
-    velocityMover.Velocity = SafeMoveVelocity
-    root.AssemblyAngularVelocity = Vector3.zero
-
-    local flatDirection = Vector3.new(offset.X, 0, offset.Z)
-
-    if flatDirection.Magnitude > 0.05 then
-        gyro.CFrame = CFrame.lookAt(
-            root.Position,
-            root.Position + flatDirection.Unit
-        )
-    end
-end)
 
 function TweenTo(Position)
+
+    if not Character or not Character:FindFirstChild("Humanoid")
+        or Character.Humanoid.Health <= 0 or not HumanoidRootPart then
+        StopTween()
+        return
+    end
+
     if Position == false then
         StopTween()
-        return false
+        return
+    end
+    if not Position then return end
+
+    Position = typeof(Position) ~= "CFrame" and ConvertTo(CFrame, Position) or Position
+    if typeof(Position) == "CFrame" then
+        local p = Position.p
+        Position = CFrame.new(p.X, math.max(p.Y, 5), p.Z)
     end
 
-    if not Position then
-        return false
-    end
+    local root = HumanoidRootPart
+    local dist = (Position.Position - root.Position).Magnitude
 
-    local char = LocalPlayer.Character
-    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-
-    if not char or not humanoid or humanoid.Health <= 0 or not root then
+    if dist <= 200 then
         StopTween()
-        return false
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+        root.CFrame = Position
+        return
     end
 
-    Position =
-        typeof(Position) ~= "CFrame"
-        and ConvertTo(CFrame, Position)
-        or Position
+    if IsTweening then return end
+    IsTweening = true
 
-    if typeof(Position) ~= "CFrame" then
-        return false
-    end
+    local ghost = Instance.new("Part")
+    ghost.Name = "TweenGhost"
+    ghost.Transparency = 1
+    ghost.Anchored = true
+    ghost.CanCollide = false
+    ghost.Size = Vector3.new(4, 4, 4)
+    ghost.CFrame = root.CFrame
+    ghost.Parent = workspace
+    TweenGhost = ghost
 
-    local p = Position.Position
-    Position = CFrame.new(
-        p.X,
-        math.max(p.Y, 5),
-        p.Z
-    ) * (Position - Position.Position)
+    TweenInstance = TweenService:Create(
+        ghost,
+        TweenInfo.new(dist / 330, Enum.EasingStyle.Linear),
+        { CFrame = Position }
+    )
 
-    local distance = (Position.Position - root.Position).Magnitude
-    local arrivalDistance =
-        FIXED_TWEEN_ARRIVAL
+    TweenConn = RunService.Heartbeat:Connect(function()
+        if root and root.Parent and ghost and ghost.Parent then
+            pcall(function()
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+                root.CFrame = ghost.CFrame
+            end)
+        end
+    end)
 
-    if distance <= arrivalDistance then
+    TweenInstance.Completed:Connect(function()
         StopTween()
-        return true
-    end
+    end)
 
-    local targetChanged =
-        typeof(SafeMoveTarget) ~= "CFrame"
-        or (SafeMoveTarget.Position - Position.Position).Magnitude > 2
-
-    SafeMoveTarget = Position
-    SafeMoveEnabled = true
-
-    if SafeMoveRoot ~= root or targetChanged then
-        SafeMoveRoot = root
-        SafeMoveVelocity = Vector3.zero
-        SafeMoveLastDistance = distance
-        SafeMoveLastProgressAt = tick()
-    end
-
-    humanoid.Sit = false
-    humanoid.AutoRotate = false
-    GetSafeMoveActuators(root)
-
-    return true
+    TweenInstance:Play()
 end
 
 function GetBlueGear()
@@ -1666,10 +1321,15 @@ end
 local function DoMirageBlueGear()
     local mirage = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("MysticIsland")
     if not mirage then
-        ConfirmAndBlacklistCurrentServerNoMirage()
+        if CurrentServerConfirmedNoMirage() then
+            BlacklistMirageServer(
+                game.JobId,
+                "joined_server_without_mirage"
+            )
+        end
 
         if Config["Hop Mirage"] then
-            SetStatus("Khong co Mirage -> da blacklist server hien tai -> Hop API")
+            SetStatus("Khong co Mirage -> Hop Mirage API")
             if not HopMirageByAPI() then
                 SetStatus("Mirage API rong -> fallback Hop __ServerBrowser")
                 Hop("Mirage API empty")
