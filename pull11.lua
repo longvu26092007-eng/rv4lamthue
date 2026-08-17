@@ -18,9 +18,9 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
 
     -- Lay 30 server MOI NHAT, join lan luot tung cai, cach nhau 1.5s
     ["Fetch Count"]        = 30,
-    ["Hop Delay"]          = 1.5,
 }
 
+-- PullLever Mirage API V4.1 - full review + teleport stability + light noclip
 LPH_NO_VIRTUALIZE(function()
 
 local PlayerGui
@@ -134,7 +134,6 @@ Config["Use Mirage API"]    = Config["Use Mirage API"] ~= false
 Config["Avoid Full Server"] = Config["Avoid Full Server"] ~= false
 Config["Max Players"]       = Config["Max Players"] or 11
 Config["Fetch Count"]       = math.max(1, math.floor(tonumber(Config["Fetch Count"]) or 30))
-Config["Hop Delay"]         = math.max(0.1, tonumber(Config["Hop Delay"]) or 1.5)
 Config["Boost FPS"]         = Config["Boost FPS"] ~= false
 Config["FPS"]               = Config["FPS"] or 20
 Config["Black Screen"]      = Config["Black Screen"] or false
@@ -152,6 +151,7 @@ local Workspace         = game:GetService("Workspace")
 local Lighting          = game:GetService("Lighting")
 local RunService        = game:GetService("RunService")
 local TweenService      = game:GetService("TweenService")
+local TeleportService   = game:GetService("TeleportService")
 local HttpService       = game:GetService("HttpService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local StarterPlayer     = game:GetService("StarterPlayer")
@@ -380,6 +380,19 @@ local function MarkMirageJoinFailed(jobId, reason)
     )
 end
 
+-- ============================================================
+-- MIRAGE TELEPORT STATE
+-- Không còn coi "session vẫn sống sau 1.5s" là join fail.
+-- ============================================================
+local PendingMirageJoinJobId = nil
+local PendingMirageJoinAt = 0
+local PendingMirageTeleportStarted = false
+
+-- 6s: remote accepted nhưng Roblox chưa báo teleport started.
+-- 20s: Roblox đã báo started nhưng session cũ vẫn chưa rời.
+local MIRAGE_JOIN_PENDING_TIMEOUT = 6
+local MIRAGE_JOIN_STARTED_TIMEOUT = 20
+
 local function ReleaseMirageClaim(jobId)
     if not MirageFileIOReady then
         return
@@ -392,6 +405,63 @@ local function ReleaseMirageClaim(jobId)
         MirageDeleteFile(path)
     end
 end
+
+TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, message)
+    if player ~= LocalPlayer then
+        return
+    end
+
+    local pending = PendingMirageJoinJobId
+    if not pending then
+        return
+    end
+
+    local reason =
+        "TeleportInitFailed:"
+        .. tostring(teleportResult)
+        .. ":"
+        .. tostring(message or "")
+
+    MarkMirageJoinFailed(pending, reason)
+    ReleaseMirageClaim(pending)
+
+    PendingMirageJoinJobId = nil
+    PendingMirageJoinAt = 0
+    PendingMirageTeleportStarted = false
+
+    warn("[MirageAPI] " .. reason .. " | " .. tostring(pending))
+end)
+
+-- Nếu Roblox đã thực sự bắt đầu teleport thì không được coi 6s là fail.
+-- Một số máy/remote chậm có thể giữ session cũ vài giây sau khi Started.
+pcall(function()
+    LocalPlayer.OnTeleport:Connect(function(state)
+        if not PendingMirageJoinJobId then
+            return
+        end
+
+        local stateText = tostring(state)
+
+        if stateText:find("Started")
+            or stateText:find("Waiting")
+            or stateText:find("InProgress")
+        then
+            PendingMirageTeleportStarted = true
+        elseif stateText:find("Failed") then
+            local pending = PendingMirageJoinJobId
+
+            MarkMirageJoinFailed(
+                pending,
+                "OnTeleportFailed:" .. stateText
+            )
+            ReleaseMirageClaim(pending)
+
+            PendingMirageJoinJobId = nil
+            PendingMirageJoinAt = 0
+            PendingMirageTeleportStarted = false
+        end
+    end)
+end)
 
 local function TryClaimMirageServer(jobId)
     if not MirageFileIOReady then
@@ -437,16 +507,25 @@ local function TryClaimMirageServer(jobId)
 end
 
 local function CurrentServerConfirmedNoMirage()
-    -- Kiểm tra lại vài lần trước khi blacklist để tránh Map vừa replicate dở.
-    for _ = 1, 3 do
+    -- Chỉ blacklist khi Map thực sự đã replicate.
+    -- Nếu Map còn nil thì KHÔNG được kết luận "không có Mirage".
+    local sawMap = false
+
+    for _ = 1, 15 do
         local map = workspace:FindFirstChild("Map")
-        if map and map:FindFirstChild("MysticIsland") then
-            return false
+
+        if map then
+            sawMap = true
+
+            if map:FindFirstChild("MysticIsland") then
+                return false
+            end
         end
+
         task.wait(0.35)
     end
 
-    return true
+    return sawMap
 end
 
 SetStatus("Creating UI...")
@@ -516,20 +595,92 @@ end
 
 ChooseTeamByLargeButton()
 
+-- ============================================================
+-- CHARACTER BINDER
+-- Chống race-condition sau respawn/hop:
+-- callback Character cũ không được phép ghi đè Root/Humanoid của Character mới.
+-- ============================================================
+local CharacterGeneration = 0
+
+local function BindCharacter(character)
+    CharacterGeneration += 1
+    local generation = CharacterGeneration
+
+    Character = character
+    Humanoid = character and character:FindFirstChildOfClass("Humanoid") or nil
+    HumanoidRootPart = character and character:FindFirstChild("HumanoidRootPart") or nil
+
+    if not character then
+        return
+    end
+
+    task.spawn(function()
+        local deadline = os.clock() + 20
+
+        while os.clock() < deadline
+            and generation == CharacterGeneration
+            and LocalPlayer.Character == character
+        do
+            local hum = character:FindFirstChildOfClass("Humanoid")
+            local root = character:FindFirstChild("HumanoidRootPart")
+
+            if hum and root then
+                if generation == CharacterGeneration
+                    and LocalPlayer.Character == character
+                then
+                    Character = character
+                    Humanoid = hum
+                    HumanoidRootPart = root
+                end
+                return
+            end
+
+            task.wait(0.1)
+        end
+    end)
+end
+
 local function RefreshCharacter()
-    Character        = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-    Humanoid         = Character:WaitForChild("Humanoid")
-    HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+    local current = LocalPlayer.Character
+
+    if current ~= Character then
+        BindCharacter(current)
+    elseif current then
+        Humanoid = current:FindFirstChildOfClass("Humanoid")
+        HumanoidRootPart = current:FindFirstChild("HumanoidRootPart")
+    end
+
+    return Character, Humanoid, HumanoidRootPart
 end
 
 SetStatus("Waiting character...")
-repeat
-    task.wait(0.5)
-until LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+while true do
+    RefreshCharacter()
+
+    if Character
+        and Character.Parent
+        and Humanoid
+        and HumanoidRootPart
+        and Humanoid.Health > 0
+    then
+        break
+    end
+
+    task.wait(0.15)
+end
 SetStatus("Character ready")
-RefreshCharacter()
-LocalPlayer.CharacterAdded:Connect(function()
-    task.spawn(RefreshCharacter)
+
+LocalPlayer.CharacterAdded:Connect(function(character)
+    BindCharacter(character)
+end)
+
+LocalPlayer.CharacterRemoving:Connect(function(character)
+    if Character == character then
+        CharacterGeneration += 1
+        Character = nil
+        Humanoid = nil
+        HumanoidRootPart = nil
+    end
 end)
 
 SetStatus("Waiting Data/Race...")
@@ -852,34 +1003,87 @@ local function IfTableHaveIndex(t)
 end
 
 local CachedServers, LastServersDataPulled
+
 local function GetServers()
-    if LastServersDataPulled and os.time() - LastServersDataPulled < 60 then
+    if LastServersDataPulled
+        and CachedServers
+        and os.time() - LastServersDataPulled < 15
+    then
         return CachedServers
     end
+
+    local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+    if not browser then
+        warn("[ServerBrowser] __ServerBrowser missing")
+        return nil
+    end
+
     for i = 1, 100 do
-        local data = ReplicatedStorage:FindFirstChild("__ServerBrowser")
-            and ReplicatedStorage.__ServerBrowser:InvokeServer(i)
-        if IfTableHaveIndex(data) then
+        local ok, data = pcall(function()
+            return browser:InvokeServer(i)
+        end)
+
+        if ok and IfTableHaveIndex(data) then
             CachedServers = data
             LastServersDataPulled = os.time()
             return data
         end
+
+        task.wait()
     end
+
+    return nil
 end
 
 local function Hop(Reason)
-    print("[PullLever] Hop: " .. tostring(Reason))
+    print("[PullLever] Fallback Hop: " .. tostring(Reason))
+
     local Servers = GetServers()
-    if not Servers then return end
-    local List = {}
-    for JobId, v in Servers do
-        table.insert(List, { JobId = JobId, Players = v.Count, Region = v.Region })
+    if not Servers then
+        SetStatus("Fallback ServerBrowser empty")
+        return false
     end
-    if #List == 0 then return end
+
+    local maxPlayers = tonumber(Config["Max Players"] or 11) or 11
+    local avoidFull = Config["Avoid Full Server"] ~= false
+    local List = {}
+
+    for JobId, v in Servers do
+        local players = tonumber(v and v.Count) or 0
+        local notSame = tostring(JobId) ~= tostring(game.JobId)
+        local notFull = (not avoidFull) or players <= maxPlayers
+
+        if notSame and notFull then
+            table.insert(List, {
+                JobId = JobId,
+                Players = players,
+                Region = v and v.Region,
+            })
+        end
+    end
+
+    if #List == 0 then
+        SetStatus("Fallback no usable server")
+        return false
+    end
+
     local data = List[math.random(1, #List)]
-    pcall(function()
-        ReplicatedStorage:FindFirstChild("__ServerBrowser"):InvokeServer("teleport", data.JobId)
+    local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+
+    if not browser then
+        return false
+    end
+
+    local ok, err = pcall(function()
+        browser:InvokeServer("teleport", data.JobId)
     end)
+
+    if not ok then
+        warn("[ServerBrowser] Fallback teleport failed: " .. tostring(err))
+        return false
+    end
+
+    return true
 end
 
 local JoinJobIdByServerBrowser
@@ -1114,39 +1318,85 @@ end
 
 JoinJobIdByServerBrowser = function(jobId)
     if not jobId or tostring(jobId) == "" then
-        return false
+        return false, "invalid_job"
     end
 
-    if tostring(jobId) == tostring(game.JobId) then
-        return false
+    jobId = tostring(jobId)
+
+    if jobId == tostring(game.JobId) then
+        return false, "same_job"
     end
 
     local sb = ReplicatedStorage:FindFirstChild("__ServerBrowser")
     if not sb then
         warn("[ServerBrowser] Khong tim thay __ServerBrowser")
-        return false
+        return false, "browser_missing"
     end
 
+    PendingMirageJoinJobId = jobId
+    PendingMirageJoinAt = os.clock()
+    PendingMirageTeleportStarted = false
+
     local ok, result = pcall(function()
-        return sb:InvokeServer("teleport", tostring(jobId))
+        return sb:InvokeServer("teleport", jobId)
     end)
 
     if not ok then
+        PendingMirageJoinJobId = nil
+        PendingMirageJoinAt = 0
+        PendingMirageTeleportStarted = false
+
         warn("[ServerBrowser] Join JobId loi: " .. tostring(result))
-        return false
+        return false, tostring(result)
     end
 
-    return true
+    return true, result
 end
 
--- Lay 30 server moi nhat theo thu tu API TU DUOI LEN TREN -> join lan luot,
--- moi lan cach nhau Hop Delay (1.5s). Neu het danh sach van chua
--- vao duoc server nao -> return false de main loop refresh lai.
+-- Lay toi 30 server Mirage moi nhat theo thu tu API TU DUOI LEN TREN.
+-- Moi thoi diem chi co 1 teleport pending; khong spam nhieu JobId lien tiep.
 local function HopMirageByAPI()
     local cfg = getgenv().PullLeverConfig or {}
 
     if cfg["Use Mirage API"] == false then
         return false, "disabled"
+    end
+
+    -- Một teleport đang pending: không spam candidate khác.
+    if PendingMirageJoinJobId then
+        local elapsed = os.clock() - PendingMirageJoinAt
+        local timeout =
+            PendingMirageTeleportStarted
+            and MIRAGE_JOIN_STARTED_TIMEOUT
+            or MIRAGE_JOIN_PENDING_TIMEOUT
+
+        if elapsed < timeout then
+            SetStatus(
+                (PendingMirageTeleportStarted
+                    and "Teleport started, waiting... "
+                    or "Waiting Mirage teleport ")
+                .. string.format("%.1f", elapsed)
+                .. "s | "
+                .. tostring(PendingMirageJoinJobId):sub(1, 8)
+            )
+            return true, "teleport_pending"
+        end
+
+        local stale = PendingMirageJoinJobId
+        local reason =
+            PendingMirageTeleportStarted
+            and "teleport_started_but_stuck_20s"
+            or "no_teleport_after_6s"
+
+        MarkMirageJoinFailed(stale, reason)
+        ReleaseMirageClaim(stale)
+
+        PendingMirageJoinJobId = nil
+        PendingMirageJoinAt = 0
+        PendingMirageTeleportStarted = false
+
+        CachedMirageServers = nil
+        LastMirageApiFetch = 0
     end
 
     local servers, fetchReason = GetMirageServersFromAPI()
@@ -1159,7 +1409,6 @@ local function HopMirageByAPI()
     local maxPlayers     = tonumber(cfg["Max Players"] or 11) or 11
     local avoidFull      = cfg["Avoid Full Server"] ~= false
     local fetchCount     = math.max(1, math.floor(tonumber(cfg["Fetch Count"]) or 30))
-    local hopDelay       = math.max(0.1, tonumber(cfg["Hop Delay"]) or 1.5)
 
     local candidates = {}
     local stats = {
@@ -1174,8 +1423,8 @@ local function HopMirageByAPI()
         usable = 0,
     }
 
-    -- servers da duoc ExtractServerList reverse:
-    -- index 1 = item DUOI CUNG cua API = MOI NHAT.
+    -- servers đã reverse:
+    -- index 1 = item DƯỚI CÙNG API = MỚI NHẤT.
     for _, server in ipairs(servers) do
         local placeId = tonumber(server.PlaceId)
         local players = tonumber(server.Players) or 0
@@ -1187,12 +1436,7 @@ local function HopMirageByAPI()
         local joinFailed  = IsMirageJoinFailedRecently(server.JobId)
         local claimed     = IsMirageServerClaimedByOther(server.JobId)
 
-        if samePlace then
-            stats.samePlace += 1
-        else
-            stats.wrongPlace += 1
-        end
-
+        if samePlace then stats.samePlace += 1 else stats.wrongPlace += 1 end
         if not notSameJob then stats.sameJob += 1 end
         if not notFull then stats.full += 1 end
         if blacklisted then stats.blacklist += 1 end
@@ -1228,6 +1472,10 @@ local function HopMirageByAPI()
     )
 
     if #candidates == 0 then
+        -- Không giữ cache nếu toàn bộ record hiện tại đã stale/claim/fail.
+        CachedMirageServers = nil
+        LastMirageApiFetch = 0
+
         local reason =
             "usable=0"
             .. " full=" .. tostring(stats.full)
@@ -1245,50 +1493,60 @@ local function HopMirageByAPI()
         .. " server | bottom->top | moi->cu"
     )
 
+    -- CHỈ thử 1 candidate mỗi vòng.
+    -- Nếu InvokeServer accepted, chờ teleport/failure event thay vì spam tiếp.
     for i, server in ipairs(candidates) do
         local jobId = tostring(server.JobId)
 
+        if IsMirageServerBlacklisted(jobId)
+            or IsMirageJoinFailedRecently(jobId)
+        then
+            continue
+        end
+
+        if not TryClaimMirageServer(jobId) then
+            continue
+        end
+
         SetStatus(
-            "Join Full Moon " .. tostring(i) .. "/" .. tostring(#candidates)
-            .. " | Players=" .. tostring(server.Players)
-            .. " | " .. jobId:sub(1, 8)
+            "Join Mirage "
+            .. tostring(i)
+            .. "/"
+            .. tostring(#candidates)
+            .. " | Players="
+            .. tostring(server.Players)
+            .. " | "
+            .. jobId:sub(1, 8)
         )
 
         print(
-            "[MirageAPI] #" .. tostring(i)
+            "[MirageAPI] Join"
             .. " JobId=" .. jobId
             .. " PlaceId=" .. tostring(server.PlaceId)
             .. " Players=" .. tostring(server.Players)
             .. " Type=" .. tostring(server.Type or "?")
         )
 
-        if IsMirageServerBlacklisted(jobId)
-            or IsMirageJoinFailedRecently(jobId)
-        then
-            print("[MirageBlacklist] Skip stale candidate: " .. jobId)
-            continue
-        end
-
-        if not TryClaimMirageServer(jobId) then
-            print("[MirageClaim] Client khac da claim: " .. jobId)
-            continue
-        end
-
-        local joinStarted = JoinJobIdByServerBrowser(jobId)
-
-        -- Giu behavior cu: cho Hop Delay de teleport bat dau.
-        task.wait(hopDelay)
+        local joinStarted, joinResult = JoinJobIdByServerBrowser(jobId)
 
         if joinStarted then
-            MarkMirageJoinFailed(jobId, "session_alive_after_hop_delay")
-        else
-            MarkMirageJoinFailed(jobId, "invoke_failed")
+            -- QUAN TRỌNG:
+            -- Không MarkMirageJoinFailed ở đây.
+            -- Giữ claim trong lúc teleport pending; event/timeout sẽ xử lý nếu fail.
+            return true, "teleport_started"
         end
 
+        MarkMirageJoinFailed(
+            jobId,
+            "invoke_failed:" .. tostring(joinResult)
+        )
         ReleaseMirageClaim(jobId)
     end
 
-    SetStatus("Da thu het " .. tostring(#candidates) .. " Full Moon server -> refresh")
+    CachedMirageServers = nil
+    LastMirageApiFetch = 0
+
+    SetStatus("Mirage candidates exhausted -> refresh")
     return false, "attempts_exhausted"
 end
 
@@ -1300,24 +1558,49 @@ local function ConvertTo(Type, Data)
 end
 
 local function CaculateDistance(Origin, Destination)
+    RefreshCharacter()
+
+    if not HumanoidRootPart or not HumanoidRootPart.Parent then
+        return math.huge
+    end
+
     Origin = Origin or HumanoidRootPart.CFrame
     Destination = Destination or HumanoidRootPart.CFrame
-    local a = typeof(Origin)    == "CFrame" and Origin.Position    or (typeof(Origin)    == "Vector3" and Origin    or ConvertTo(Vector3, Origin))
-    local b = typeof(Destination) == "CFrame" and Destination.Position or (typeof(Destination) == "Vector3" and Destination or ConvertTo(Vector3, Destination))
+
+    local a =
+        typeof(Origin) == "CFrame" and Origin.Position
+        or (typeof(Origin) == "Vector3" and Origin or ConvertTo(Vector3, Origin))
+
+    local b =
+        typeof(Destination) == "CFrame" and Destination.Position
+        or (typeof(Destination) == "Vector3" and Destination or ConvertTo(Vector3, Destination))
+
     return (a - b).Magnitude
 end
 
 local TweenConn, TweenInstance, TweenGhost, IsTweening = nil, nil, nil, false
-local function NoclipLoop()
-    if LocalPlayer.Character then
-        for _, c in LocalPlayer.Character:GetDescendants() do
-            if c:IsA("BasePart") and c.CanCollide and c.Name ~= "HumanoidRootPart" then
-                c.CanCollide = false
-            end
+
+-- Không quét GetDescendants mỗi frame nữa.
+-- Với nhiều client, Stepped + GetDescendants gây CPU thừa rất lớn.
+local function ApplyNoclip()
+    local char = LocalPlayer.Character
+    if not char then return end
+
+    for _, c in char:GetDescendants() do
+        if c:IsA("BasePart")
+            and c.CanCollide
+            and c.Name ~= "HumanoidRootPart"
+        then
+            c.CanCollide = false
         end
     end
 end
-RunService.Stepped:Connect(NoclipLoop)
+
+task.spawn(function()
+    while task.wait(0.25) do
+        pcall(ApplyNoclip)
+    end
+end)
 
 local function StopTween()
     if TweenInstance then pcall(function() TweenInstance:Cancel() end) TweenInstance = nil end
@@ -1327,6 +1610,7 @@ local function StopTween()
 end
 
 function TweenTo(Position)
+    RefreshCharacter()
 
     if not Character or not Character:FindFirstChild("Humanoid")
         or Character.Humanoid.Health <= 0 or not HumanoidRootPart then
