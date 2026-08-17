@@ -916,46 +916,105 @@ local function JsonDecodeSafe(body)
 end
 
 -- ============================================================
--- MIRAGE API (baorph): schema moi (2026-07)
---   { count = N, ok = true, key = "island",
---     items = [ "job id: <GUID>; player: <N>[/12]; placeid: <N|None>", ... ] }
--- items la mang STRING, khong phai object.
--- Giu nguyen thu tu API tra ve (khong sort).
+-- FULL MOON / ISLAND API (baorph): schema hien tai
+--
+-- Vi du:
+-- {
+--   "api_url": "https://baorph.pythonanywhere.com/token",
+--   "count": 29,
+--   "items": [
+--     "job id: <GUID>; type: mirage; player: 4; placeid: 100117331123089",
+--     ...
+--   ],
+--   "key": "island",
+--   "ok": true
+-- }
+--
+-- QUAN TRONG:
+-- API sap xep DU LIEU CU O TREN, MOI O DUOI.
+-- Vi vay ExtractServerList() doc items TU CUOI LEN DAU.
+-- list[1] = server moi nhat.
 -- ============================================================
 local function NormalizeServerEntry(v)
-    -- Schema moi: string
     if type(v) == "string" then
-        local jobId   = v:match("job%s*id:%s*([%x%-]+)")
-        local players = tonumber(v:match("player:%s*(%d+)")) or 0
-        local placeId = tonumber(v:match("placeid:%s*(%d+)"))  -- "None" -> nil
-        if not jobId or jobId == "" then return nil end
+        local jobId = v:match("[Jj][Oo][Bb]%s*[Ii][Dd]%s*:%s*([%x%-]+)")
+        local serverType = v:match("[Tt][Yy][Pp][Ee]%s*:%s*([^;]+)")
+        local players = tonumber(v:match("[Pp][Ll][Aa][Yy][Ee][Rr]%s*:%s*(%d+)")) or 0
+        local placeId = tonumber(v:match("[Pp][Ll][Aa][Cc][Ee][Ii][Dd]%s*:%s*(%d+)"))
+
+        if not jobId or jobId == "" then
+            return nil
+        end
+
+        if serverType then
+            serverType = tostring(serverType):match("^%s*(.-)%s*$")
+        end
+
         return {
-            JobId   = jobId,
+            JobId = jobId,
             PlaceId = placeId,
             Players = players,
+            Type = serverType,
+            Raw = v,
         }
     end
-    -- Du phong: object (schema cu)
-    if type(v) ~= "table" then return nil end
-    local jobId = v.raw_job_id or v.job_id or v.jobid or v.JobId or v.id
-    if not jobId or tostring(jobId) == "" then return nil end
+
+    -- Fallback object schema cu.
+    if type(v) ~= "table" then
+        return nil
+    end
+
+    local jobId =
+        v.raw_job_id
+        or v.job_id
+        or v.jobid
+        or v.JobId
+        or v.id
+
+    if not jobId or tostring(jobId) == "" then
+        return nil
+    end
+
     return {
-        JobId   = tostring(jobId),
+        JobId = tostring(jobId),
         PlaceId = tonumber(v.place_id or v.placeid or v.PlaceId),
         Players = tonumber(v.players or v.player or v.Players) or 0,
+        Type = tostring(v.type or v.Type or v.server_type or ""),
+        Raw = v,
     }
 end
 
 local function ExtractServerList(data)
     local list = {}
-    if type(data) ~= "table" then return list end
+
+    if type(data) ~= "table" then
+        return list
+    end
+
+    if data.ok == false then
+        warn("[MirageAPI] API returned ok=false")
+        return list
+    end
 
     local source = data.items or data.data or data.servers
-    if type(source) ~= "table" then return list end
+    if type(source) ~= "table" then
+        return list
+    end
 
-    for _, v in ipairs(source) do
-        local one = NormalizeServerEntry(v)
-        if one then table.insert(list, one) end
+    -- API: tren = cu, duoi = moi.
+    -- Doc nguoc de uu tien server moi nhat.
+    for i = #source, 1, -1 do
+        local one = NormalizeServerEntry(source[i])
+
+        if one then
+            local tp = tostring(one.Type or ""):lower()
+
+            -- Endpoint hien tai tra type=mirage.
+            -- Type rong van chap nhan de tuong thich schema cu.
+            if tp == "" or tp == "mirage" then
+                list[#list + 1] = one
+            end
+        end
     end
 
     return list
@@ -1022,7 +1081,7 @@ local function GetMirageServersFromAPI()
         CachedMirageServers = servers
     end
 
-    print("[MirageAPI] Parsed " .. tostring(#servers) .. " server(s), moi nhat truoc")
+    print("[MirageAPI] Parsed " .. tostring(#servers) .. " server(s) | bottom->top | newest first")
     SetStatus("Mirage API servers: " .. tostring(#servers))
     return servers
 end
@@ -1054,7 +1113,7 @@ JoinJobIdByServerBrowser = function(jobId)
     return true
 end
 
--- Lay 30 server moi nhat -> join lan luot tu gan nhat den thu 30,
+-- Lay 30 server moi nhat theo thu tu API TU DUOI LEN TREN -> join lan luot,
 -- moi lan cach nhau Hop Delay (1.5s). Neu het danh sach van chua
 -- vao duoc server nao -> return false de main loop refresh lai.
 local function HopMirageByAPI()
@@ -1117,7 +1176,7 @@ local function HopMirageByAPI()
         return false
     end
 
-    SetStatus("Mirage: thu " .. tostring(#candidates) .. " server (moi nhat -> cu)")
+    SetStatus("Mirage: thu " .. tostring(#candidates) .. " server | bottom->top | moi->cu")
 
     for i, server in ipairs(candidates) do
         local jobId = tostring(server.JobId)
@@ -1132,6 +1191,7 @@ local function HopMirageByAPI()
             .. " JobId=" .. jobId
             .. " PlaceId=" .. tostring(server.PlaceId)
             .. " Players=" .. tostring(server.Players)
+            .. " Type=" .. tostring(server.Type or "?")
             .. " Timestamp=" .. tostring(server.Timestamp)
         )
 
