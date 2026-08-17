@@ -15,10 +15,12 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
     ["Mirage API"]         = "https://baorph.pythonanywhere.com/token?token=8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8&api_key=baorapi&key=mirage",
     ["Avoid Full Server"]  = true,
     ["Max Players"]        = 11,
+
+    -- Lay 30 server MOI NHAT, join lan luot tung cai, cach nhau 1.5s
     ["Fetch Count"]        = 30,
 }
 
--- API hop transplanted + new ItemReplicationService inventory/material detection
+-- PullLever V5 - FullReview base | no shared blacklist | strict Mirage tween | Completed-pull
 LPH_NO_VIRTUALIZE(function()
 
 local PlayerGui
@@ -33,7 +35,9 @@ local function SetStatus(text)
     print("[PullLever] " .. text)
 
     if _statusLabel then
-        _statusLabel.Text = "Status: " .. text
+        -- Ghi vao CoreGui/gethui co the loi neu thread dang o identity
+        -- thap (sau khi require module game) -> khong de no giet script.
+        pcall(function() _statusLabel.Text = "Status: " .. text end)
     end
 end
 
@@ -123,9 +127,10 @@ Config["Enabled"]           = Config["Enabled"] ~= false
 Config["Team"]              = Config["Team"] or "Pirates"
 Config["Hop Mirage"]        = Config["Hop Mirage"] ~= false
 Config["Use Mirage API"]    = Config["Use Mirage API"] ~= false
-if tostring(Config["Mirage API"] or "") == "" then
-    Config["Mirage API"] = ""
-end
+
+-- Endpoint thuc te duoc goi bang key=mirage.
+-- API envelope hien tai van co the tra data.key == "island"; day la binh thuong.
+-- Khong rewrite URL dua theo data.key.
 Config["Avoid Full Server"] = Config["Avoid Full Server"] ~= false
 Config["Max Players"]       = Config["Max Players"] or 11
 Config["Fetch Count"]       = math.max(1, math.floor(tonumber(Config["Fetch Count"]) or 30))
@@ -153,6 +158,76 @@ local StarterPlayer     = game:GetService("StarterPlayer")
 
 local LocalPlayer = Players.LocalPlayer
 local Character, Humanoid, HumanoidRootPart
+
+-- ============================================================
+-- MIRAGE LOCAL STATE ONLY
+-- Shared blacklist / join_fail / claim file system REMOVED.
+-- Khong tao mirage_shared/, khong blacklist JobId giua cac account.
+-- Chi nho JobId fail trong RAM cua CHINH session nay.
+-- ============================================================
+local JoinedMirageJobs = {}
+
+local PendingMirageJoinJobId = nil
+local PendingMirageJoinAt = 0
+local PendingMirageTeleportStarted = false
+
+local MIRAGE_JOIN_PENDING_TIMEOUT = 6
+local MIRAGE_JOIN_STARTED_TIMEOUT = 20
+
+local function FindMirageIsland()
+    local map = workspace:FindFirstChild("Map")
+    return map and map:FindFirstChild("MysticIsland") or nil
+end
+
+TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, message)
+    if player ~= LocalPlayer then
+        return
+    end
+
+    local pending = PendingMirageJoinJobId
+    if pending then
+        JoinedMirageJobs[tostring(pending)] = true
+    end
+
+    PendingMirageJoinJobId = nil
+    PendingMirageJoinAt = 0
+    PendingMirageTeleportStarted = false
+
+    if pending then
+        warn(
+            "[MirageAPI] TeleportInitFailed "
+            .. tostring(teleportResult)
+            .. " | "
+            .. tostring(message or "")
+            .. " | JobId="
+            .. tostring(pending)
+        )
+    end
+end)
+
+pcall(function()
+    LocalPlayer.OnTeleport:Connect(function(state)
+        if not PendingMirageJoinJobId then
+            return
+        end
+
+        local stateText = tostring(state)
+
+        if stateText:find("Started")
+            or stateText:find("Waiting")
+            or stateText:find("InProgress")
+        then
+            PendingMirageTeleportStarted = true
+
+        elseif stateText:find("Failed") then
+            JoinedMirageJobs[tostring(PendingMirageJoinJobId)] = true
+
+            PendingMirageJoinJobId = nil
+            PendingMirageJoinAt = 0
+            PendingMirageTeleportStarted = false
+        end
+    end)
+end)
 
 SetStatus("Creating UI...")
 pcall(MakeUI)
@@ -221,20 +296,92 @@ end
 
 ChooseTeamByLargeButton()
 
+-- ============================================================
+-- CHARACTER BINDER
+-- Chống race-condition sau respawn/hop:
+-- callback Character cũ không được phép ghi đè Root/Humanoid của Character mới.
+-- ============================================================
+local CharacterGeneration = 0
+
+local function BindCharacter(character)
+    CharacterGeneration += 1
+    local generation = CharacterGeneration
+
+    Character = character
+    Humanoid = character and character:FindFirstChildOfClass("Humanoid") or nil
+    HumanoidRootPart = character and character:FindFirstChild("HumanoidRootPart") or nil
+
+    if not character then
+        return
+    end
+
+    task.spawn(function()
+        local deadline = os.clock() + 20
+
+        while os.clock() < deadline
+            and generation == CharacterGeneration
+            and LocalPlayer.Character == character
+        do
+            local hum = character:FindFirstChildOfClass("Humanoid")
+            local root = character:FindFirstChild("HumanoidRootPart")
+
+            if hum and root then
+                if generation == CharacterGeneration
+                    and LocalPlayer.Character == character
+                then
+                    Character = character
+                    Humanoid = hum
+                    HumanoidRootPart = root
+                end
+                return
+            end
+
+            task.wait(0.1)
+        end
+    end)
+end
+
 local function RefreshCharacter()
-    Character        = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-    Humanoid         = Character:WaitForChild("Humanoid")
-    HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+    local current = LocalPlayer.Character
+
+    if current ~= Character then
+        BindCharacter(current)
+    elseif current then
+        Humanoid = current:FindFirstChildOfClass("Humanoid")
+        HumanoidRootPart = current:FindFirstChild("HumanoidRootPart")
+    end
+
+    return Character, Humanoid, HumanoidRootPart
 end
 
 SetStatus("Waiting character...")
-repeat
-    task.wait(0.5)
-until LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+while true do
+    RefreshCharacter()
+
+    if Character
+        and Character.Parent
+        and Humanoid
+        and HumanoidRootPart
+        and Humanoid.Health > 0
+    then
+        break
+    end
+
+    task.wait(0.15)
+end
 SetStatus("Character ready")
-RefreshCharacter()
-LocalPlayer.CharacterAdded:Connect(function()
-    task.spawn(RefreshCharacter)
+
+LocalPlayer.CharacterAdded:Connect(function(character)
+    BindCharacter(character)
+end)
+
+LocalPlayer.CharacterRemoving:Connect(function(character)
+    if Character == character then
+        CharacterGeneration += 1
+        Character = nil
+        Humanoid = nil
+        HumanoidRootPart = nil
+    end
 end)
 
 SetStatus("Waiting Data/Race...")
@@ -326,304 +473,220 @@ local function RefreshPlayerData()
 end
 
 -- ============================================================
--- INVENTORY / MATERIAL DETECTION - NEW METHOD
---
--- Bản cũ dùng:
---   CommF_:InvokeServer("getInventory")
---
--- Sau update cách đó có thể không còn trả đúng Mirror Fractal / material.
--- Bản này đọc trực tiếp Inventory controller + ItemReplicationService.
---
--- ConChoChisiti36.Backpack vẫn giữ cùng format để HasMirrorFractal()
--- và HasValkyrieHelm() phía dưới không phải đổi logic.
+-- THREAD IDENTITY
+-- require(...) module cua game se ha identity cua thread hien tai
+-- xuong muc script game -> sau do ghi vao CoreGui/gethui bi loi
+-- "cannot access 'Instance' (lacking capability Plugin)".
+-- Boc lai de luon tra identity ve muc cao sau khi require.
 -- ============================================================
-
-local _setidentity =
-    setthreadidentity
-    or setidentity
-    or set_thread_identity
+local _setidentity = setthreadidentity or setidentity or set_thread_identity
     or (syn and syn.set_thread_identity)
-
-local _getidentity =
-    getthreadidentity
-    or getidentity
-    or get_thread_identity
+local _getidentity = getthreadidentity or getidentity or get_thread_identity
+    or (syn and syn.get_thread_identity)
 
 local function RaiseIdentity()
-    if not _setidentity then
-        return nil
-    end
-
+    if not _setidentity then return nil end
     local prev
     if _getidentity then
-        local ok, value = pcall(_getidentity)
-        if ok then
-            prev = value
-        end
+        local ok, v = pcall(_getidentity)
+        if ok then prev = v end
     end
-
     pcall(_setidentity, 8)
     return prev
 end
 
 local function RestoreIdentity(prev)
-    if not _setidentity then
-        return
-    end
-
+    if not _setidentity then return end
     pcall(_setidentity, prev or 8)
 end
 
+-- ============================================================
+-- INVENTORY (update moi): doc qua ItemReplicationService +
+-- Inventory controller + ItemConfig thay cho CommF_ getInventory
+-- (getInventory khong con tra Mirror Fractal sau update).
+--   Backpack[<Display.Name>] = { Name=, Count=, Category=, ItemId= }
+-- ============================================================
 local InvModules = {
-    Inventory = nil,
-    ItemConfig = nil,
+    Inventory   = nil,
+    ItemConfig  = nil,
     ItemService = nil,
-    KEYS = nil,
-    Ready = false,
+    KEYS        = nil,
+    Ready       = false,
 }
+
+-- Tim node theo duong dan, khong index truc tiep de loi bao ro rang
+-- thay vi treo hoac "attempt to index nil".
+local function ResolvePath(root, path)
+    local node = root
+    for _, name in ipairs(path) do
+        if typeof(node) ~= "Instance" then return nil, name end
+        local child = node:FindFirstChild(name)
+        if not child then return nil, name end
+        node = child
+    end
+    return node
+end
 
 local _invLoadWarned = false
 local _invTilesWarned = false
 
-local function ResolvePath(root, path)
-    local node = root
-
-    for _, name in ipairs(path) do
-        if typeof(node) ~= "Instance" then
-            return nil, name
-        end
-
-        local child = node:FindFirstChild(name)
-        if not child then
-            return nil, name
-        end
-
-        node = child
-    end
-
-    return node
-end
-
 local function LoadInventoryModules()
-    if InvModules.Ready then
-        return true
-    end
+    if InvModules.Ready then return true end
 
     local paths = {
-        Inventory = { "Controllers", "UI", "Inventory" },
-        ItemConfig = { "ItemConfig" },
+        Inventory   = { "Controllers", "UI", "Inventory" },
+        ItemConfig  = { "ItemConfig" },
         ItemService = { "ItemReplicationService" },
-        KEYS = { "ItemReplicationService", "KEYS" },
+        KEYS        = { "ItemReplicationService", "KEYS" },
     }
 
     local nodes = {}
-
     for key, path in pairs(paths) do
         local node, missing = ResolvePath(ReplicatedStorage, path)
-
         if not node then
             if not _invLoadWarned then
                 _invLoadWarned = true
-                warn(
-                    "[Inventory] Missing ReplicatedStorage."
+                warn("[Inventory] Khong tim thay ReplicatedStorage."
                     .. table.concat(path, ".")
-                    .. " | missing="
-                    .. tostring(missing)
-                )
+                    .. " (thieu '" .. tostring(missing) .. "')")
             end
-
             return false
         end
-
         nodes[key] = node
     end
 
-    -- Một số executor cần identity khác nhau để require module game.
-    local candidates = _setidentity and { 2, 8, false } or { false }
+    -- require module cua game co the doi identity khac nhau tuy
+    -- executor. Thu lan luot 2 (script game) -> 8 -> giu nguyen.
+    -- Dung `false` lam sentinel "khong doi identity": neu de nil trong
+    -- table constructor thi ipairs se cat mat phan tu do.
+    local candidates = _setidentity and {2, 8, false} or {false}
     local lastErr
 
     for _, ident in ipairs(candidates) do
         local prev = RaiseIdentity()
-
-        if ident and _setidentity then
-            pcall(_setidentity, ident)
-        end
-
+        if ident and _setidentity then pcall(_setidentity, ident) end
         local ok, err = pcall(function()
-            InvModules.Inventory = require(nodes.Inventory)
-            InvModules.ItemConfig = require(nodes.ItemConfig)
+            InvModules.Inventory   = require(nodes.Inventory)
+            InvModules.ItemConfig  = require(nodes.ItemConfig)
             InvModules.ItemService = require(nodes.ItemService)
-            InvModules.KEYS = require(nodes.KEYS)
+            InvModules.KEYS        = require(nodes.KEYS)
         end)
 
         RestoreIdentity(prev)
 
-        if ok
-            and type(InvModules.Inventory) == "table"
-            and type(InvModules.ItemService) == "table"
-        then
+        if ok and type(InvModules.Inventory) == "table"
+            and type(InvModules.ItemService) == "table" then
             InvModules.Ready = true
             return true
         end
 
         lastErr = err
-        InvModules.Inventory = nil
-        InvModules.ItemConfig = nil
-        InvModules.ItemService = nil
-        InvModules.KEYS = nil
+        InvModules.Inventory, InvModules.ItemConfig = nil, nil
+        InvModules.ItemService, InvModules.KEYS = nil, nil
     end
 
     if not _invLoadWarned then
         _invLoadWarned = true
-        warn("[Inventory] require failed: " .. tostring(lastErr))
+        warn("[Inventory] require that bai: " .. tostring(lastErr))
     end
-
     return false
 end
 
 local function InventoryModulesInitialized()
-    if not InvModules.Ready then
-        return false
-    end
-
-    local ok, ready = pcall(function()
+    if not InvModules.Ready then return false end
+    local ok, res = pcall(function()
         return InvModules.Inventory:GetIfInitialized()
             and InvModules.ItemService.IsInitialized == true
     end)
-
-    return ok and ready == true
-end
-
-local function GetItemConfigSafe(itemId)
-    local ItemConfig = InvModules.ItemConfig
-
-    -- Hỗ trợ cả API mới .match(...):unwrap() và API cũ GetItemConfig(...).
-    local ok, cfg = pcall(function()
-        if type(ItemConfig) == "table" and type(ItemConfig.match) == "function" then
-            local result = ItemConfig.match(itemId)
-            if result and type(result.unwrap) == "function" then
-                return result:unwrap()
-            end
-        end
-
-        if type(ItemConfig) == "table" and type(ItemConfig.GetItemConfig) == "function" then
-            return ItemConfig:GetItemConfig(itemId)
-        end
-
-        return nil
-    end)
-
-    if ok then
-        return cfg
-    end
-
-    return nil
+    return ok and res == true
 end
 
 local function _RefreshInventoryInner()
+    -- LoadInventoryModules da tu warn mot lan roi, khong warn lai o day
+    -- vi main loop goi moi 1s -> spam console.
     if not LoadInventoryModules() then
-        return false
+        return
     end
 
     if not InventoryModulesInitialized() then
-        return false
+        return
     end
 
-    local Inventory = InvModules.Inventory
-    local ItemService = InvModules.ItemService
-    local KEYS = InvModules.KEYS
+    local Inventory   = InvModules.Inventory
+    local ItemConfig  = InvModules.ItemConfig
+    local ItemService  = InvModules.ItemService
+    local KEYS        = InvModules.KEYS
 
-    -- Quantity được lưu theo ItemId.
+    -- So luong theo ItemId
     local amounts = {}
-
     local okQty, qtyList = pcall(function()
         return ItemService:GetItems(KEYS.QUANTITY)
     end)
-
     if okQty and type(qtyList) == "table" then
         for _, item in pairs(qtyList) do
             if type(item) == "table" and item.ItemId then
-                amounts[item.ItemId] =
-                    (amounts[item.ItemId] or 0)
+                amounts[item.ItemId] = (amounts[item.ItemId] or 0)
                     + (tonumber(item.Value) or 0)
             end
         end
     end
 
-    local okTiles, tiles = pcall(function()
-        return Inventory:GetTiles()
-    end)
-
+    local okTiles, tiles = pcall(function() return Inventory:GetTiles() end)
     if not okTiles or type(tiles) ~= "table" then
+        -- Chi warn mot lan: main loop goi moi 1s.
         if not _invTilesWarned then
             _invTilesWarned = true
-            warn("[Inventory] GetTiles failed: " .. tostring(tiles))
+            warn("[Inventory] GetTiles that bai: " .. tostring(tiles))
         end
-
-        return false
+        return
     end
-
     _invTilesWarned = false
 
-    local backpack = {}
-    local seen = {}
-    local total = 0
+    local backpack, seen, total = {}, {}, 0
 
     for _, tile in pairs(tiles) do
-        local itemId =
-            type(tile) == "table"
-            and tile.ItemId
-            or nil
+        local id = type(tile) == "table" and tile.ItemId or nil
 
-        if itemId and not seen[itemId] then
-            seen[itemId] = true
+        if id and not seen[id] then
+            seen[id] = true
 
-            local config = GetItemConfigSafe(itemId)
+            local okCfg, config = pcall(function()
+                return ItemConfig.match(id):unwrap()
+            end)
 
-            if type(config) == "table" then
-                local display = config.Display or {}
-                local index = config.Index or {}
-
-                local name =
-                    display.Name
-                    or index.StorageKey
-                    or tostring(itemId)
+            if okCfg and type(config) == "table" and config.Display then
+                local name = config.Display.Name
+                    or (config.Index and config.Index.StorageKey)
+                    or tostring(id)
 
                 backpack[tostring(name)] = {
-                    Name = tostring(name),
-                    Count = amounts[itemId] or 1,
-                    Category = display.Category,
-                    Group = config.Group,
-                    ItemId = itemId,
+                    Name     = tostring(name),
+                    Count    = amounts[id] or 1,
+                    Category = config.Display.Category,
+                    ItemId   = id,
                 }
-
-                total += 1
+                total = total + 1
             end
         end
     end
 
-    -- Không xóa cache cũ nếu inventory đang replicate dở.
+    -- Chi ghi de khi doc duoc it nhat 1 item, tranh xoa trang cache
+    -- khi inventory chua replicate xong.
     if total > 0 then
         ConChoChisiti36.Backpack = backpack
-        return true
     end
-
-    return false
 end
 
+-- Goi vao module cua game co the ha identity giua duong. Luon tra
+-- identity ve muc cao sau khi doc xong, ke ca khi loi.
 local function RefreshInventory()
     local prev = RaiseIdentity()
-    local ok, result = pcall(_RefreshInventoryInner)
+    local ok, err = pcall(_RefreshInventoryInner)
     RestoreIdentity(prev)
-
     if not ok then
-        warn("[Inventory] RefreshInventory error: " .. tostring(result))
-        return false
+        warn("[Inventory] RefreshInventory loi: " .. tostring(err))
     end
-
-    return result == true
 end
-
 
 CommE.OnClientEvent:Connect(function(...)
     local t = {...}
@@ -641,34 +704,87 @@ local function IfTableHaveIndex(t)
 end
 
 local CachedServers, LastServersDataPulled
+
 local function GetServers()
-    if LastServersDataPulled and os.time() - LastServersDataPulled < 60 then
+    if LastServersDataPulled
+        and CachedServers
+        and os.time() - LastServersDataPulled < 15
+    then
         return CachedServers
     end
+
+    local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+    if not browser then
+        warn("[ServerBrowser] __ServerBrowser missing")
+        return nil
+    end
+
     for i = 1, 100 do
-        local data = ReplicatedStorage:FindFirstChild("__ServerBrowser")
-            and ReplicatedStorage.__ServerBrowser:InvokeServer(i)
-        if IfTableHaveIndex(data) then
+        local ok, data = pcall(function()
+            return browser:InvokeServer(i)
+        end)
+
+        if ok and IfTableHaveIndex(data) then
             CachedServers = data
             LastServersDataPulled = os.time()
             return data
         end
+
+        task.wait()
     end
+
+    return nil
 end
 
 local function Hop(Reason)
-    print("[PullLever] Hop: " .. tostring(Reason))
+    print("[PullLever] Fallback Hop: " .. tostring(Reason))
+
     local Servers = GetServers()
-    if not Servers then return end
-    local List = {}
-    for JobId, v in Servers do
-        table.insert(List, { JobId = JobId, Players = v.Count, Region = v.Region })
+    if not Servers then
+        SetStatus("Fallback ServerBrowser empty")
+        return false
     end
-    if #List == 0 then return end
+
+    local maxPlayers = tonumber(Config["Max Players"] or 11) or 11
+    local avoidFull = Config["Avoid Full Server"] ~= false
+    local List = {}
+
+    for JobId, v in Servers do
+        local players = tonumber(v and v.Count) or 0
+        local notSame = tostring(JobId) ~= tostring(game.JobId)
+        local notFull = (not avoidFull) or players <= maxPlayers
+
+        if notSame and notFull then
+            table.insert(List, {
+                JobId = JobId,
+                Players = players,
+                Region = v and v.Region,
+            })
+        end
+    end
+
+    if #List == 0 then
+        SetStatus("Fallback no usable server")
+        return false
+    end
+
     local data = List[math.random(1, #List)]
-    pcall(function()
-        ReplicatedStorage:FindFirstChild("__ServerBrowser"):InvokeServer("teleport", data.JobId)
+    local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+
+    if not browser then
+        return false
+    end
+
+    local ok, err = pcall(function()
+        browser:InvokeServer("teleport", data.JobId)
     end)
+
+    if not ok then
+        warn("[ServerBrowser] Fallback teleport failed: " .. tostring(err))
+        return false
+    end
+
+    return true
 end
 
 local JoinJobIdByServerBrowser
@@ -706,35 +822,29 @@ local function JsonDecodeSafe(body)
 end
 
 -- ============================================================
--- MIRAGE API - FIXED VERSION
+-- MIRAGE API (baorph): query key=mirage, envelope key=island
 --
--- Query:
---   ...&key=mirage
---
--- Payload hien tai:
+-- Vi du:
 -- {
---   count = N,
---   items = {
---     "job id: ...; type: mirage; player: 4; placeid: ...",
+--   "api_url": "https://baorph.pythonanywhere.com/token",
+--   "count": 29,
+--   "items": [
+--     "job id: <GUID>; type: mirage; player: 4; placeid: 100117331123089",
 --     ...
---   },
---   key = "island",
---   ok = true
+--   ],
+--   "key": "island",
+--   "ok": true
 -- }
 --
--- Luu y:
---   URL key=mirage nhung response envelope key=island la BINH THUONG.
---   API: tren = cu, duoi = moi -> doc TU CUOI LEN DAU.
+-- QUAN TRONG:
+-- API sap xep DU LIEU CU O TREN, MOI O DUOI.
+-- Vi vay ExtractServerList() doc items TU CUOI LEN DAU.
+-- list[1] = server moi nhat.
 --
--- Ban nay CO Y KHONG co:
---   - shared blacklist file
---   - join_fail file
---   - claim file
---
--- Chi giu JoinedMirageJobs trong RAM cua rieng client de tranh lap JobId
--- trong cung mot session.
+-- Query URL dung key=mirage, nhung payload co the tron nhieu type:
+--   mirage / mysticisland / prehistoricisland
+-- Nen loc CHINH XAC Type == "mirage" trong items.
 -- ============================================================
-
 local function NormalizeServerEntry(v)
     if type(v) == "string" then
         local jobId = v:match("[Jj][Oo][Bb]%s*[Ii][Dd]%s*:%s*([%x%-]+)")
@@ -759,7 +869,7 @@ local function NormalizeServerEntry(v)
         }
     end
 
-    -- Backward-compatible object schema.
+    -- Fallback object schema cu.
     if type(v) ~= "table" then
         return nil
     end
@@ -778,9 +888,8 @@ local function NormalizeServerEntry(v)
     return {
         JobId = tostring(jobId),
         PlaceId = tonumber(v.place_id or v.placeid or v.PlaceId),
-        Players = tonumber(v.players or v.player or v.Players or v.Count) or 0,
+        Players = tonumber(v.players or v.player or v.Players) or 0,
         Type = tostring(v.type or v.Type or v.server_type or ""),
-        Region = v.Region or v.region,
         Raw = v,
     }
 end
@@ -803,15 +912,16 @@ local function ExtractServerList(data)
     end
 
     -- API: tren = cu, duoi = moi.
-    -- Reverse => list[1] la Mirage moi nhat.
+    -- Doc nguoc de uu tien server moi nhat.
     for i = #source, 1, -1 do
         local one = NormalizeServerEntry(source[i])
 
         if one then
             local tp = tostring(one.Type or ""):lower()
 
-            -- String schema hien tai co nhieu island type.
-            -- CHI lay exact type=mirage.
+            -- Payload key=mirage van co the chua mysticisland/prehistoricisland.
+            -- Schema string hien tai: CHI lay type=mirage.
+            -- Schema object cu khong co Type: van cho phep de backward-compatible.
             if type(one.Raw) == "string" then
                 if tp == "mirage" then
                     list[#list + 1] = one
@@ -829,22 +939,20 @@ local LastMirageApiFetch = 0
 local CachedMirageServers = nil
 local CachedMiragePlaceId = nil
 
-local function GetMirageServersFromAPI(forceRefresh)
+local function GetMirageServersFromAPI()
     local cfg = getgenv().PullLeverConfig or {}
     local url = tostring(cfg["Mirage API"] or "")
 
     if url == "" then
-        warn("[MirageAPI] API url rong")
+        warn("[MirageAPI] Mirage API url rong -> bo qua")
         return {}, "url_empty"
     end
 
     local currentPlaceId = tonumber(game.PlaceId)
 
-    if not forceRefresh
-        and CachedMirageServers
+    if CachedMirageServers
         and CachedMiragePlaceId == currentPlaceId
-        and os.time() - LastMirageApiFetch < 20
-    then
+        and os.time() - LastMirageApiFetch < 20 then
         return CachedMirageServers, "cache"
     end
 
@@ -854,7 +962,7 @@ local function GetMirageServersFromAPI(forceRefresh)
         Url = url,
         Method = "GET",
         Headers = {
-            ["Accept"] = "application/json",
+            ["Accept"]     = "application/json",
             ["User-Agent"] = "Roblox/WinInet",
         },
     })
@@ -867,12 +975,7 @@ local function GetMirageServersFromAPI(forceRefresh)
     local statusCode = tonumber(res.StatusCode or res.status_code or res.Status or 0)
     local body = res.Body or res.body or ""
 
-    print(
-        "[MirageAPI] Status="
-        .. tostring(statusCode)
-        .. " BodyLen="
-        .. tostring(#body)
-    )
+    print("[MirageAPI] Status=" .. tostring(statusCode) .. " BodyLen=" .. tostring(#body))
 
     if statusCode ~= 0 and (statusCode < 200 or statusCode >= 300) then
         warn("[MirageAPI] Bad status: " .. tostring(statusCode))
@@ -881,16 +984,15 @@ local function GetMirageServersFromAPI(forceRefresh)
 
     local data = JsonDecodeSafe(body)
     if not data then
-        warn(
-            "[MirageAPI] JSON decode failed. Body head: "
-            .. tostring(body):sub(1, 300)
-        )
+        warn("[MirageAPI] JSON decode failed. Body head: " .. tostring(body):sub(1, 300))
         return {}, "json_decode_failed"
     end
 
-    -- Query key=mirage nhung envelope key=island -> khong xem la loi.
-    if data.key ~= nil then
-        print("[MirageAPI] Response envelope key=" .. tostring(data.key))
+    -- Luu y: URL query dang la key=mirage, nhung API envelope hien tai
+    -- tra data.key = "island". Khong dung data.key de suy ra query selector.
+    local responseKey = tostring(data.key or "")
+    if responseKey ~= "" then
+        print("[MirageAPI] Response envelope key=" .. responseKey)
     end
 
     local servers = ExtractServerList(data)
@@ -899,17 +1001,13 @@ local function GetMirageServersFromAPI(forceRefresh)
         LastMirageApiFetch = os.time()
         CachedMiragePlaceId = currentPlaceId
         CachedMirageServers = servers
-    else
-        CachedMirageServers = nil
-        CachedMiragePlaceId = nil
     end
 
     print(
-        "[MirageAPI] Parsed "
-        .. tostring(#servers)
-        .. " Mirage server(s) | bottom->top | newest first"
+        "[MirageAPI] Parsed " .. tostring(#servers)
+        .. " server(s) | key=" .. tostring(data.key)
+        .. " | bottom->top | newest first"
     )
-
     SetStatus("Mirage API servers: " .. tostring(#servers))
 
     if #servers <= 0 then
@@ -918,19 +1016,6 @@ local function GetMirageServersFromAPI(forceRefresh)
 
     return servers, "ok"
 end
-
--- ============================================================
--- LOCAL-ONLY VISITED / TELEPORT STATE
--- KHONG ghi file, KHONG shared blacklist, KHONG shared claim.
--- ============================================================
-local JoinedMirageJobs = {}
-
-local PendingMirageJoinJobId = nil
-local PendingMirageJoinAt = 0
-local PendingMirageTeleportStarted = false
-
-local MIRAGE_JOIN_PENDING_TIMEOUT = 6
-local MIRAGE_JOIN_STARTED_TIMEOUT = 20
 
 JoinJobIdByServerBrowser = function(jobId)
     if not jobId or tostring(jobId) == "" then
@@ -966,74 +1051,11 @@ JoinJobIdByServerBrowser = function(jobId)
         return false, tostring(result)
     end
 
-    print(
-        "[ServerBrowser] Sent Mirage teleport | JobId="
-        .. jobId
-        .. " | Result="
-        .. tostring(result)
-    )
-
     return true, result
 end
 
-TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, message)
-    if player ~= LocalPlayer then
-        return
-    end
-
-    local pending = PendingMirageJoinJobId
-    if not pending then
-        return
-    end
-
-    -- Local-only visited: skip lai JobId nay trong session hien tai.
-    JoinedMirageJobs[pending] = true
-
-    PendingMirageJoinJobId = nil
-    PendingMirageJoinAt = 0
-    PendingMirageTeleportStarted = false
-
-    CachedMirageServers = nil
-    LastMirageApiFetch = 0
-
-    warn(
-        "[MirageAPI] TeleportInitFailed "
-        .. tostring(teleportResult)
-        .. " | "
-        .. tostring(message or "")
-        .. " | JobId="
-        .. tostring(pending)
-    )
-end)
-
-pcall(function()
-    LocalPlayer.OnTeleport:Connect(function(state)
-        if not PendingMirageJoinJobId then
-            return
-        end
-
-        local stateText = tostring(state)
-
-        if stateText:find("Started")
-            or stateText:find("Waiting")
-            or stateText:find("InProgress")
-        then
-            PendingMirageTeleportStarted = true
-
-        elseif stateText:find("Failed") then
-            local pending = PendingMirageJoinJobId
-            JoinedMirageJobs[pending] = true
-
-            PendingMirageJoinJobId = nil
-            PendingMirageJoinAt = 0
-            PendingMirageTeleportStarted = false
-
-            CachedMirageServers = nil
-            LastMirageApiFetch = 0
-        end
-    end)
-end)
-
+-- Lay toi 30 server Mirage moi nhat theo thu tu API TU DUOI LEN TREN.
+-- Moi thoi diem chi co 1 teleport pending; khong spam nhieu JobId lien tiep.
 local function HopMirageByAPI()
     local cfg = getgenv().PullLeverConfig or {}
 
@@ -1041,7 +1063,12 @@ local function HopMirageByAPI()
         return false, "disabled"
     end
 
-    -- Khong spam JobId moi neu teleport cu van dang pending.
+    -- HARD PRIORITY:
+    -- Neu server HIEN TAI da co Mirage thi API hop bi cam.
+    if FindMirageIsland() then
+        return false, "mirage_present"
+    end
+
     if PendingMirageJoinJobId then
         local elapsed = os.clock() - PendingMirageJoinAt
         local timeout =
@@ -1061,8 +1088,7 @@ local function HopMirageByAPI()
             return true, "teleport_pending"
         end
 
-        -- Timeout local-only: bo JobId nay trong session nay, khong ghi blacklist.
-        local stale = PendingMirageJoinJobId
+        local stale = tostring(PendingMirageJoinJobId)
         JoinedMirageJobs[stale] = true
 
         PendingMirageJoinJobId = nil
@@ -1071,23 +1097,24 @@ local function HopMirageByAPI()
 
         CachedMirageServers = nil
         LastMirageApiFetch = 0
-
-        warn(
-            "[MirageAPI] Pending timeout | JobId="
-            .. tostring(stale)
-        )
     end
 
-    local servers, fetchReason = GetMirageServersFromAPI(false)
-
+    local servers, fetchReason = GetMirageServersFromAPI()
     if type(servers) ~= "table" or #servers <= 0 then
         SetStatus("Mirage API empty | " .. tostring(fetchReason))
         return false, fetchReason or "api_empty"
     end
 
+    -- API request co the mat mot luc; check Mirage LAN NUA truoc khi teleport.
+    if FindMirageIsland() then
+        return false, "mirage_present"
+    end
+
     local currentPlaceId = tonumber(game.PlaceId)
-    local maxPlayers = tonumber(cfg["Max Players"] or 11) or 11
-    local avoidFull = cfg["Avoid Full Server"] ~= false
+    local maxPlayers =
+        tonumber(cfg["Max Players"] or 11) or 11
+    local avoidFull =
+        cfg["Avoid Full Server"] ~= false
     local fetchCount =
         math.max(
             1,
@@ -1105,19 +1132,34 @@ local function HopMirageByAPI()
         usable = 0,
     }
 
-    -- servers da newest-first do ExtractServerList reverse.
+    -- GetMirageServersFromAPI da reverse:
+    -- index 1 = item duoi cung API = MOI NHAT.
     for _, server in ipairs(servers) do
         local jobId = tostring(server.JobId or "")
         local placeId = tonumber(server.PlaceId)
         local players = tonumber(server.Players) or 0
 
-        -- placeId nil van cho phep: __ServerBrowser teleport JobId trong place hien tai.
-        local samePlace = (placeId == nil) or (placeId == currentPlaceId)
-        local notSameJob = jobId ~= "" and jobId ~= tostring(game.JobId)
-        local notVisited = not JoinedMirageJobs[jobId]
-        local notFull = (not avoidFull) or players <= maxPlayers
+        local samePlace =
+            (placeId == nil)
+            or (placeId == currentPlaceId)
 
-        if samePlace then stats.samePlace += 1 else stats.wrongPlace += 1 end
+        local notSameJob =
+            jobId ~= ""
+            and jobId ~= tostring(game.JobId)
+
+        local notVisited =
+            not JoinedMirageJobs[jobId]
+
+        local notFull =
+            (not avoidFull)
+            or players <= maxPlayers
+
+        if samePlace then
+            stats.samePlace += 1
+        else
+            stats.wrongPlace += 1
+        end
+
         if not notSameJob then stats.sameJob += 1 end
         if not notFull then stats.full += 1 end
         if not notVisited then stats.visited += 1 end
@@ -1147,7 +1189,6 @@ local function HopMirageByAPI()
     )
 
     if #candidates == 0 then
-        -- Refresh de lay cac item moi o cuoi API.
         CachedMirageServers = nil
         LastMirageApiFetch = 0
 
@@ -1161,10 +1202,14 @@ local function HopMirageByAPI()
         return false, "filtered_empty"
     end
 
-    -- QUAN TRONG: candidates dang theo thu tu MOI -> CU.
-    -- Khong random nua.
+    -- Moi nhat truoc, KHONG random.
     local server = candidates[1]
     local jobId = tostring(server.JobId)
+
+    -- Check lan cuoi ngay truoc InvokeServer("teleport").
+    if FindMirageIsland() then
+        return false, "mirage_present"
+    end
 
     SetStatus(
         "Join newest Mirage"
@@ -1186,8 +1231,6 @@ local function HopMirageByAPI()
         JoinJobIdByServerBrowser(jobId)
 
     if joinStarted then
-        -- Khong mark visited ngay.
-        -- Chi mark neu teleport fail/timeout; neu teleport thanh cong script roi session.
         return true, "teleport_started"
     end
 
@@ -1206,24 +1249,49 @@ local function ConvertTo(Type, Data)
 end
 
 local function CaculateDistance(Origin, Destination)
+    RefreshCharacter()
+
+    if not HumanoidRootPart or not HumanoidRootPart.Parent then
+        return math.huge
+    end
+
     Origin = Origin or HumanoidRootPart.CFrame
     Destination = Destination or HumanoidRootPart.CFrame
-    local a = typeof(Origin)    == "CFrame" and Origin.Position    or (typeof(Origin)    == "Vector3" and Origin    or ConvertTo(Vector3, Origin))
-    local b = typeof(Destination) == "CFrame" and Destination.Position or (typeof(Destination) == "Vector3" and Destination or ConvertTo(Vector3, Destination))
+
+    local a =
+        typeof(Origin) == "CFrame" and Origin.Position
+        or (typeof(Origin) == "Vector3" and Origin or ConvertTo(Vector3, Origin))
+
+    local b =
+        typeof(Destination) == "CFrame" and Destination.Position
+        or (typeof(Destination) == "Vector3" and Destination or ConvertTo(Vector3, Destination))
+
     return (a - b).Magnitude
 end
 
 local TweenConn, TweenInstance, TweenGhost, IsTweening = nil, nil, nil, false
-local function NoclipLoop()
-    if LocalPlayer.Character then
-        for _, c in LocalPlayer.Character:GetDescendants() do
-            if c:IsA("BasePart") and c.CanCollide and c.Name ~= "HumanoidRootPart" then
-                c.CanCollide = false
-            end
+
+-- Không quét GetDescendants mỗi frame nữa.
+-- Với nhiều client, Stepped + GetDescendants gây CPU thừa rất lớn.
+local function ApplyNoclip()
+    local char = LocalPlayer.Character
+    if not char then return end
+
+    for _, c in char:GetDescendants() do
+        if c:IsA("BasePart")
+            and c.CanCollide
+            and c.Name ~= "HumanoidRootPart"
+        then
+            c.CanCollide = false
         end
     end
 end
-RunService.Stepped:Connect(NoclipLoop)
+
+task.spawn(function()
+    while task.wait(0.25) do
+        pcall(ApplyNoclip)
+    end
+end)
 
 local function StopTween()
     if TweenInstance then pcall(function() TweenInstance:Cancel() end) TweenInstance = nil end
@@ -1233,6 +1301,7 @@ local function StopTween()
 end
 
 function TweenTo(Position)
+    RefreshCharacter()
 
     if not Character or not Character:FindFirstChild("Humanoid")
         or Character.Humanoid.Health <= 0 or not HumanoidRootPart then
@@ -1312,26 +1381,68 @@ function GetBlueGear()
     return nil
 end
 
-local function GetInventoryItemCount(name)
-    local item = ConChoChisiti36.Backpack[tostring(name)]
-
-    if type(item) ~= "table" then
-        return 0
-    end
-
-    return math.max(0, tonumber(item.Count) or 1)
-end
-
 local function HasMirrorFractal()
-    return GetInventoryItemCount("Mirror Fractal") > 0
+    return ConChoChisiti36.Backpack["Mirror Fractal"] ~= nil
 end
-
 local function HasValkyrieHelm()
-    return GetInventoryItemCount("Valkyrie Helm") > 0
+    return ConChoChisiti36.Backpack["Valkyrie Helm"] ~= nil
 end
 local function IsTempleDoorOpened()
     local ok, v = pcall(function() return CommF_:InvokeServer("CheckTempleDoor") end)
     return ok and v == true
+end
+
+-- ============================================================
+-- COMPLETED PULL MARKER
+-- Khi CheckTempleDoor == true:
+--   <PlayerName>.txt = Completed-pull
+-- ============================================================
+local function WriteCompletedPull()
+    local outputFile = tostring(LocalPlayer.Name) .. ".txt"
+    local content = "Completed-pull"
+
+    if type(writefile) ~= "function" then
+        warn("[PullLever] writefile unavailable -> cannot create " .. outputFile)
+        return false
+    end
+
+    local ok, err = pcall(function()
+        writefile(outputFile, content)
+    end)
+
+    if not ok then
+        warn("[PullLever] Completed-pull write failed: " .. tostring(err))
+        return false
+    end
+
+    local verified = true
+
+    if type(isfile) == "function" then
+        local vok, exists = pcall(isfile, outputFile)
+        if vok and exists ~= true then
+            verified = false
+        end
+    end
+
+    if verified and type(readfile) == "function" then
+        local rok, body = pcall(readfile, outputFile)
+        if rok and tostring(body or "") ~= content then
+            verified = false
+        end
+    end
+
+    if verified then
+        print(
+            "[PullLever] CREATED "
+            .. outputFile
+            .. " = "
+            .. content
+        )
+        return true
+    end
+
+    warn("[PullLever] Completed-pull verify failed: " .. outputFile)
+    return false
 end
 local function IsCurrentRaceV3()
     local ok, v = pcall(function()
@@ -1361,55 +1472,104 @@ local function DoRaceV4Progress()
 end
 
 local function DoMirageBlueGear()
-    local mirage = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("MysticIsland")
+    local mirage = FindMirageIsland()
+
+    -- Replication settle:
+    -- tranh vua vao server, UI/Map sap replicate ma da gui API teleport mat.
+    if not mirage then
+        for _ = 1, 10 do
+            task.wait(0.1)
+            mirage = FindMirageIsland()
+            if mirage then
+                break
+            end
+        end
+    end
+
     if not mirage then
         if Config["Hop Mirage"] then
             SetStatus("Khong co Mirage -> Hop Mirage API")
-            local apiStarted, apiReason = HopMirageByAPI()
+
+            local apiStarted, apiReason =
+                HopMirageByAPI()
+
+            -- Neu API guard phat hien Mirage vua replicate:
+            -- KHONG fallback server hop; main loop se tween ngay tick tiep.
+            if apiReason == "mirage_present" then
+                SetStatus("Mirage vua spawn/replicate -> GIU SERVER")
+                return
+            end
+
             if not apiStarted then
-                SetStatus("Mirage API fallback | " .. tostring(apiReason))
+                SetStatus(
+                    "Mirage API fallback | "
+                    .. tostring(apiReason)
+                )
                 Hop("Mirage API: " .. tostring(apiReason))
             end
         else
             SetStatus("Khong co Mirage (Hop Mirage = false)")
         end
+
         return
     end
 
-    local hour = math.floor(Lighting.ClockTime)
-    if hour >= 12 or hour < 5 then
-        local blue = GetBlueGear()
-        if blue then
-            SetStatus("Thay Blue Gear -> Tween")
-            TweenTo(blue)
-            return
-        end
-        local top = mirage:GetModelCFrame() + Vector3.new(0, 300, 0)
-        SetStatus("Mirage OK, chua co Blue Gear -> ActivateAbility")
-        TweenTo(top)
-        if CaculateDistance(top) < 20 then
-            pcall(function()
-                LocalPlayer.CameraMaxZoomDistance = 0.5
-                LocalPlayer.CameraMaxZoomDistance = 200
-                workspace.CurrentCamera.CFrame = CFrame.new(
-                    workspace.CurrentCamera.CFrame.Position,
-                    Lighting:GetMoonDirection() + workspace.CurrentCamera.CFrame.Position
-                )
-            end)
-            pcall(function()
-                ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommE"):FireServer("ActivateAbility")
-            end)
-        end
-    else
-        SetStatus("Sai gio trong ngay -> Hop Mirage API")
-        if Config["Hop Mirage"] then
-            local apiStarted, apiReason = HopMirageByAPI()
-            if not apiStarted then
-                SetStatus("Mirage API fallback | " .. tostring(apiReason))
-                Hop("Mirage API: " .. tostring(apiReason))
-            end
-        end
+    -- ========================================================
+    -- CO MIRAGE = TUYET DOI KHONG HOP SERVER.
+    -- Luon di ra Mirage truoc.
+    -- ========================================================
+    local blue = GetBlueGear()
+
+    if blue then
+        SetStatus("Mirage YES + Blue Gear -> Tween")
+        TweenTo(blue)
+        return
     end
+
+    local top =
+        mirage:GetModelCFrame()
+        + Vector3.new(0, 300, 0)
+
+    SetStatus("Mirage YES -> Tween ra island")
+    TweenTo(top)
+
+    if CaculateDistance(top) >= 20 then
+        return
+    end
+
+    -- Da o tren Mirage.
+    -- Gio sai thi DUNG TAI MIRAGE cho den dung gio, KHONG hop.
+    local hour = math.floor(Lighting.ClockTime)
+
+    if not (hour >= 12 or hour < 5) then
+        SetStatus(
+            "Da o Mirage -> doi dung gio | Clock="
+            .. tostring(math.floor(Lighting.ClockTime))
+        )
+        return
+    end
+
+    -- Dung gio: quay camera ve moon + activate race ability.
+    SetStatus("Mirage OK -> ActivateAbility")
+
+    pcall(function()
+        LocalPlayer.CameraMaxZoomDistance = 0.5
+        LocalPlayer.CameraMaxZoomDistance = 200
+
+        workspace.CurrentCamera.CFrame =
+            CFrame.new(
+                workspace.CurrentCamera.CFrame.Position,
+                Lighting:GetMoonDirection()
+                    + workspace.CurrentCamera.CFrame.Position
+            )
+    end)
+
+    pcall(function()
+        ReplicatedStorage
+            :WaitForChild("Remotes")
+            :WaitForChild("CommE")
+            :FireServer("ActivateAbility")
+    end)
 end
 
 if Config["Boost FPS"] then
@@ -1435,7 +1595,7 @@ pcall(MakeUI)
 
 local _lastUiRefresh = 0
 
-local function UIUpdateTick()
+local function _UIUpdateTickInner()
     local now = os.time()
     if now - _lastUiRefresh < 1 then return end
     _lastUiRefresh = now
@@ -1465,6 +1625,18 @@ local function UIUpdateTick()
     _progressLabel.Text = "RaceV4 Check: "   .. (ok2 and tostring(prog) or "?")
 end
 
+-- Ghi vao label o CoreGui/gethui can identity cao. Neu mot require
+-- truoc do da ha identity thi day la cho no no ra loi, nen luon
+-- raise identity + pcall: UI loi khong duoc lam chet main loop.
+local function UIUpdateTick()
+    local prev = RaiseIdentity()
+    local ok, err = pcall(_UIUpdateTickInner)
+    RestoreIdentity(prev)
+    if not ok then
+        warn("[UI] UIUpdateTick loi: " .. tostring(err))
+    end
+end
+
 while task.wait(1) do
     if not Config["Enabled"] then
         SetStatus("Disabled"); task.wait(5); continue
@@ -1480,7 +1652,14 @@ while task.wait(1) do
     end
 
     if IsTempleDoorOpened() then
-        SetStatus("Temple Door da mo -> DONE")
+        local wrote = WriteCompletedPull()
+
+        if wrote then
+            SetStatus("Temple Door da mo -> Completed-pull")
+        else
+            SetStatus("Temple Door da mo -> DONE (marker write failed)")
+        end
+
         break
     end
 
