@@ -20,7 +20,7 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
     ["Fetch Count"]        = 30,
 }
 
--- PullLever V5 - FullReview base | no shared blacklist | strict Mirage tween | Completed-pull
+-- PullLever V5.1 - no blacklist | Mirage anti-rubberband movement | Completed-pull
 LPH_NO_VIRTUALIZE(function()
 
 local PlayerGui
@@ -1370,6 +1370,227 @@ function TweenTo(Position)
     TweenInstance:Play()
 end
 
+
+-- ============================================================
+-- MIRAGE MOVEMENT CONTROLLER V5.1
+--
+-- Dedicated movement for long-distance Mirage travel.
+-- Không dùng TweenTo() cũ vì TweenTo cũ:
+--   - kết thúc tween -> StopTween() -> ngừng giữ vị trí ngay
+--   - dist <= 200 -> CFrame thẳng
+-- Hai điểm này có thể gây rubber-band / giật ngược về vị trí server cũ.
+--
+-- Cách này theo controller Katakuri:
+--   proxy tween -> Heartbeat kéo HRP theo proxy
+--   khi tới đích -> chuyển HOLD, tiếp tục giữ vị trí
+--   không có khoảng trống "tween xong rồi thả HRP".
+-- ============================================================
+local MIRAGE_TWEEN_SPEED = 280
+local MIRAGE_SNAP_DISTANCE = 6
+
+local MirageMovement = {
+    Proxy = nil,
+    Tween = nil,
+    Mode = "IDLE", -- IDLE | MOVE | HOLD
+    Target = nil,
+    LastRetargetAt = 0,
+}
+
+local function EnsureMirageProxy()
+    if MirageMovement.Proxy and MirageMovement.Proxy.Parent then
+        return MirageMovement.Proxy
+    end
+
+    local proxy = Instance.new("Part")
+    proxy.Name = "PullLeverMirageProxy"
+    proxy.Anchored = true
+    proxy.CanCollide = false
+    proxy.CanTouch = false
+    proxy.CanQuery = false
+    proxy.Transparency = 1
+    proxy.Size = Vector3.new(2, 2, 2)
+    proxy.Parent = workspace
+
+    MirageMovement.Proxy = proxy
+    return proxy
+end
+
+local function CancelMirageTweenOnly()
+    if MirageMovement.Tween then
+        pcall(function()
+            MirageMovement.Tween:Cancel()
+        end)
+        MirageMovement.Tween = nil
+    end
+end
+
+function MirageMovement.cancel()
+    MirageMovement.Mode = "IDLE"
+    MirageMovement.Target = nil
+    CancelMirageTweenOnly()
+
+    if MirageMovement.Proxy then
+        pcall(function()
+            MirageMovement.Proxy:Destroy()
+        end)
+        MirageMovement.Proxy = nil
+    end
+end
+
+function MirageMovement.holdAt(targetCFrame)
+    if typeof(targetCFrame) ~= "CFrame" then
+        return false
+    end
+
+    CancelMirageTweenOnly()
+    MirageMovement.Mode = "HOLD"
+    MirageMovement.Target = targetCFrame
+    return true
+end
+
+function MirageMovement.moveTo(targetCFrame)
+    RefreshCharacter()
+
+    local root = HumanoidRootPart
+    local hum = Humanoid
+
+    if not root
+        or not root.Parent
+        or not hum
+        or hum.Health <= 0
+        or typeof(targetCFrame) ~= "CFrame"
+    then
+        MirageMovement.cancel()
+        return false
+    end
+
+    hum.Sit = false
+
+    local dist =
+        (root.Position - targetCFrame.Position).Magnitude
+
+    -- Chỉ snap/hold khi thực sự đã rất gần.
+    -- Không CFrame thẳng 200 studs như TweenTo cũ.
+    if dist <= MIRAGE_SNAP_DISTANCE then
+        MirageMovement.holdAt(targetCFrame)
+        return true
+    end
+
+    local now = os.clock()
+
+    -- Main loop có thể gọi lại cùng target nhiều lần.
+    -- Không restart tween liên tục.
+    if MirageMovement.Mode == "MOVE"
+        and MirageMovement.Target
+    then
+        local targetDelta =
+            (MirageMovement.Target.Position - targetCFrame.Position).Magnitude
+
+        if targetDelta < 10 then
+            return false
+        end
+    end
+
+    local proxy = EnsureMirageProxy()
+
+    CancelMirageTweenOnly()
+
+    proxy.CFrame = root.CFrame
+    MirageMovement.Target = targetCFrame
+    MirageMovement.Mode = "MOVE"
+    MirageMovement.LastRetargetAt = now
+
+    local travel =
+        math.max(dist / MIRAGE_TWEEN_SPEED, 0.05)
+
+    local tween =
+        TweenService:Create(
+            proxy,
+            TweenInfo.new(
+                travel,
+                Enum.EasingStyle.Linear
+            ),
+            {
+                CFrame = targetCFrame
+            }
+        )
+
+    MirageMovement.Tween = tween
+
+    tween.Completed:Connect(function(playbackState)
+        -- Callback của tween cũ không được đè tween mới.
+        if MirageMovement.Tween ~= tween then
+            return
+        end
+
+        MirageMovement.Tween = nil
+
+        if playbackState == Enum.PlaybackState.Completed
+            and MirageMovement.Target
+        then
+            -- QUAN TRỌNG:
+            -- không IDLE / không StopTween tại đây.
+            -- HOLD liên tục để tránh server rubber-band về điểm xuất phát.
+            MirageMovement.Mode = "HOLD"
+        end
+    end)
+
+    tween:Play()
+    return false
+end
+
+RunService.Heartbeat:Connect(function()
+    if MirageMovement.Mode == "IDLE" then
+        return
+    end
+
+    RefreshCharacter()
+
+    local root = HumanoidRootPart
+    local hum = Humanoid
+
+    if not root
+        or not root.Parent
+        or not hum
+        or hum.Health <= 0
+    then
+        MirageMovement.cancel()
+        return
+    end
+
+    local target
+
+    if MirageMovement.Mode == "MOVE" then
+        local proxy = MirageMovement.Proxy
+
+        if not proxy or not proxy.Parent then
+            MirageMovement.cancel()
+            return
+        end
+
+        target = proxy.CFrame
+
+    elseif MirageMovement.Mode == "HOLD" then
+        target = MirageMovement.Target
+    end
+
+    if typeof(target) ~= "CFrame" then
+        MirageMovement.cancel()
+        return
+    end
+
+    pcall(function()
+        hum.Sit = false
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.CFrame = target
+    end)
+end)
+
+local function TweenToMirage(targetCFrame)
+    return MirageMovement.moveTo(targetCFrame)
+end
+
 function GetBlueGear()
     local mi = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("MysticIsland")
     if not mi then return nil end
@@ -1487,6 +1708,8 @@ local function DoMirageBlueGear()
     end
 
     if not mirage then
+        MirageMovement.cancel()
+
         if Config["Hop Mirage"] then
             SetStatus("Khong co Mirage -> Hop Mirage API")
 
@@ -1522,7 +1745,7 @@ local function DoMirageBlueGear()
 
     if blue then
         SetStatus("Mirage YES + Blue Gear -> Tween")
-        TweenTo(blue)
+        TweenToMirage(blue)
         return
     end
 
@@ -1530,8 +1753,12 @@ local function DoMirageBlueGear()
         mirage:GetModelCFrame()
         + Vector3.new(0, 300, 0)
 
-    SetStatus("Mirage YES -> Tween ra island")
-    TweenTo(top)
+    SetStatus(
+        "Mirage YES -> Tween ra island"
+        .. " | speed="
+        .. tostring(MIRAGE_TWEEN_SPEED)
+    )
+    TweenToMirage(top)
 
     if CaculateDistance(top) >= 20 then
         return
@@ -1652,6 +1879,7 @@ while task.wait(1) do
     end
 
     if IsTempleDoorOpened() then
+        MirageMovement.cancel()
         local wrote = WriteCompletedPull()
 
         if wrote then
