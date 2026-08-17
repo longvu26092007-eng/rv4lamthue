@@ -16,11 +16,11 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
     ["Avoid Full Server"]  = true,
     ["Max Players"]        = 11,
 
-    -- Lay 30 server MOI NHAT, join lan luot tung cai, cach nhau 1.5s
-    ["Fetch Count"]        = 30,
+    -- Lay DUNG 5 server Mirage usable MOI NHAT; thu JobId cach nhau 2 giay
+    ["Fetch Count"]        = 5,
 }
 
--- PullLever V5.1 - no blacklist | Mirage anti-rubberband movement | Completed-pull
+-- PullLever V5.3 - __ServerBrowser ONLY | 5 newest / 2s | anti-rubberband | Completed-pull
 LPH_NO_VIRTUALIZE(function()
 
 local PlayerGui
@@ -133,7 +133,7 @@ Config["Use Mirage API"]    = Config["Use Mirage API"] ~= false
 -- Khong rewrite URL dua theo data.key.
 Config["Avoid Full Server"] = Config["Avoid Full Server"] ~= false
 Config["Max Players"]       = Config["Max Players"] or 11
-Config["Fetch Count"]       = math.max(1, math.floor(tonumber(Config["Fetch Count"]) or 30))
+Config["Fetch Count"]       = 5
 Config["Boost FPS"]         = Config["Boost FPS"] ~= false
 Config["FPS"]               = Config["FPS"] or 20
 Config["Black Screen"]      = Config["Black Screen"] or false
@@ -151,7 +151,6 @@ local Workspace         = game:GetService("Workspace")
 local Lighting          = game:GetService("Lighting")
 local RunService        = game:GetService("RunService")
 local TweenService      = game:GetService("TweenService")
-local TeleportService   = game:GetService("TeleportService")
 local HttpService       = game:GetService("HttpService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local StarterPlayer     = game:GetService("StarterPlayer")
@@ -161,73 +160,25 @@ local Character, Humanoid, HumanoidRootPart
 
 -- ============================================================
 -- MIRAGE LOCAL STATE ONLY
--- Shared blacklist / join_fail / claim file system REMOVED.
--- Khong tao mirage_shared/, khong blacklist JobId giua cac account.
--- Chi nho JobId fail trong RAM cua CHINH session nay.
+--
+-- JOIN JOBID CHI DUNG:
+--   ReplicatedStorage.__ServerBrowser:InvokeServer("teleport", JobId)
+--
+-- KHONG TeleportService.
+-- KHONG shared blacklist / claim / join_fail file.
+-- JoinedMirageJobs chi ton tai trong RAM cua session hien tai de
+-- khong lap lai ngay JobId vua thu that bai.
 -- ============================================================
 local JoinedMirageJobs = {}
-
-local PendingMirageJoinJobId = nil
-local PendingMirageJoinAt = 0
-local PendingMirageTeleportStarted = false
-
-local MIRAGE_JOIN_PENDING_TIMEOUT = 6
-local MIRAGE_JOIN_STARTED_TIMEOUT = 20
 
 local function FindMirageIsland()
     local map = workspace:FindFirstChild("Map")
     return map and map:FindFirstChild("MysticIsland") or nil
 end
 
-TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, message)
-    if player ~= LocalPlayer then
-        return
-    end
-
-    local pending = PendingMirageJoinJobId
-    if pending then
-        JoinedMirageJobs[tostring(pending)] = true
-    end
-
-    PendingMirageJoinJobId = nil
-    PendingMirageJoinAt = 0
-    PendingMirageTeleportStarted = false
-
-    if pending then
-        warn(
-            "[MirageAPI] TeleportInitFailed "
-            .. tostring(teleportResult)
-            .. " | "
-            .. tostring(message or "")
-            .. " | JobId="
-            .. tostring(pending)
-        )
-    end
-end)
-
-pcall(function()
-    LocalPlayer.OnTeleport:Connect(function(state)
-        if not PendingMirageJoinJobId then
-            return
-        end
-
-        local stateText = tostring(state)
-
-        if stateText:find("Started")
-            or stateText:find("Waiting")
-            or stateText:find("InProgress")
-        then
-            PendingMirageTeleportStarted = true
-
-        elseif stateText:find("Failed") then
-            JoinedMirageJobs[tostring(PendingMirageJoinJobId)] = true
-
-            PendingMirageJoinJobId = nil
-            PendingMirageJoinAt = 0
-            PendingMirageTeleportStarted = false
-        end
-    end)
-end)
+local function GetServerBrowser()
+    return ReplicatedStorage:FindFirstChild("__ServerBrowser")
+end
 
 SetStatus("Creating UI...")
 pcall(MakeUI)
@@ -939,7 +890,7 @@ local LastMirageApiFetch = 0
 local CachedMirageServers = nil
 local CachedMiragePlaceId = nil
 
-local function GetMirageServersFromAPI()
+local function GetMirageServersFromAPI(forceRefresh)
     local cfg = getgenv().PullLeverConfig or {}
     local url = tostring(cfg["Mirage API"] or "")
 
@@ -1028,34 +979,43 @@ JoinJobIdByServerBrowser = function(jobId)
         return false, "same_job"
     end
 
-    local sb = ReplicatedStorage:FindFirstChild("__ServerBrowser")
-    if not sb then
+    local browser = GetServerBrowser()
+    if not browser then
         warn("[ServerBrowser] Khong tim thay __ServerBrowser")
         return false, "browser_missing"
     end
 
-    PendingMirageJoinJobId = jobId
-    PendingMirageJoinAt = os.clock()
-    PendingMirageTeleportStarted = false
-
+    -- "teleport" o day CHI la action name cua __ServerBrowser remote.
+    -- Khong lien quan TeleportService.
     local ok, result = pcall(function()
-        return sb:InvokeServer("teleport", jobId)
+        return browser:InvokeServer("teleport", jobId)
     end)
 
     if not ok then
-        PendingMirageJoinJobId = nil
-        PendingMirageJoinAt = 0
-        PendingMirageTeleportStarted = false
-
-        warn("[ServerBrowser] Join JobId loi: " .. tostring(result))
+        warn(
+            "[ServerBrowser] Join JobId loi | "
+            .. jobId
+            .. " | "
+            .. tostring(result)
+        )
         return false, tostring(result)
     end
+
+    print(
+        "[ServerBrowser] SENT JobId="
+        .. jobId
+        .. " | result="
+        .. tostring(result)
+    )
 
     return true, result
 end
 
 -- Lay toi 30 server Mirage moi nhat theo thu tu API TU DUOI LEN TREN.
 -- Moi thoi diem chi co 1 teleport pending; khong spam nhieu JobId lien tiep.
+local MIRAGE_BATCH_SIZE = 5
+local MIRAGE_JOB_DELAY = 2.0
+
 local function HopMirageByAPI()
     local cfg = getgenv().PullLeverConfig or {}
 
@@ -1063,182 +1023,190 @@ local function HopMirageByAPI()
         return false, "disabled"
     end
 
-    -- HARD PRIORITY:
-    -- Neu server HIEN TAI da co Mirage thi API hop bi cam.
+    -- Neu server hien tai da co Mirage: TUYET DOI KHONG HOP.
     if FindMirageIsland() then
         return false, "mirage_present"
     end
 
-    if PendingMirageJoinJobId then
-        local elapsed = os.clock() - PendingMirageJoinAt
-        local timeout =
-            PendingMirageTeleportStarted
-            and MIRAGE_JOIN_STARTED_TIMEOUT
-            or MIRAGE_JOIN_PENDING_TIMEOUT
-
-        if elapsed < timeout then
-            SetStatus(
-                (PendingMirageTeleportStarted
-                    and "Teleport started, waiting... "
-                    or "Waiting Mirage teleport ")
-                .. string.format("%.1f", elapsed)
-                .. "s | "
-                .. tostring(PendingMirageJoinJobId):sub(1, 8)
-            )
-            return true, "teleport_pending"
+    -- Chay lien tuc theo batch:
+    -- fetch API -> 5 newest usable -> #1..#5 cach 2s
+    -- -> het 5 thi fetch API moi ngay.
+    while cfg["Use Mirage API"] ~= false do
+        if FindMirageIsland() then
+            return false, "mirage_present"
         end
-
-        local stale = tostring(PendingMirageJoinJobId)
-        JoinedMirageJobs[stale] = true
-
-        PendingMirageJoinJobId = nil
-        PendingMirageJoinAt = 0
-        PendingMirageTeleportStarted = false
 
         CachedMirageServers = nil
+        CachedMiragePlaceId = nil
         LastMirageApiFetch = 0
-    end
 
-    local servers, fetchReason = GetMirageServersFromAPI()
-    if type(servers) ~= "table" or #servers <= 0 then
-        SetStatus("Mirage API empty | " .. tostring(fetchReason))
-        return false, fetchReason or "api_empty"
-    end
+        local servers, fetchReason = GetMirageServersFromAPI(true)
 
-    -- API request co the mat mot luc; check Mirage LAN NUA truoc khi teleport.
-    if FindMirageIsland() then
-        return false, "mirage_present"
-    end
-
-    local currentPlaceId = tonumber(game.PlaceId)
-    local maxPlayers =
-        tonumber(cfg["Max Players"] or 11) or 11
-    local avoidFull =
-        cfg["Avoid Full Server"] ~= false
-    local fetchCount =
-        math.max(
-            1,
-            math.floor(tonumber(cfg["Fetch Count"]) or 30)
-        )
-
-    local candidates = {}
-    local stats = {
-        total = #servers,
-        samePlace = 0,
-        wrongPlace = 0,
-        sameJob = 0,
-        full = 0,
-        visited = 0,
-        usable = 0,
-    }
-
-    -- GetMirageServersFromAPI da reverse:
-    -- index 1 = item duoi cung API = MOI NHAT.
-    for _, server in ipairs(servers) do
-        local jobId = tostring(server.JobId or "")
-        local placeId = tonumber(server.PlaceId)
-        local players = tonumber(server.Players) or 0
-
-        local samePlace =
-            (placeId == nil)
-            or (placeId == currentPlaceId)
-
-        local notSameJob =
-            jobId ~= ""
-            and jobId ~= tostring(game.JobId)
-
-        local notVisited =
-            not JoinedMirageJobs[jobId]
-
-        local notFull =
-            (not avoidFull)
-            or players <= maxPlayers
-
-        if samePlace then
-            stats.samePlace += 1
-        else
-            stats.wrongPlace += 1
+        if type(servers) ~= "table" or #servers <= 0 then
+            SetStatus(
+                "Mirage API empty | "
+                .. tostring(fetchReason)
+                .. " -> refetch"
+            )
+            task.wait(1)
+            continue
         end
 
-        if not notSameJob then stats.sameJob += 1 end
-        if not notFull then stats.full += 1 end
-        if not notVisited then stats.visited += 1 end
+        -- API request co the mat thoi gian; check lai Mirage truoc khi join.
+        if FindMirageIsland() then
+            return false, "mirage_present"
+        end
 
-        if samePlace
-            and notSameJob
-            and notVisited
-            and notFull
-        then
-            candidates[#candidates + 1] = server
-            stats.usable += 1
+        local currentPlaceId = tonumber(game.PlaceId)
+        local maxPlayers = tonumber(cfg["Max Players"] or 11) or 11
+        local avoidFull = cfg["Avoid Full Server"] ~= false
 
-            if #candidates >= fetchCount then
-                break
+        local candidates = {}
+        local stats = {
+            total = #servers,
+            full = 0,
+            wrongPlace = 0,
+            sameJob = 0,
+            visited = 0,
+        }
+
+        -- ExtractServerList da reverse:
+        -- index 1 = item DUOI CUNG API = MOI NHAT.
+        for _, server in ipairs(servers) do
+            local jobId = tostring(server.JobId or "")
+            local placeId = tonumber(server.PlaceId)
+            local players = tonumber(server.Players) or 0
+
+            local samePlace =
+                (placeId == nil)
+                or (placeId == currentPlaceId)
+
+            local notSameJob =
+                jobId ~= ""
+                and jobId ~= tostring(game.JobId)
+
+            local notFull =
+                (not avoidFull)
+                or players <= maxPlayers
+
+            local notVisited =
+                not JoinedMirageJobs[jobId]
+
+            if not samePlace then stats.wrongPlace += 1 end
+            if not notSameJob then stats.sameJob += 1 end
+            if not notFull then stats.full += 1 end
+            if not notVisited then stats.visited += 1 end
+
+            if samePlace
+                and notSameJob
+                and notFull
+                and notVisited
+            then
+                candidates[#candidates + 1] = server
+
+                if #candidates >= MIRAGE_BATCH_SIZE then
+                    break
+                end
             end
         end
-    end
 
-    print(
-        "[MirageAPI] Filter"
-        .. " total=" .. tostring(stats.total)
-        .. " samePlace=" .. tostring(stats.samePlace)
-        .. " usable=" .. tostring(stats.usable)
-        .. " full=" .. tostring(stats.full)
-        .. " visited=" .. tostring(stats.visited)
-        .. " wrongPlace=" .. tostring(stats.wrongPlace)
-    )
+        print(
+            "[ServerBrowser][MirageAPI]"
+            .. " total=" .. tostring(stats.total)
+            .. " newestUsable=" .. tostring(#candidates)
+            .. " full=" .. tostring(stats.full)
+            .. " visited=" .. tostring(stats.visited)
+            .. " wrongPlace=" .. tostring(stats.wrongPlace)
+        )
 
-    if #candidates == 0 then
+        if #candidates == 0 then
+            -- API co data nhung tat ca candidate hien tai da thu/khong usable.
+            -- Nghi ngan roi fetch lai API; KHONG random fallback server.
+            SetStatus(
+                "Mirage API no new usable -> refetch"
+                .. " | full=" .. tostring(stats.full)
+                .. " visited=" .. tostring(stats.visited)
+            )
+            task.wait(1)
+            continue
+        end
+
+        -- ====================================================
+        -- DUNG 5 NEWEST USABLE:
+        -- #1 -> 2s -> #2 -> 2s -> ... -> #5.
+        -- Join CHI qua __ServerBrowser.
+        -- ====================================================
+        for i, server in ipairs(candidates) do
+            if FindMirageIsland() then
+                SetStatus("Mirage vua replicate -> dung ServerBrowser")
+                return false, "mirage_present"
+            end
+
+            local jobId = tostring(server.JobId or "")
+
+            if jobId ~= "" then
+                SetStatus(
+                    "ServerBrowser "
+                    .. tostring(i)
+                    .. "/"
+                    .. tostring(#candidates)
+                    .. " | Players="
+                    .. tostring(server.Players)
+                    .. " | "
+                    .. jobId:sub(1, 8)
+                    .. " | next=2s"
+                )
+
+                print(
+                    "[ServerBrowser] TRY "
+                    .. tostring(i)
+                    .. "/"
+                    .. tostring(#candidates)
+                    .. " | JobId="
+                    .. jobId
+                    .. " | Players="
+                    .. tostring(server.Players)
+                    .. " | Type="
+                    .. tostring(server.Type or "?")
+                )
+
+                local ok, result =
+                    JoinJobIdByServerBrowser(jobId)
+
+                -- Neu Invoke loi thi bo qua JobId nay.
+                -- Neu Invoke accepted nhung client chua roi session sau 2s,
+                -- script se tiep tuc JobId tiep theo dung yeu cau.
+                if not ok then
+                    warn(
+                        "[ServerBrowser] FAILED "
+                        .. jobId
+                        .. " | "
+                        .. tostring(result)
+                    )
+                end
+
+                task.wait(MIRAGE_JOB_DELAY)
+
+                -- Neu code con chay o session nay thi coi JobId vua thu la da dung.
+                JoinedMirageJobs[jobId] = true
+            end
+        end
+
+        -- Het 5 -> force fetch 5 newest usable MOI ngay trong ham nay.
         CachedMirageServers = nil
+        CachedMiragePlaceId = nil
         LastMirageApiFetch = 0
 
         SetStatus(
-            "Mirage API no usable"
-            .. " | full=" .. tostring(stats.full)
-            .. " visited=" .. tostring(stats.visited)
-            .. " place=" .. tostring(stats.wrongPlace)
+            "Het "
+            .. tostring(#candidates)
+            .. " ServerBrowser JobId -> fetch 5 moi"
         )
 
-        return false, "filtered_empty"
+        task.wait(0.15)
     end
 
-    -- Moi nhat truoc, KHONG random.
-    local server = candidates[1]
-    local jobId = tostring(server.JobId)
-
-    -- Check lan cuoi ngay truoc InvokeServer("teleport").
-    if FindMirageIsland() then
-        return false, "mirage_present"
-    end
-
-    SetStatus(
-        "Join newest Mirage"
-        .. " | Players=" .. tostring(server.Players)
-        .. " | "
-        .. jobId:sub(1, 8)
-    )
-
-    print(
-        "[MirageAPI] Pick newest"
-        .. " JobId=" .. jobId
-        .. " PlaceId=" .. tostring(server.PlaceId)
-        .. " Players=" .. tostring(server.Players)
-        .. " Type=" .. tostring(server.Type or "?")
-        .. " Candidates=" .. tostring(#candidates)
-    )
-
-    local joinStarted, joinResult =
-        JoinJobIdByServerBrowser(jobId)
-
-    if joinStarted then
-        return true, "teleport_started"
-    end
-
-    JoinedMirageJobs[jobId] = true
-    CachedMirageServers = nil
-    LastMirageApiFetch = 0
-
-    return false, "invoke_failed:" .. tostring(joinResult)
+    return false, "disabled"
 end
 
 local function ConvertTo(Type, Data)
@@ -1723,12 +1691,11 @@ local function DoMirageBlueGear()
                 return
             end
 
-            if not apiStarted then
+            if not apiStarted and apiReason ~= "mirage_present" then
                 SetStatus(
-                    "Mirage API fallback | "
+                    "Mirage API stopped | "
                     .. tostring(apiReason)
                 )
-                Hop("Mirage API: " .. tostring(apiReason))
             end
         else
             SetStatus("Khong co Mirage (Hop Mirage = false)")
