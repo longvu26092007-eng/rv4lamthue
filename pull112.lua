@@ -18,7 +18,7 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
     ["Fetch Count"]        = 30,
 }
 
--- API hop transplanted: newest-first, no shared blacklist/claim
+-- API hop transplanted + new ItemReplicationService inventory/material detection
 LPH_NO_VIRTUALIZE(function()
 
 local PlayerGui
@@ -325,19 +325,305 @@ local function RefreshPlayerData()
     end
 end
 
-local function RefreshInventory()
-    local ok, list = pcall(function()
-        return CommF_:InvokeServer("getInventory")
+-- ============================================================
+-- INVENTORY / MATERIAL DETECTION - NEW METHOD
+--
+-- Bản cũ dùng:
+--   CommF_:InvokeServer("getInventory")
+--
+-- Sau update cách đó có thể không còn trả đúng Mirror Fractal / material.
+-- Bản này đọc trực tiếp Inventory controller + ItemReplicationService.
+--
+-- ConChoChisiti36.Backpack vẫn giữ cùng format để HasMirrorFractal()
+-- và HasValkyrieHelm() phía dưới không phải đổi logic.
+-- ============================================================
+
+local _setidentity =
+    setthreadidentity
+    or setidentity
+    or set_thread_identity
+    or (syn and syn.set_thread_identity)
+
+local _getidentity =
+    getthreadidentity
+    or getidentity
+    or get_thread_identity
+
+local function RaiseIdentity()
+    if not _setidentity then
+        return nil
+    end
+
+    local prev
+    if _getidentity then
+        local ok, value = pcall(_getidentity)
+        if ok then
+            prev = value
+        end
+    end
+
+    pcall(_setidentity, 8)
+    return prev
+end
+
+local function RestoreIdentity(prev)
+    if not _setidentity then
+        return
+    end
+
+    pcall(_setidentity, prev or 8)
+end
+
+local InvModules = {
+    Inventory = nil,
+    ItemConfig = nil,
+    ItemService = nil,
+    KEYS = nil,
+    Ready = false,
+}
+
+local _invLoadWarned = false
+local _invTilesWarned = false
+
+local function ResolvePath(root, path)
+    local node = root
+
+    for _, name in ipairs(path) do
+        if typeof(node) ~= "Instance" then
+            return nil, name
+        end
+
+        local child = node:FindFirstChild(name)
+        if not child then
+            return nil, name
+        end
+
+        node = child
+    end
+
+    return node
+end
+
+local function LoadInventoryModules()
+    if InvModules.Ready then
+        return true
+    end
+
+    local paths = {
+        Inventory = { "Controllers", "UI", "Inventory" },
+        ItemConfig = { "ItemConfig" },
+        ItemService = { "ItemReplicationService" },
+        KEYS = { "ItemReplicationService", "KEYS" },
+    }
+
+    local nodes = {}
+
+    for key, path in pairs(paths) do
+        local node, missing = ResolvePath(ReplicatedStorage, path)
+
+        if not node then
+            if not _invLoadWarned then
+                _invLoadWarned = true
+                warn(
+                    "[Inventory] Missing ReplicatedStorage."
+                    .. table.concat(path, ".")
+                    .. " | missing="
+                    .. tostring(missing)
+                )
+            end
+
+            return false
+        end
+
+        nodes[key] = node
+    end
+
+    -- Một số executor cần identity khác nhau để require module game.
+    local candidates = _setidentity and { 2, 8, false } or { false }
+    local lastErr
+
+    for _, ident in ipairs(candidates) do
+        local prev = RaiseIdentity()
+
+        if ident and _setidentity then
+            pcall(_setidentity, ident)
+        end
+
+        local ok, err = pcall(function()
+            InvModules.Inventory = require(nodes.Inventory)
+            InvModules.ItemConfig = require(nodes.ItemConfig)
+            InvModules.ItemService = require(nodes.ItemService)
+            InvModules.KEYS = require(nodes.KEYS)
+        end)
+
+        RestoreIdentity(prev)
+
+        if ok
+            and type(InvModules.Inventory) == "table"
+            and type(InvModules.ItemService) == "table"
+        then
+            InvModules.Ready = true
+            return true
+        end
+
+        lastErr = err
+        InvModules.Inventory = nil
+        InvModules.ItemConfig = nil
+        InvModules.ItemService = nil
+        InvModules.KEYS = nil
+    end
+
+    if not _invLoadWarned then
+        _invLoadWarned = true
+        warn("[Inventory] require failed: " .. tostring(lastErr))
+    end
+
+    return false
+end
+
+local function InventoryModulesInitialized()
+    if not InvModules.Ready then
+        return false
+    end
+
+    local ok, ready = pcall(function()
+        return InvModules.Inventory:GetIfInitialized()
+            and InvModules.ItemService.IsInitialized == true
     end)
-    ConChoChisiti36.Backpack = {}
-    if ok and type(list) == "table" then
-        for _, v in list do
-            if type(v) == "table" and v.Name then
-                ConChoChisiti36.Backpack[v.Name] = v
+
+    return ok and ready == true
+end
+
+local function GetItemConfigSafe(itemId)
+    local ItemConfig = InvModules.ItemConfig
+
+    -- Hỗ trợ cả API mới .match(...):unwrap() và API cũ GetItemConfig(...).
+    local ok, cfg = pcall(function()
+        if type(ItemConfig) == "table" and type(ItemConfig.match) == "function" then
+            local result = ItemConfig.match(itemId)
+            if result and type(result.unwrap) == "function" then
+                return result:unwrap()
+            end
+        end
+
+        if type(ItemConfig) == "table" and type(ItemConfig.GetItemConfig) == "function" then
+            return ItemConfig:GetItemConfig(itemId)
+        end
+
+        return nil
+    end)
+
+    if ok then
+        return cfg
+    end
+
+    return nil
+end
+
+local function _RefreshInventoryInner()
+    if not LoadInventoryModules() then
+        return false
+    end
+
+    if not InventoryModulesInitialized() then
+        return false
+    end
+
+    local Inventory = InvModules.Inventory
+    local ItemService = InvModules.ItemService
+    local KEYS = InvModules.KEYS
+
+    -- Quantity được lưu theo ItemId.
+    local amounts = {}
+
+    local okQty, qtyList = pcall(function()
+        return ItemService:GetItems(KEYS.QUANTITY)
+    end)
+
+    if okQty and type(qtyList) == "table" then
+        for _, item in pairs(qtyList) do
+            if type(item) == "table" and item.ItemId then
+                amounts[item.ItemId] =
+                    (amounts[item.ItemId] or 0)
+                    + (tonumber(item.Value) or 0)
             end
         end
     end
+
+    local okTiles, tiles = pcall(function()
+        return Inventory:GetTiles()
+    end)
+
+    if not okTiles or type(tiles) ~= "table" then
+        if not _invTilesWarned then
+            _invTilesWarned = true
+            warn("[Inventory] GetTiles failed: " .. tostring(tiles))
+        end
+
+        return false
+    end
+
+    _invTilesWarned = false
+
+    local backpack = {}
+    local seen = {}
+    local total = 0
+
+    for _, tile in pairs(tiles) do
+        local itemId =
+            type(tile) == "table"
+            and tile.ItemId
+            or nil
+
+        if itemId and not seen[itemId] then
+            seen[itemId] = true
+
+            local config = GetItemConfigSafe(itemId)
+
+            if type(config) == "table" then
+                local display = config.Display or {}
+                local index = config.Index or {}
+
+                local name =
+                    display.Name
+                    or index.StorageKey
+                    or tostring(itemId)
+
+                backpack[tostring(name)] = {
+                    Name = tostring(name),
+                    Count = amounts[itemId] or 1,
+                    Category = display.Category,
+                    Group = config.Group,
+                    ItemId = itemId,
+                }
+
+                total += 1
+            end
+        end
+    end
+
+    -- Không xóa cache cũ nếu inventory đang replicate dở.
+    if total > 0 then
+        ConChoChisiti36.Backpack = backpack
+        return true
+    end
+
+    return false
 end
+
+local function RefreshInventory()
+    local prev = RaiseIdentity()
+    local ok, result = pcall(_RefreshInventoryInner)
+    RestoreIdentity(prev)
+
+    if not ok then
+        warn("[Inventory] RefreshInventory error: " .. tostring(result))
+        return false
+    end
+
+    return result == true
+end
+
 
 CommE.OnClientEvent:Connect(function(...)
     local t = {...}
@@ -1026,11 +1312,22 @@ function GetBlueGear()
     return nil
 end
 
-local function HasMirrorFractal()
-    return ConChoChisiti36.Backpack["Mirror Fractal"] ~= nil
+local function GetInventoryItemCount(name)
+    local item = ConChoChisiti36.Backpack[tostring(name)]
+
+    if type(item) ~= "table" then
+        return 0
+    end
+
+    return math.max(0, tonumber(item.Count) or 1)
 end
+
+local function HasMirrorFractal()
+    return GetInventoryItemCount("Mirror Fractal") > 0
+end
+
 local function HasValkyrieHelm()
-    return ConChoChisiti36.Backpack["Valkyrie Helm"] ~= nil
+    return GetInventoryItemCount("Valkyrie Helm") > 0
 end
 local function IsTempleDoorOpened()
     local ok, v = pcall(function() return CommF_:InvokeServer("CheckTempleDoor") end)
