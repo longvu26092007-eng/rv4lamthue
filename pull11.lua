@@ -15,12 +15,10 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
     ["Mirage API"]         = "https://baorph.pythonanywhere.com/token?token=8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8&api_key=baorapi&key=mirage",
     ["Avoid Full Server"]  = true,
     ["Max Players"]        = 11,
-
-    -- Lay 30 server MOI NHAT, join lan luot tung cai, cach nhau 1.5s
     ["Fetch Count"]        = 30,
 }
 
--- PullLever Mirage API V4.1 - full review + teleport stability + light noclip
+-- API hop transplanted: newest-first, no shared blacklist/claim
 LPH_NO_VIRTUALIZE(function()
 
 local PlayerGui
@@ -35,9 +33,7 @@ local function SetStatus(text)
     print("[PullLever] " .. text)
 
     if _statusLabel then
-        -- Ghi vao CoreGui/gethui co the loi neu thread dang o identity
-        -- thap (sau khi require module game) -> khong de no giet script.
-        pcall(function() _statusLabel.Text = "Status: " .. text end)
+        _statusLabel.Text = "Status: " .. text
     end
 end
 
@@ -127,10 +123,9 @@ Config["Enabled"]           = Config["Enabled"] ~= false
 Config["Team"]              = Config["Team"] or "Pirates"
 Config["Hop Mirage"]        = Config["Hop Mirage"] ~= false
 Config["Use Mirage API"]    = Config["Use Mirage API"] ~= false
-
--- Endpoint thuc te duoc goi bang key=mirage.
--- API envelope hien tai van co the tra data.key == "island"; day la binh thuong.
--- Khong rewrite URL dua theo data.key.
+if tostring(Config["Mirage API"] or "") == "" then
+    Config["Mirage API"] = ""
+end
 Config["Avoid Full Server"] = Config["Avoid Full Server"] ~= false
 Config["Max Players"]       = Config["Max Players"] or 11
 Config["Fetch Count"]       = math.max(1, math.floor(tonumber(Config["Fetch Count"]) or 30))
@@ -158,375 +153,6 @@ local StarterPlayer     = game:GetService("StarterPlayer")
 
 local LocalPlayer = Players.LocalPlayer
 local Character, Humanoid, HumanoidRootPart
-
--- ============================================================
--- SHARED MIRAGE SERVER BLACKLIST
--- 20 client trên cùng máy dùng chung workspace executor.
---
--- Không dùng một file JSON chung cho blacklist/claim.
--- Mỗi JobId có file riêng để tránh 20 client đọc-sửa-ghi đè nhau:
---   mirage_shared/blacklist/<jobId>.txt
---   mirage_shared/join_fail/<jobId>.txt
---   mirage_shared/claim/<jobId>.txt
---
--- TTL khóa cứng trong source:
---   Không có Mirage: 15 phút
---   Join thất bại:     2 phút
---   Claim JobId:       35 giây
--- ============================================================
-local MIRAGE_BLACKLIST_TTL = 15 * 60
-local MIRAGE_JOIN_FAIL_TTL = 2 * 60
-local MIRAGE_CLAIM_TTL = 35
-
-local MIRAGE_SHARED_ROOT = "mirage_shared"
-local MIRAGE_BLACKLIST_DIR = MIRAGE_SHARED_ROOT .. "/blacklist"
-local MIRAGE_JOIN_FAIL_DIR = MIRAGE_SHARED_ROOT .. "/join_fail"
-local MIRAGE_CLAIM_DIR = MIRAGE_SHARED_ROOT .. "/claim"
-
-local MirageFileIOReady =
-    type(writefile) == "function"
-    and type(readfile) == "function"
-    and type(isfile) == "function"
-
-local MirageFolderMode =
-    MirageFileIOReady
-    and type(makefolder) == "function"
-
-local MirageClientToken = table.concat({
-    tostring(LocalPlayer.UserId),
-    tostring(os.time()),
-    tostring(math.random(100000, 999999))
-}, "_")
-
-local function MirageSafeJobId(jobId)
-    return tostring(jobId or ""):gsub("[^%w%-_]", "_")
-end
-
-local function MirageEnsureFolder(path)
-    if not MirageFolderMode then
-        return false
-    end
-
-    local exists = false
-
-    if type(isfolder) == "function" then
-        local ok, result = pcall(isfolder, path)
-        exists = ok and result == true
-    end
-
-    if not exists then
-        pcall(makefolder, path)
-    end
-
-    return true
-end
-
-if MirageFolderMode then
-    MirageEnsureFolder(MIRAGE_SHARED_ROOT)
-    MirageEnsureFolder(MIRAGE_BLACKLIST_DIR)
-    MirageEnsureFolder(MIRAGE_JOIN_FAIL_DIR)
-    MirageEnsureFolder(MIRAGE_CLAIM_DIR)
-end
-
-local function MirageRecordPath(kind, jobId)
-    local safeJobId = MirageSafeJobId(jobId)
-
-    if MirageFolderMode then
-        local folder =
-            kind == "blacklist" and MIRAGE_BLACKLIST_DIR
-            or kind == "join_fail" and MIRAGE_JOIN_FAIL_DIR
-            or MIRAGE_CLAIM_DIR
-
-        return folder .. "/" .. safeJobId .. ".txt"
-    end
-
-    -- Fallback cho executor có file API nhưng không có makefolder.
-    return "mirage_" .. tostring(kind) .. "_" .. safeJobId .. ".txt"
-end
-
-local function MirageDeleteFile(path)
-    if type(delfile) ~= "function" then
-        return
-    end
-
-    pcall(function()
-        if isfile(path) then
-            delfile(path)
-        end
-    end)
-end
-
-local function MirageReadRecord(kind, jobId)
-    if not MirageFileIOReady then
-        return nil, nil, nil
-    end
-
-    local path = MirageRecordPath(kind, jobId)
-
-    local existsOk, exists = pcall(isfile, path)
-    if not existsOk or not exists then
-        return nil, nil, path
-    end
-
-    local ok, body = pcall(readfile, path)
-    if not ok or type(body) ~= "string" then
-        return nil, nil, path
-    end
-
-    local timestamp, owner =
-        body:match("^(%d+)|([^|]*)")
-
-    return tonumber(timestamp), owner, path
-end
-
-local function MirageWriteRecord(kind, jobId, owner, reason)
-    if not MirageFileIOReady then
-        return false
-    end
-
-    local path = MirageRecordPath(kind, jobId)
-    local body = table.concat({
-        tostring(os.time()),
-        tostring(owner or MirageClientToken),
-        tostring(reason or "")
-    }, "|")
-
-    local ok = pcall(writefile, path, body)
-    return ok
-end
-
-local function MirageRecordIsActive(kind, jobId, ttl)
-    local timestamp, owner, path =
-        MirageReadRecord(kind, jobId)
-
-    if not timestamp then
-        return false, nil, 0
-    end
-
-    local age = math.max(0, os.time() - timestamp)
-
-    if age >= ttl then
-        MirageDeleteFile(path)
-        return false, nil, 0
-    end
-
-    return true, owner, ttl - age
-end
-
-local function IsMirageServerBlacklisted(jobId)
-    local active = MirageRecordIsActive(
-        "blacklist",
-        jobId,
-        MIRAGE_BLACKLIST_TTL
-    )
-    return active == true
-end
-
-local function IsMirageJoinFailedRecently(jobId)
-    local active = MirageRecordIsActive(
-        "join_fail",
-        jobId,
-        MIRAGE_JOIN_FAIL_TTL
-    )
-    return active == true
-end
-
-local function IsMirageServerClaimedByOther(jobId)
-    local active, owner = MirageRecordIsActive(
-        "claim",
-        jobId,
-        MIRAGE_CLAIM_TTL
-    )
-
-    return active == true
-        and owner ~= nil
-        and owner ~= MirageClientToken
-end
-
-local function BlacklistMirageServer(jobId, reason)
-    if not jobId or tostring(jobId) == "" then
-        return false
-    end
-
-    local written = MirageWriteRecord(
-        "blacklist",
-        jobId,
-        MirageClientToken,
-        reason or "no_mirage"
-    )
-
-    if written then
-        warn(
-            "[MirageBlacklist] Blacklist 15m: "
-            .. tostring(jobId)
-            .. " | "
-            .. tostring(reason or "no_mirage")
-        )
-    end
-
-    return written
-end
-
-local function MarkMirageJoinFailed(jobId, reason)
-    if not jobId or tostring(jobId) == "" then
-        return false
-    end
-
-    return MirageWriteRecord(
-        "join_fail",
-        jobId,
-        MirageClientToken,
-        reason or "join_failed"
-    )
-end
-
--- ============================================================
--- MIRAGE TELEPORT STATE
--- Không còn coi "session vẫn sống sau 1.5s" là join fail.
--- ============================================================
-local PendingMirageJoinJobId = nil
-local PendingMirageJoinAt = 0
-local PendingMirageTeleportStarted = false
-
--- 6s: remote accepted nhưng Roblox chưa báo teleport started.
--- 20s: Roblox đã báo started nhưng session cũ vẫn chưa rời.
-local MIRAGE_JOIN_PENDING_TIMEOUT = 6
-local MIRAGE_JOIN_STARTED_TIMEOUT = 20
-
-local function ReleaseMirageClaim(jobId)
-    if not MirageFileIOReady then
-        return
-    end
-
-    local _, owner, path =
-        MirageReadRecord("claim", jobId)
-
-    if owner == MirageClientToken and path then
-        MirageDeleteFile(path)
-    end
-end
-
-TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, message)
-    if player ~= LocalPlayer then
-        return
-    end
-
-    local pending = PendingMirageJoinJobId
-    if not pending then
-        return
-    end
-
-    local reason =
-        "TeleportInitFailed:"
-        .. tostring(teleportResult)
-        .. ":"
-        .. tostring(message or "")
-
-    MarkMirageJoinFailed(pending, reason)
-    ReleaseMirageClaim(pending)
-
-    PendingMirageJoinJobId = nil
-    PendingMirageJoinAt = 0
-    PendingMirageTeleportStarted = false
-
-    warn("[MirageAPI] " .. reason .. " | " .. tostring(pending))
-end)
-
--- Nếu Roblox đã thực sự bắt đầu teleport thì không được coi 6s là fail.
--- Một số máy/remote chậm có thể giữ session cũ vài giây sau khi Started.
-pcall(function()
-    LocalPlayer.OnTeleport:Connect(function(state)
-        if not PendingMirageJoinJobId then
-            return
-        end
-
-        local stateText = tostring(state)
-
-        if stateText:find("Started")
-            or stateText:find("Waiting")
-            or stateText:find("InProgress")
-        then
-            PendingMirageTeleportStarted = true
-        elseif stateText:find("Failed") then
-            local pending = PendingMirageJoinJobId
-
-            MarkMirageJoinFailed(
-                pending,
-                "OnTeleportFailed:" .. stateText
-            )
-            ReleaseMirageClaim(pending)
-
-            PendingMirageJoinJobId = nil
-            PendingMirageJoinAt = 0
-            PendingMirageTeleportStarted = false
-        end
-    end)
-end)
-
-local function TryClaimMirageServer(jobId)
-    if not MirageFileIOReady then
-        -- Không có file API thì giữ hành vi cũ.
-        return true
-    end
-
-    if IsMirageServerClaimedByOther(jobId) then
-        return false
-    end
-
-    -- Jitter nhỏ, ổn định theo UserId để 20 client không ghi cùng một lúc.
-    local jitter =
-        0.04
-        + ((tonumber(LocalPlayer.UserId) or 0) % 11) * 0.011
-        + math.random() * 0.05
-
-    task.wait(jitter)
-
-    if IsMirageServerClaimedByOther(jobId) then
-        return false
-    end
-
-    if not MirageWriteRecord(
-        "claim",
-        jobId,
-        MirageClientToken,
-        "joining"
-    ) then
-        return true
-    end
-
-    -- Cho các client cùng tranh JobId có thời gian ghi.
-    task.wait(0.12 + math.random() * 0.06)
-
-    local active, owner = MirageRecordIsActive(
-        "claim",
-        jobId,
-        MIRAGE_CLAIM_TTL
-    )
-
-    return active == true and owner == MirageClientToken
-end
-
-local function CurrentServerConfirmedNoMirage()
-    -- Chỉ blacklist khi Map thực sự đã replicate.
-    -- Nếu Map còn nil thì KHÔNG được kết luận "không có Mirage".
-    local sawMap = false
-
-    for _ = 1, 15 do
-        local map = workspace:FindFirstChild("Map")
-
-        if map then
-            sawMap = true
-
-            if map:FindFirstChild("MysticIsland") then
-                return false
-            end
-        end
-
-        task.wait(0.35)
-    end
-
-    return sawMap
-end
 
 SetStatus("Creating UI...")
 pcall(MakeUI)
@@ -595,92 +221,20 @@ end
 
 ChooseTeamByLargeButton()
 
--- ============================================================
--- CHARACTER BINDER
--- Chống race-condition sau respawn/hop:
--- callback Character cũ không được phép ghi đè Root/Humanoid của Character mới.
--- ============================================================
-local CharacterGeneration = 0
-
-local function BindCharacter(character)
-    CharacterGeneration += 1
-    local generation = CharacterGeneration
-
-    Character = character
-    Humanoid = character and character:FindFirstChildOfClass("Humanoid") or nil
-    HumanoidRootPart = character and character:FindFirstChild("HumanoidRootPart") or nil
-
-    if not character then
-        return
-    end
-
-    task.spawn(function()
-        local deadline = os.clock() + 20
-
-        while os.clock() < deadline
-            and generation == CharacterGeneration
-            and LocalPlayer.Character == character
-        do
-            local hum = character:FindFirstChildOfClass("Humanoid")
-            local root = character:FindFirstChild("HumanoidRootPart")
-
-            if hum and root then
-                if generation == CharacterGeneration
-                    and LocalPlayer.Character == character
-                then
-                    Character = character
-                    Humanoid = hum
-                    HumanoidRootPart = root
-                end
-                return
-            end
-
-            task.wait(0.1)
-        end
-    end)
-end
-
 local function RefreshCharacter()
-    local current = LocalPlayer.Character
-
-    if current ~= Character then
-        BindCharacter(current)
-    elseif current then
-        Humanoid = current:FindFirstChildOfClass("Humanoid")
-        HumanoidRootPart = current:FindFirstChild("HumanoidRootPart")
-    end
-
-    return Character, Humanoid, HumanoidRootPart
+    Character        = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    Humanoid         = Character:WaitForChild("Humanoid")
+    HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
 end
 
 SetStatus("Waiting character...")
-while true do
-    RefreshCharacter()
-
-    if Character
-        and Character.Parent
-        and Humanoid
-        and HumanoidRootPart
-        and Humanoid.Health > 0
-    then
-        break
-    end
-
-    task.wait(0.15)
-end
+repeat
+    task.wait(0.5)
+until LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
 SetStatus("Character ready")
-
-LocalPlayer.CharacterAdded:Connect(function(character)
-    BindCharacter(character)
-end)
-
-LocalPlayer.CharacterRemoving:Connect(function(character)
-    if Character == character then
-        CharacterGeneration += 1
-        Character = nil
-        Humanoid = nil
-        HumanoidRootPart = nil
-    end
+RefreshCharacter()
+LocalPlayer.CharacterAdded:Connect(function()
+    task.spawn(RefreshCharacter)
 end)
 
 SetStatus("Waiting Data/Race...")
@@ -771,219 +325,17 @@ local function RefreshPlayerData()
     end
 end
 
--- ============================================================
--- THREAD IDENTITY
--- require(...) module cua game se ha identity cua thread hien tai
--- xuong muc script game -> sau do ghi vao CoreGui/gethui bi loi
--- "cannot access 'Instance' (lacking capability Plugin)".
--- Boc lai de luon tra identity ve muc cao sau khi require.
--- ============================================================
-local _setidentity = setthreadidentity or setidentity or set_thread_identity
-    or (syn and syn.set_thread_identity)
-local _getidentity = getthreadidentity or getidentity or get_thread_identity
-    or (syn and syn.get_thread_identity)
-
-local function RaiseIdentity()
-    if not _setidentity then return nil end
-    local prev
-    if _getidentity then
-        local ok, v = pcall(_getidentity)
-        if ok then prev = v end
-    end
-    pcall(_setidentity, 8)
-    return prev
-end
-
-local function RestoreIdentity(prev)
-    if not _setidentity then return end
-    pcall(_setidentity, prev or 8)
-end
-
--- ============================================================
--- INVENTORY (update moi): doc qua ItemReplicationService +
--- Inventory controller + ItemConfig thay cho CommF_ getInventory
--- (getInventory khong con tra Mirror Fractal sau update).
---   Backpack[<Display.Name>] = { Name=, Count=, Category=, ItemId= }
--- ============================================================
-local InvModules = {
-    Inventory   = nil,
-    ItemConfig  = nil,
-    ItemService = nil,
-    KEYS        = nil,
-    Ready       = false,
-}
-
--- Tim node theo duong dan, khong index truc tiep de loi bao ro rang
--- thay vi treo hoac "attempt to index nil".
-local function ResolvePath(root, path)
-    local node = root
-    for _, name in ipairs(path) do
-        if typeof(node) ~= "Instance" then return nil, name end
-        local child = node:FindFirstChild(name)
-        if not child then return nil, name end
-        node = child
-    end
-    return node
-end
-
-local _invLoadWarned = false
-local _invTilesWarned = false
-
-local function LoadInventoryModules()
-    if InvModules.Ready then return true end
-
-    local paths = {
-        Inventory   = { "Controllers", "UI", "Inventory" },
-        ItemConfig  = { "ItemConfig" },
-        ItemService = { "ItemReplicationService" },
-        KEYS        = { "ItemReplicationService", "KEYS" },
-    }
-
-    local nodes = {}
-    for key, path in pairs(paths) do
-        local node, missing = ResolvePath(ReplicatedStorage, path)
-        if not node then
-            if not _invLoadWarned then
-                _invLoadWarned = true
-                warn("[Inventory] Khong tim thay ReplicatedStorage."
-                    .. table.concat(path, ".")
-                    .. " (thieu '" .. tostring(missing) .. "')")
-            end
-            return false
-        end
-        nodes[key] = node
-    end
-
-    -- require module cua game co the doi identity khac nhau tuy
-    -- executor. Thu lan luot 2 (script game) -> 8 -> giu nguyen.
-    -- Dung `false` lam sentinel "khong doi identity": neu de nil trong
-    -- table constructor thi ipairs se cat mat phan tu do.
-    local candidates = _setidentity and {2, 8, false} or {false}
-    local lastErr
-
-    for _, ident in ipairs(candidates) do
-        local prev = RaiseIdentity()
-        if ident and _setidentity then pcall(_setidentity, ident) end
-        local ok, err = pcall(function()
-            InvModules.Inventory   = require(nodes.Inventory)
-            InvModules.ItemConfig  = require(nodes.ItemConfig)
-            InvModules.ItemService = require(nodes.ItemService)
-            InvModules.KEYS        = require(nodes.KEYS)
-        end)
-
-        RestoreIdentity(prev)
-
-        if ok and type(InvModules.Inventory) == "table"
-            and type(InvModules.ItemService) == "table" then
-            InvModules.Ready = true
-            return true
-        end
-
-        lastErr = err
-        InvModules.Inventory, InvModules.ItemConfig = nil, nil
-        InvModules.ItemService, InvModules.KEYS = nil, nil
-    end
-
-    if not _invLoadWarned then
-        _invLoadWarned = true
-        warn("[Inventory] require that bai: " .. tostring(lastErr))
-    end
-    return false
-end
-
-local function InventoryModulesInitialized()
-    if not InvModules.Ready then return false end
-    local ok, res = pcall(function()
-        return InvModules.Inventory:GetIfInitialized()
-            and InvModules.ItemService.IsInitialized == true
-    end)
-    return ok and res == true
-end
-
-local function _RefreshInventoryInner()
-    -- LoadInventoryModules da tu warn mot lan roi, khong warn lai o day
-    -- vi main loop goi moi 1s -> spam console.
-    if not LoadInventoryModules() then
-        return
-    end
-
-    if not InventoryModulesInitialized() then
-        return
-    end
-
-    local Inventory   = InvModules.Inventory
-    local ItemConfig  = InvModules.ItemConfig
-    local ItemService  = InvModules.ItemService
-    local KEYS        = InvModules.KEYS
-
-    -- So luong theo ItemId
-    local amounts = {}
-    local okQty, qtyList = pcall(function()
-        return ItemService:GetItems(KEYS.QUANTITY)
-    end)
-    if okQty and type(qtyList) == "table" then
-        for _, item in pairs(qtyList) do
-            if type(item) == "table" and item.ItemId then
-                amounts[item.ItemId] = (amounts[item.ItemId] or 0)
-                    + (tonumber(item.Value) or 0)
-            end
-        end
-    end
-
-    local okTiles, tiles = pcall(function() return Inventory:GetTiles() end)
-    if not okTiles or type(tiles) ~= "table" then
-        -- Chi warn mot lan: main loop goi moi 1s.
-        if not _invTilesWarned then
-            _invTilesWarned = true
-            warn("[Inventory] GetTiles that bai: " .. tostring(tiles))
-        end
-        return
-    end
-    _invTilesWarned = false
-
-    local backpack, seen, total = {}, {}, 0
-
-    for _, tile in pairs(tiles) do
-        local id = type(tile) == "table" and tile.ItemId or nil
-
-        if id and not seen[id] then
-            seen[id] = true
-
-            local okCfg, config = pcall(function()
-                return ItemConfig.match(id):unwrap()
-            end)
-
-            if okCfg and type(config) == "table" and config.Display then
-                local name = config.Display.Name
-                    or (config.Index and config.Index.StorageKey)
-                    or tostring(id)
-
-                backpack[tostring(name)] = {
-                    Name     = tostring(name),
-                    Count    = amounts[id] or 1,
-                    Category = config.Display.Category,
-                    ItemId   = id,
-                }
-                total = total + 1
-            end
-        end
-    end
-
-    -- Chi ghi de khi doc duoc it nhat 1 item, tranh xoa trang cache
-    -- khi inventory chua replicate xong.
-    if total > 0 then
-        ConChoChisiti36.Backpack = backpack
-    end
-end
-
--- Goi vao module cua game co the ha identity giua duong. Luon tra
--- identity ve muc cao sau khi doc xong, ke ca khi loi.
 local function RefreshInventory()
-    local prev = RaiseIdentity()
-    local ok, err = pcall(_RefreshInventoryInner)
-    RestoreIdentity(prev)
-    if not ok then
-        warn("[Inventory] RefreshInventory loi: " .. tostring(err))
+    local ok, list = pcall(function()
+        return CommF_:InvokeServer("getInventory")
+    end)
+    ConChoChisiti36.Backpack = {}
+    if ok and type(list) == "table" then
+        for _, v in list do
+            if type(v) == "table" and v.Name then
+                ConChoChisiti36.Backpack[v.Name] = v
+            end
+        end
     end
 end
 
@@ -1003,87 +355,34 @@ local function IfTableHaveIndex(t)
 end
 
 local CachedServers, LastServersDataPulled
-
 local function GetServers()
-    if LastServersDataPulled
-        and CachedServers
-        and os.time() - LastServersDataPulled < 15
-    then
+    if LastServersDataPulled and os.time() - LastServersDataPulled < 60 then
         return CachedServers
     end
-
-    local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
-    if not browser then
-        warn("[ServerBrowser] __ServerBrowser missing")
-        return nil
-    end
-
     for i = 1, 100 do
-        local ok, data = pcall(function()
-            return browser:InvokeServer(i)
-        end)
-
-        if ok and IfTableHaveIndex(data) then
+        local data = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+            and ReplicatedStorage.__ServerBrowser:InvokeServer(i)
+        if IfTableHaveIndex(data) then
             CachedServers = data
             LastServersDataPulled = os.time()
             return data
         end
-
-        task.wait()
     end
-
-    return nil
 end
 
 local function Hop(Reason)
-    print("[PullLever] Fallback Hop: " .. tostring(Reason))
-
+    print("[PullLever] Hop: " .. tostring(Reason))
     local Servers = GetServers()
-    if not Servers then
-        SetStatus("Fallback ServerBrowser empty")
-        return false
-    end
-
-    local maxPlayers = tonumber(Config["Max Players"] or 11) or 11
-    local avoidFull = Config["Avoid Full Server"] ~= false
+    if not Servers then return end
     local List = {}
-
     for JobId, v in Servers do
-        local players = tonumber(v and v.Count) or 0
-        local notSame = tostring(JobId) ~= tostring(game.JobId)
-        local notFull = (not avoidFull) or players <= maxPlayers
-
-        if notSame and notFull then
-            table.insert(List, {
-                JobId = JobId,
-                Players = players,
-                Region = v and v.Region,
-            })
-        end
+        table.insert(List, { JobId = JobId, Players = v.Count, Region = v.Region })
     end
-
-    if #List == 0 then
-        SetStatus("Fallback no usable server")
-        return false
-    end
-
+    if #List == 0 then return end
     local data = List[math.random(1, #List)]
-    local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
-
-    if not browser then
-        return false
-    end
-
-    local ok, err = pcall(function()
-        browser:InvokeServer("teleport", data.JobId)
+    pcall(function()
+        ReplicatedStorage:FindFirstChild("__ServerBrowser"):InvokeServer("teleport", data.JobId)
     end)
-
-    if not ok then
-        warn("[ServerBrowser] Fallback teleport failed: " .. tostring(err))
-        return false
-    end
-
-    return true
 end
 
 local JoinJobIdByServerBrowser
@@ -1121,29 +420,35 @@ local function JsonDecodeSafe(body)
 end
 
 -- ============================================================
--- MIRAGE API (baorph): query key=mirage, envelope key=island
+-- MIRAGE API - FIXED VERSION
 --
--- Vi du:
+-- Query:
+--   ...&key=mirage
+--
+-- Payload hien tai:
 -- {
---   "api_url": "https://baorph.pythonanywhere.com/token",
---   "count": 29,
---   "items": [
---     "job id: <GUID>; type: mirage; player: 4; placeid: 100117331123089",
+--   count = N,
+--   items = {
+--     "job id: ...; type: mirage; player: 4; placeid: ...",
 --     ...
---   ],
---   "key": "island",
---   "ok": true
+--   },
+--   key = "island",
+--   ok = true
 -- }
 --
--- QUAN TRONG:
--- API sap xep DU LIEU CU O TREN, MOI O DUOI.
--- Vi vay ExtractServerList() doc items TU CUOI LEN DAU.
--- list[1] = server moi nhat.
+-- Luu y:
+--   URL key=mirage nhung response envelope key=island la BINH THUONG.
+--   API: tren = cu, duoi = moi -> doc TU CUOI LEN DAU.
 --
--- Query URL dung key=mirage, nhung payload co the tron nhieu type:
---   mirage / mysticisland / prehistoricisland
--- Nen loc CHINH XAC Type == "mirage" trong items.
+-- Ban nay CO Y KHONG co:
+--   - shared blacklist file
+--   - join_fail file
+--   - claim file
+--
+-- Chi giu JoinedMirageJobs trong RAM cua rieng client de tranh lap JobId
+-- trong cung mot session.
 -- ============================================================
+
 local function NormalizeServerEntry(v)
     if type(v) == "string" then
         local jobId = v:match("[Jj][Oo][Bb]%s*[Ii][Dd]%s*:%s*([%x%-]+)")
@@ -1168,7 +473,7 @@ local function NormalizeServerEntry(v)
         }
     end
 
-    -- Fallback object schema cu.
+    -- Backward-compatible object schema.
     if type(v) ~= "table" then
         return nil
     end
@@ -1187,8 +492,9 @@ local function NormalizeServerEntry(v)
     return {
         JobId = tostring(jobId),
         PlaceId = tonumber(v.place_id or v.placeid or v.PlaceId),
-        Players = tonumber(v.players or v.player or v.Players) or 0,
+        Players = tonumber(v.players or v.player or v.Players or v.Count) or 0,
         Type = tostring(v.type or v.Type or v.server_type or ""),
+        Region = v.Region or v.region,
         Raw = v,
     }
 end
@@ -1211,16 +517,15 @@ local function ExtractServerList(data)
     end
 
     -- API: tren = cu, duoi = moi.
-    -- Doc nguoc de uu tien server moi nhat.
+    -- Reverse => list[1] la Mirage moi nhat.
     for i = #source, 1, -1 do
         local one = NormalizeServerEntry(source[i])
 
         if one then
             local tp = tostring(one.Type or ""):lower()
 
-            -- Payload key=mirage van co the chua mysticisland/prehistoricisland.
-            -- Schema string hien tai: CHI lay type=mirage.
-            -- Schema object cu khong co Type: van cho phep de backward-compatible.
+            -- String schema hien tai co nhieu island type.
+            -- CHI lay exact type=mirage.
             if type(one.Raw) == "string" then
                 if tp == "mirage" then
                     list[#list + 1] = one
@@ -1238,20 +543,22 @@ local LastMirageApiFetch = 0
 local CachedMirageServers = nil
 local CachedMiragePlaceId = nil
 
-local function GetMirageServersFromAPI()
+local function GetMirageServersFromAPI(forceRefresh)
     local cfg = getgenv().PullLeverConfig or {}
     local url = tostring(cfg["Mirage API"] or "")
 
     if url == "" then
-        warn("[MirageAPI] Mirage API url rong -> bo qua")
+        warn("[MirageAPI] API url rong")
         return {}, "url_empty"
     end
 
     local currentPlaceId = tonumber(game.PlaceId)
 
-    if CachedMirageServers
+    if not forceRefresh
+        and CachedMirageServers
         and CachedMiragePlaceId == currentPlaceId
-        and os.time() - LastMirageApiFetch < 20 then
+        and os.time() - LastMirageApiFetch < 20
+    then
         return CachedMirageServers, "cache"
     end
 
@@ -1261,7 +568,7 @@ local function GetMirageServersFromAPI()
         Url = url,
         Method = "GET",
         Headers = {
-            ["Accept"]     = "application/json",
+            ["Accept"] = "application/json",
             ["User-Agent"] = "Roblox/WinInet",
         },
     })
@@ -1274,7 +581,12 @@ local function GetMirageServersFromAPI()
     local statusCode = tonumber(res.StatusCode or res.status_code or res.Status or 0)
     local body = res.Body or res.body or ""
 
-    print("[MirageAPI] Status=" .. tostring(statusCode) .. " BodyLen=" .. tostring(#body))
+    print(
+        "[MirageAPI] Status="
+        .. tostring(statusCode)
+        .. " BodyLen="
+        .. tostring(#body)
+    )
 
     if statusCode ~= 0 and (statusCode < 200 or statusCode >= 300) then
         warn("[MirageAPI] Bad status: " .. tostring(statusCode))
@@ -1283,15 +595,16 @@ local function GetMirageServersFromAPI()
 
     local data = JsonDecodeSafe(body)
     if not data then
-        warn("[MirageAPI] JSON decode failed. Body head: " .. tostring(body):sub(1, 300))
+        warn(
+            "[MirageAPI] JSON decode failed. Body head: "
+            .. tostring(body):sub(1, 300)
+        )
         return {}, "json_decode_failed"
     end
 
-    -- Luu y: URL query dang la key=mirage, nhung API envelope hien tai
-    -- tra data.key = "island". Khong dung data.key de suy ra query selector.
-    local responseKey = tostring(data.key or "")
-    if responseKey ~= "" then
-        print("[MirageAPI] Response envelope key=" .. responseKey)
+    -- Query key=mirage nhung envelope key=island -> khong xem la loi.
+    if data.key ~= nil then
+        print("[MirageAPI] Response envelope key=" .. tostring(data.key))
     end
 
     local servers = ExtractServerList(data)
@@ -1300,13 +613,17 @@ local function GetMirageServersFromAPI()
         LastMirageApiFetch = os.time()
         CachedMiragePlaceId = currentPlaceId
         CachedMirageServers = servers
+    else
+        CachedMirageServers = nil
+        CachedMiragePlaceId = nil
     end
 
     print(
-        "[MirageAPI] Parsed " .. tostring(#servers)
-        .. " server(s) | key=" .. tostring(data.key)
-        .. " | bottom->top | newest first"
+        "[MirageAPI] Parsed "
+        .. tostring(#servers)
+        .. " Mirage server(s) | bottom->top | newest first"
     )
+
     SetStatus("Mirage API servers: " .. tostring(#servers))
 
     if #servers <= 0 then
@@ -1315,6 +632,19 @@ local function GetMirageServersFromAPI()
 
     return servers, "ok"
 end
+
+-- ============================================================
+-- LOCAL-ONLY VISITED / TELEPORT STATE
+-- KHONG ghi file, KHONG shared blacklist, KHONG shared claim.
+-- ============================================================
+local JoinedMirageJobs = {}
+
+local PendingMirageJoinJobId = nil
+local PendingMirageJoinAt = 0
+local PendingMirageTeleportStarted = false
+
+local MIRAGE_JOIN_PENDING_TIMEOUT = 6
+local MIRAGE_JOIN_STARTED_TIMEOUT = 20
 
 JoinJobIdByServerBrowser = function(jobId)
     if not jobId or tostring(jobId) == "" then
@@ -1350,11 +680,74 @@ JoinJobIdByServerBrowser = function(jobId)
         return false, tostring(result)
     end
 
+    print(
+        "[ServerBrowser] Sent Mirage teleport | JobId="
+        .. jobId
+        .. " | Result="
+        .. tostring(result)
+    )
+
     return true, result
 end
 
--- Lay toi 30 server Mirage moi nhat theo thu tu API TU DUOI LEN TREN.
--- Moi thoi diem chi co 1 teleport pending; khong spam nhieu JobId lien tiep.
+TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, message)
+    if player ~= LocalPlayer then
+        return
+    end
+
+    local pending = PendingMirageJoinJobId
+    if not pending then
+        return
+    end
+
+    -- Local-only visited: skip lai JobId nay trong session hien tai.
+    JoinedMirageJobs[pending] = true
+
+    PendingMirageJoinJobId = nil
+    PendingMirageJoinAt = 0
+    PendingMirageTeleportStarted = false
+
+    CachedMirageServers = nil
+    LastMirageApiFetch = 0
+
+    warn(
+        "[MirageAPI] TeleportInitFailed "
+        .. tostring(teleportResult)
+        .. " | "
+        .. tostring(message or "")
+        .. " | JobId="
+        .. tostring(pending)
+    )
+end)
+
+pcall(function()
+    LocalPlayer.OnTeleport:Connect(function(state)
+        if not PendingMirageJoinJobId then
+            return
+        end
+
+        local stateText = tostring(state)
+
+        if stateText:find("Started")
+            or stateText:find("Waiting")
+            or stateText:find("InProgress")
+        then
+            PendingMirageTeleportStarted = true
+
+        elseif stateText:find("Failed") then
+            local pending = PendingMirageJoinJobId
+            JoinedMirageJobs[pending] = true
+
+            PendingMirageJoinJobId = nil
+            PendingMirageJoinAt = 0
+            PendingMirageTeleportStarted = false
+
+            CachedMirageServers = nil
+            LastMirageApiFetch = 0
+        end
+    end)
+end)
+
 local function HopMirageByAPI()
     local cfg = getgenv().PullLeverConfig or {}
 
@@ -1362,7 +755,7 @@ local function HopMirageByAPI()
         return false, "disabled"
     end
 
-    -- Một teleport đang pending: không spam candidate khác.
+    -- Khong spam JobId moi neu teleport cu van dang pending.
     if PendingMirageJoinJobId then
         local elapsed = os.clock() - PendingMirageJoinAt
         local timeout =
@@ -1382,14 +775,9 @@ local function HopMirageByAPI()
             return true, "teleport_pending"
         end
 
+        -- Timeout local-only: bo JobId nay trong session nay, khong ghi blacklist.
         local stale = PendingMirageJoinJobId
-        local reason =
-            PendingMirageTeleportStarted
-            and "teleport_started_but_stuck_20s"
-            or "no_teleport_after_6s"
-
-        MarkMirageJoinFailed(stale, reason)
-        ReleaseMirageClaim(stale)
+        JoinedMirageJobs[stale] = true
 
         PendingMirageJoinJobId = nil
         PendingMirageJoinAt = 0
@@ -1397,18 +785,28 @@ local function HopMirageByAPI()
 
         CachedMirageServers = nil
         LastMirageApiFetch = 0
+
+        warn(
+            "[MirageAPI] Pending timeout | JobId="
+            .. tostring(stale)
+        )
     end
 
-    local servers, fetchReason = GetMirageServersFromAPI()
+    local servers, fetchReason = GetMirageServersFromAPI(false)
+
     if type(servers) ~= "table" or #servers <= 0 then
         SetStatus("Mirage API empty | " .. tostring(fetchReason))
         return false, fetchReason or "api_empty"
     end
 
     local currentPlaceId = tonumber(game.PlaceId)
-    local maxPlayers     = tonumber(cfg["Max Players"] or 11) or 11
-    local avoidFull      = cfg["Avoid Full Server"] ~= false
-    local fetchCount     = math.max(1, math.floor(tonumber(cfg["Fetch Count"]) or 30))
+    local maxPlayers = tonumber(cfg["Max Players"] or 11) or 11
+    local avoidFull = cfg["Avoid Full Server"] ~= false
+    local fetchCount =
+        math.max(
+            1,
+            math.floor(tonumber(cfg["Fetch Count"]) or 30)
+        )
 
     local candidates = {}
     local stats = {
@@ -1417,38 +815,31 @@ local function HopMirageByAPI()
         wrongPlace = 0,
         sameJob = 0,
         full = 0,
-        blacklist = 0,
-        joinFail = 0,
-        claimed = 0,
+        visited = 0,
         usable = 0,
     }
 
-    -- servers đã reverse:
-    -- index 1 = item DƯỚI CÙNG API = MỚI NHẤT.
+    -- servers da newest-first do ExtractServerList reverse.
     for _, server in ipairs(servers) do
+        local jobId = tostring(server.JobId or "")
         local placeId = tonumber(server.PlaceId)
         local players = tonumber(server.Players) or 0
 
-        local samePlace  = (placeId == nil) or (placeId == currentPlaceId)
-        local notSameJob = tostring(server.JobId) ~= tostring(game.JobId)
-        local notFull    = (not avoidFull) or players <= maxPlayers
-        local blacklisted = IsMirageServerBlacklisted(server.JobId)
-        local joinFailed  = IsMirageJoinFailedRecently(server.JobId)
-        local claimed     = IsMirageServerClaimedByOther(server.JobId)
+        -- placeId nil van cho phep: __ServerBrowser teleport JobId trong place hien tai.
+        local samePlace = (placeId == nil) or (placeId == currentPlaceId)
+        local notSameJob = jobId ~= "" and jobId ~= tostring(game.JobId)
+        local notVisited = not JoinedMirageJobs[jobId]
+        local notFull = (not avoidFull) or players <= maxPlayers
 
         if samePlace then stats.samePlace += 1 else stats.wrongPlace += 1 end
         if not notSameJob then stats.sameJob += 1 end
         if not notFull then stats.full += 1 end
-        if blacklisted then stats.blacklist += 1 end
-        if joinFailed then stats.joinFail += 1 end
-        if claimed then stats.claimed += 1 end
+        if not notVisited then stats.visited += 1 end
 
         if samePlace
             and notSameJob
+            and notVisited
             and notFull
-            and not blacklisted
-            and not joinFailed
-            and not claimed
         then
             candidates[#candidates + 1] = server
             stats.usable += 1
@@ -1465,89 +856,60 @@ local function HopMirageByAPI()
         .. " samePlace=" .. tostring(stats.samePlace)
         .. " usable=" .. tostring(stats.usable)
         .. " full=" .. tostring(stats.full)
-        .. " blacklist=" .. tostring(stats.blacklist)
-        .. " joinFail=" .. tostring(stats.joinFail)
-        .. " claimed=" .. tostring(stats.claimed)
+        .. " visited=" .. tostring(stats.visited)
         .. " wrongPlace=" .. tostring(stats.wrongPlace)
     )
 
     if #candidates == 0 then
-        -- Không giữ cache nếu toàn bộ record hiện tại đã stale/claim/fail.
+        -- Refresh de lay cac item moi o cuoi API.
         CachedMirageServers = nil
         LastMirageApiFetch = 0
 
-        local reason =
-            "usable=0"
-            .. " full=" .. tostring(stats.full)
-            .. " black=" .. tostring(stats.blacklist)
-            .. " fail=" .. tostring(stats.joinFail)
-            .. " claim=" .. tostring(stats.claimed)
+        SetStatus(
+            "Mirage API no usable"
+            .. " | full=" .. tostring(stats.full)
+            .. " visited=" .. tostring(stats.visited)
             .. " place=" .. tostring(stats.wrongPlace)
+        )
 
-        SetStatus("Mirage API filtered empty | " .. reason)
         return false, "filtered_empty"
     end
 
+    -- QUAN TRONG: candidates dang theo thu tu MOI -> CU.
+    -- Khong random nua.
+    local server = candidates[1]
+    local jobId = tostring(server.JobId)
+
     SetStatus(
-        "Mirage API: " .. tostring(#candidates)
-        .. " server | bottom->top | moi->cu"
+        "Join newest Mirage"
+        .. " | Players=" .. tostring(server.Players)
+        .. " | "
+        .. jobId:sub(1, 8)
     )
 
-    -- CHỈ thử 1 candidate mỗi vòng.
-    -- Nếu InvokeServer accepted, chờ teleport/failure event thay vì spam tiếp.
-    for i, server in ipairs(candidates) do
-        local jobId = tostring(server.JobId)
+    print(
+        "[MirageAPI] Pick newest"
+        .. " JobId=" .. jobId
+        .. " PlaceId=" .. tostring(server.PlaceId)
+        .. " Players=" .. tostring(server.Players)
+        .. " Type=" .. tostring(server.Type or "?")
+        .. " Candidates=" .. tostring(#candidates)
+    )
 
-        if IsMirageServerBlacklisted(jobId)
-            or IsMirageJoinFailedRecently(jobId)
-        then
-            continue
-        end
+    local joinStarted, joinResult =
+        JoinJobIdByServerBrowser(jobId)
 
-        if not TryClaimMirageServer(jobId) then
-            continue
-        end
-
-        SetStatus(
-            "Join Mirage "
-            .. tostring(i)
-            .. "/"
-            .. tostring(#candidates)
-            .. " | Players="
-            .. tostring(server.Players)
-            .. " | "
-            .. jobId:sub(1, 8)
-        )
-
-        print(
-            "[MirageAPI] Join"
-            .. " JobId=" .. jobId
-            .. " PlaceId=" .. tostring(server.PlaceId)
-            .. " Players=" .. tostring(server.Players)
-            .. " Type=" .. tostring(server.Type or "?")
-        )
-
-        local joinStarted, joinResult = JoinJobIdByServerBrowser(jobId)
-
-        if joinStarted then
-            -- QUAN TRỌNG:
-            -- Không MarkMirageJoinFailed ở đây.
-            -- Giữ claim trong lúc teleport pending; event/timeout sẽ xử lý nếu fail.
-            return true, "teleport_started"
-        end
-
-        MarkMirageJoinFailed(
-            jobId,
-            "invoke_failed:" .. tostring(joinResult)
-        )
-        ReleaseMirageClaim(jobId)
+    if joinStarted then
+        -- Khong mark visited ngay.
+        -- Chi mark neu teleport fail/timeout; neu teleport thanh cong script roi session.
+        return true, "teleport_started"
     end
 
+    JoinedMirageJobs[jobId] = true
     CachedMirageServers = nil
     LastMirageApiFetch = 0
 
-    SetStatus("Mirage candidates exhausted -> refresh")
-    return false, "attempts_exhausted"
+    return false, "invoke_failed:" .. tostring(joinResult)
 end
 
 local function ConvertTo(Type, Data)
@@ -1558,49 +920,24 @@ local function ConvertTo(Type, Data)
 end
 
 local function CaculateDistance(Origin, Destination)
-    RefreshCharacter()
-
-    if not HumanoidRootPart or not HumanoidRootPart.Parent then
-        return math.huge
-    end
-
     Origin = Origin or HumanoidRootPart.CFrame
     Destination = Destination or HumanoidRootPart.CFrame
-
-    local a =
-        typeof(Origin) == "CFrame" and Origin.Position
-        or (typeof(Origin) == "Vector3" and Origin or ConvertTo(Vector3, Origin))
-
-    local b =
-        typeof(Destination) == "CFrame" and Destination.Position
-        or (typeof(Destination) == "Vector3" and Destination or ConvertTo(Vector3, Destination))
-
+    local a = typeof(Origin)    == "CFrame" and Origin.Position    or (typeof(Origin)    == "Vector3" and Origin    or ConvertTo(Vector3, Origin))
+    local b = typeof(Destination) == "CFrame" and Destination.Position or (typeof(Destination) == "Vector3" and Destination or ConvertTo(Vector3, Destination))
     return (a - b).Magnitude
 end
 
 local TweenConn, TweenInstance, TweenGhost, IsTweening = nil, nil, nil, false
-
--- Không quét GetDescendants mỗi frame nữa.
--- Với nhiều client, Stepped + GetDescendants gây CPU thừa rất lớn.
-local function ApplyNoclip()
-    local char = LocalPlayer.Character
-    if not char then return end
-
-    for _, c in char:GetDescendants() do
-        if c:IsA("BasePart")
-            and c.CanCollide
-            and c.Name ~= "HumanoidRootPart"
-        then
-            c.CanCollide = false
+local function NoclipLoop()
+    if LocalPlayer.Character then
+        for _, c in LocalPlayer.Character:GetDescendants() do
+            if c:IsA("BasePart") and c.CanCollide and c.Name ~= "HumanoidRootPart" then
+                c.CanCollide = false
+            end
         end
     end
 end
-
-task.spawn(function()
-    while task.wait(0.25) do
-        pcall(ApplyNoclip)
-    end
-end)
+RunService.Stepped:Connect(NoclipLoop)
 
 local function StopTween()
     if TweenInstance then pcall(function() TweenInstance:Cancel() end) TweenInstance = nil end
@@ -1610,7 +947,6 @@ local function StopTween()
 end
 
 function TweenTo(Position)
-    RefreshCharacter()
 
     if not Character or not Character:FindFirstChild("Humanoid")
         or Character.Humanoid.Health <= 0 or not HumanoidRootPart then
@@ -1730,17 +1066,10 @@ end
 local function DoMirageBlueGear()
     local mirage = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("MysticIsland")
     if not mirage then
-        if CurrentServerConfirmedNoMirage() then
-            BlacklistMirageServer(
-                game.JobId,
-                "joined_server_without_mirage"
-            )
-        end
-
         if Config["Hop Mirage"] then
             SetStatus("Khong co Mirage -> Hop Mirage API")
-            local hopped, apiReason = HopMirageByAPI()
-            if not hopped then
+            local apiStarted, apiReason = HopMirageByAPI()
+            if not apiStarted then
                 SetStatus("Mirage API fallback | " .. tostring(apiReason))
                 Hop("Mirage API: " .. tostring(apiReason))
             end
@@ -1777,8 +1106,8 @@ local function DoMirageBlueGear()
     else
         SetStatus("Sai gio trong ngay -> Hop Mirage API")
         if Config["Hop Mirage"] then
-            local hopped, apiReason = HopMirageByAPI()
-            if not hopped then
+            local apiStarted, apiReason = HopMirageByAPI()
+            if not apiStarted then
                 SetStatus("Mirage API fallback | " .. tostring(apiReason))
                 Hop("Mirage API: " .. tostring(apiReason))
             end
@@ -1809,7 +1138,7 @@ pcall(MakeUI)
 
 local _lastUiRefresh = 0
 
-local function _UIUpdateTickInner()
+local function UIUpdateTick()
     local now = os.time()
     if now - _lastUiRefresh < 1 then return end
     _lastUiRefresh = now
@@ -1837,18 +1166,6 @@ local function _UIUpdateTickInner()
     _doorLabel.Text    = "Temple Door: "     .. (ok and tostring(door) or "?")
     local ok2, prog = pcall(function() return CommF_:InvokeServer("RaceV4Progress", "Check") end)
     _progressLabel.Text = "RaceV4 Check: "   .. (ok2 and tostring(prog) or "?")
-end
-
--- Ghi vao label o CoreGui/gethui can identity cao. Neu mot require
--- truoc do da ha identity thi day la cho no no ra loi, nen luon
--- raise identity + pcall: UI loi khong duoc lam chet main loop.
-local function UIUpdateTick()
-    local prev = RaiseIdentity()
-    local ok, err = pcall(_UIUpdateTickInner)
-    RestoreIdentity(prev)
-    if not ok then
-        warn("[UI] UIUpdateTick loi: " .. tostring(err))
-    end
 end
 
 while task.wait(1) do
