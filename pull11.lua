@@ -127,9 +127,10 @@ Config["Enabled"]           = Config["Enabled"] ~= false
 Config["Team"]              = Config["Team"] or "Pirates"
 Config["Hop Mirage"]        = Config["Hop Mirage"] ~= false
 Config["Use Mirage API"]    = Config["Use Mirage API"] ~= false
-if tostring(Config["Mirage API"] or "") == "" then
-    Config["Mirage API"] = ""
-end
+
+-- Endpoint thuc te duoc goi bang key=mirage.
+-- API envelope hien tai van co the tra data.key == "island"; day la binh thuong.
+-- Khong rewrite URL dua theo data.key.
 Config["Avoid Full Server"] = Config["Avoid Full Server"] ~= false
 Config["Max Players"]       = Config["Max Players"] or 11
 Config["Fetch Count"]       = math.max(1, math.floor(tonumber(Config["Fetch Count"]) or 30))
@@ -916,7 +917,7 @@ local function JsonDecodeSafe(body)
 end
 
 -- ============================================================
--- FULL MOON / ISLAND API (baorph): schema hien tai
+-- MIRAGE API (baorph): query key=mirage, envelope key=island
 --
 -- Vi du:
 -- {
@@ -934,6 +935,10 @@ end
 -- API sap xep DU LIEU CU O TREN, MOI O DUOI.
 -- Vi vay ExtractServerList() doc items TU CUOI LEN DAU.
 -- list[1] = server moi nhat.
+--
+-- Query URL dung key=mirage, nhung payload co the tron nhieu type:
+--   mirage / mysticisland / prehistoricisland
+-- Nen loc CHINH XAC Type == "mirage" trong items.
 -- ============================================================
 local function NormalizeServerEntry(v)
     if type(v) == "string" then
@@ -1009,9 +1014,14 @@ local function ExtractServerList(data)
         if one then
             local tp = tostring(one.Type or ""):lower()
 
-            -- Endpoint hien tai tra type=mirage.
-            -- Type rong van chap nhan de tuong thich schema cu.
-            if tp == "" or tp == "mirage" then
+            -- Payload key=mirage van co the chua mysticisland/prehistoricisland.
+            -- Schema string hien tai: CHI lay type=mirage.
+            -- Schema object cu khong co Type: van cho phep de backward-compatible.
+            if type(one.Raw) == "string" then
+                if tp == "mirage" then
+                    list[#list + 1] = one
+                end
+            elseif tp == "" or tp == "mirage" then
                 list[#list + 1] = one
             end
         end
@@ -1030,7 +1040,7 @@ local function GetMirageServersFromAPI()
 
     if url == "" then
         warn("[MirageAPI] Mirage API url rong -> bo qua")
-        return {}
+        return {}, "url_empty"
     end
 
     local currentPlaceId = tonumber(game.PlaceId)
@@ -1038,7 +1048,7 @@ local function GetMirageServersFromAPI()
     if CachedMirageServers
         and CachedMiragePlaceId == currentPlaceId
         and os.time() - LastMirageApiFetch < 20 then
-        return CachedMirageServers
+        return CachedMirageServers, "cache"
     end
 
     SetStatus("Fetching Mirage API...")
@@ -1054,7 +1064,7 @@ local function GetMirageServersFromAPI()
 
     if not ok then
         warn("[MirageAPI] Request failed: " .. tostring(res))
-        return {}
+        return {}, "request_failed"
     end
 
     local statusCode = tonumber(res.StatusCode or res.status_code or res.Status or 0)
@@ -1064,13 +1074,20 @@ local function GetMirageServersFromAPI()
 
     if statusCode ~= 0 and (statusCode < 200 or statusCode >= 300) then
         warn("[MirageAPI] Bad status: " .. tostring(statusCode))
-        return {}
+        return {}, "http_" .. tostring(statusCode)
     end
 
     local data = JsonDecodeSafe(body)
     if not data then
         warn("[MirageAPI] JSON decode failed. Body head: " .. tostring(body):sub(1, 300))
-        return {}
+        return {}, "json_decode_failed"
+    end
+
+    -- Luu y: URL query dang la key=mirage, nhung API envelope hien tai
+    -- tra data.key = "island". Khong dung data.key de suy ra query selector.
+    local responseKey = tostring(data.key or "")
+    if responseKey ~= "" then
+        print("[MirageAPI] Response envelope key=" .. responseKey)
     end
 
     local servers = ExtractServerList(data)
@@ -1081,9 +1098,18 @@ local function GetMirageServersFromAPI()
         CachedMirageServers = servers
     end
 
-    print("[MirageAPI] Parsed " .. tostring(#servers) .. " server(s) | bottom->top | newest first")
+    print(
+        "[MirageAPI] Parsed " .. tostring(#servers)
+        .. " server(s) | key=" .. tostring(data.key)
+        .. " | bottom->top | newest first"
+    )
     SetStatus("Mirage API servers: " .. tostring(#servers))
-    return servers
+
+    if #servers <= 0 then
+        return {}, "parsed_empty"
+    end
+
+    return servers, "ok"
 end
 
 JoinJobIdByServerBrowser = function(jobId)
@@ -1120,13 +1146,13 @@ local function HopMirageByAPI()
     local cfg = getgenv().PullLeverConfig or {}
 
     if cfg["Use Mirage API"] == false then
-        return false
+        return false, "disabled"
     end
 
-    local servers = GetMirageServersFromAPI()
+    local servers, fetchReason = GetMirageServersFromAPI()
     if type(servers) ~= "table" or #servers <= 0 then
-        SetStatus("Mirage API empty -> refresh")
-        return false
+        SetStatus("Mirage API empty | " .. tostring(fetchReason))
+        return false, fetchReason or "api_empty"
     end
 
     local currentPlaceId = tonumber(game.PlaceId)
@@ -1135,64 +1161,105 @@ local function HopMirageByAPI()
     local fetchCount     = math.max(1, math.floor(tonumber(cfg["Fetch Count"]) or 30))
     local hopDelay       = math.max(0.1, tonumber(cfg["Hop Delay"]) or 1.5)
 
-    local candidates, samePlaceCount = {}, 0
+    local candidates = {}
+    local stats = {
+        total = #servers,
+        samePlace = 0,
+        wrongPlace = 0,
+        sameJob = 0,
+        full = 0,
+        blacklist = 0,
+        joinFail = 0,
+        claimed = 0,
+        usable = 0,
+    }
 
+    -- servers da duoc ExtractServerList reverse:
+    -- index 1 = item DUOI CUNG cua API = MOI NHAT.
     for _, server in ipairs(servers) do
         local placeId = tonumber(server.PlaceId)
         local players = tonumber(server.Players) or 0
 
-        -- placeId nil = API khong tra -> coi nhu cung place (ServerBrowser
-        -- teleport trong place hien tai nen khong gay Error 773).
         local samePlace  = (placeId == nil) or (placeId == currentPlaceId)
         local notSameJob = tostring(server.JobId) ~= tostring(game.JobId)
         local notFull    = (not avoidFull) or players <= maxPlayers
-        local notBlacklisted =
-            not IsMirageServerBlacklisted(server.JobId)
-        local notJoinFailed =
-            not IsMirageJoinFailedRecently(server.JobId)
-        local notClaimed =
-            not IsMirageServerClaimedByOther(server.JobId)
+        local blacklisted = IsMirageServerBlacklisted(server.JobId)
+        local joinFailed  = IsMirageJoinFailedRecently(server.JobId)
+        local claimed     = IsMirageServerClaimedByOther(server.JobId)
 
-        if samePlace then samePlaceCount = samePlaceCount + 1 end
+        if samePlace then
+            stats.samePlace += 1
+        else
+            stats.wrongPlace += 1
+        end
+
+        if not notSameJob then stats.sameJob += 1 end
+        if not notFull then stats.full += 1 end
+        if blacklisted then stats.blacklist += 1 end
+        if joinFailed then stats.joinFail += 1 end
+        if claimed then stats.claimed += 1 end
 
         if samePlace
             and notSameJob
             and notFull
-            and notBlacklisted
-            and notJoinFailed
-            and notClaimed
+            and not blacklisted
+            and not joinFailed
+            and not claimed
         then
             candidates[#candidates + 1] = server
-            if #candidates >= fetchCount then break end
+            stats.usable += 1
+
+            if #candidates >= fetchCount then
+                break
+            end
         end
     end
 
+    print(
+        "[MirageAPI] Filter"
+        .. " total=" .. tostring(stats.total)
+        .. " samePlace=" .. tostring(stats.samePlace)
+        .. " usable=" .. tostring(stats.usable)
+        .. " full=" .. tostring(stats.full)
+        .. " blacklist=" .. tostring(stats.blacklist)
+        .. " joinFail=" .. tostring(stats.joinFail)
+        .. " claimed=" .. tostring(stats.claimed)
+        .. " wrongPlace=" .. tostring(stats.wrongPlace)
+    )
+
     if #candidates == 0 then
-        SetStatus(
-            "No Mirage JobId for PlaceId=" .. tostring(currentPlaceId)
-            .. " | SamePlace=" .. tostring(samePlaceCount)
-            .. " -> refresh"
-        )
-        return false
+        local reason =
+            "usable=0"
+            .. " full=" .. tostring(stats.full)
+            .. " black=" .. tostring(stats.blacklist)
+            .. " fail=" .. tostring(stats.joinFail)
+            .. " claim=" .. tostring(stats.claimed)
+            .. " place=" .. tostring(stats.wrongPlace)
+
+        SetStatus("Mirage API filtered empty | " .. reason)
+        return false, "filtered_empty"
     end
 
-    SetStatus("Mirage: thu " .. tostring(#candidates) .. " server | bottom->top | moi->cu")
+    SetStatus(
+        "Mirage API: " .. tostring(#candidates)
+        .. " server | bottom->top | moi->cu"
+    )
 
     for i, server in ipairs(candidates) do
         local jobId = tostring(server.JobId)
 
         SetStatus(
-            "Join Mirage " .. tostring(i) .. "/" .. tostring(#candidates)
+            "Join Full Moon " .. tostring(i) .. "/" .. tostring(#candidates)
             .. " | Players=" .. tostring(server.Players)
             .. " | " .. jobId:sub(1, 8)
         )
+
         print(
             "[MirageAPI] #" .. tostring(i)
             .. " JobId=" .. jobId
             .. " PlaceId=" .. tostring(server.PlaceId)
             .. " Players=" .. tostring(server.Players)
             .. " Type=" .. tostring(server.Type or "?")
-            .. " Timestamp=" .. tostring(server.Timestamp)
         )
 
         if IsMirageServerBlacklisted(jobId)
@@ -1209,9 +1276,7 @@ local function HopMirageByAPI()
 
         local joinStarted = JoinJobIdByServerBrowser(jobId)
 
-        -- Giữ nguyên cơ chế fire-and-forget cũ.
-        -- Nếu session vẫn còn sống sau Hop Delay thì coi lần join này thất bại,
-        -- cooldown ngắn 2 phút và nhả claim để client khác không lặp ngay.
+        -- Giu behavior cu: cho Hop Delay de teleport bat dau.
         task.wait(hopDelay)
 
         if joinStarted then
@@ -1223,8 +1288,8 @@ local function HopMirageByAPI()
         ReleaseMirageClaim(jobId)
     end
 
-    SetStatus("Da thu het " .. tostring(#candidates) .. " server -> refresh")
-    return false
+    SetStatus("Da thu het " .. tostring(#candidates) .. " Full Moon server -> refresh")
+    return false, "attempts_exhausted"
 end
 
 local function ConvertTo(Type, Data)
@@ -1390,9 +1455,10 @@ local function DoMirageBlueGear()
 
         if Config["Hop Mirage"] then
             SetStatus("Khong co Mirage -> Hop Mirage API")
-            if not HopMirageByAPI() then
-                SetStatus("Mirage API rong -> fallback Hop __ServerBrowser")
-                Hop("Mirage API empty")
+            local hopped, apiReason = HopMirageByAPI()
+            if not hopped then
+                SetStatus("Mirage API fallback | " .. tostring(apiReason))
+                Hop("Mirage API: " .. tostring(apiReason))
             end
         else
             SetStatus("Khong co Mirage (Hop Mirage = false)")
@@ -1427,9 +1493,10 @@ local function DoMirageBlueGear()
     else
         SetStatus("Sai gio trong ngay -> Hop Mirage API")
         if Config["Hop Mirage"] then
-            if not HopMirageByAPI() then
-                SetStatus("Mirage API rong -> fallback Hop __ServerBrowser")
-                Hop("Mirage API empty")
+            local hopped, apiReason = HopMirageByAPI()
+            if not hopped then
+                SetStatus("Mirage API fallback | " .. tostring(apiReason))
+                Hop("Mirage API: " .. tostring(apiReason))
             end
         end
     end
