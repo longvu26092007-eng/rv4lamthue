@@ -1353,7 +1353,7 @@ end
 --   khi tới đích -> chuyển HOLD, tiếp tục giữ vị trí
 --   không có khoảng trống "tween xong rồi thả HRP".
 -- ============================================================
-local MIRAGE_TWEEN_SPEED = 280
+local MIRAGE_TWEEN_SPEED = 250
 local MIRAGE_SNAP_DISTANCE = 6
 
 local MirageMovement = {
