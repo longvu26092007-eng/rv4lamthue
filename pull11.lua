@@ -12,7 +12,7 @@ getgenv().PullLeverConfig = getgenv().PullLeverConfig or {
     ["Black Screen"]       = true,
 
     ["Use Mirage API"]     = true,
-    ["Mirage API"]         = "https://baorph.pythonanywhere.com/token?token=8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8&api_key=baorapi&key=mirage",
+    ["Mirage API"]         = "https://baorph.pythonanywhere.com/token?api_key=baorapi&token=LH8UzJvtTZfmndW1&key=mirage",
     ["Avoid Full Server"]  = true,
     ["Max Players"]        = 11,
 
