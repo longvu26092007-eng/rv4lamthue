@@ -151,6 +151,7 @@ local Workspace         = game:GetService("Workspace")
 local Lighting          = game:GetService("Lighting")
 local RunService        = game:GetService("RunService")
 local TweenService      = game:GetService("TweenService")
+local CollectionService = game:GetService("CollectionService")
 local HttpService       = game:GetService("HttpService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local StarterPlayer     = game:GetService("StarterPlayer")
@@ -1237,7 +1238,62 @@ local function CaculateDistance(Origin, Destination)
     return (a - b).Magnitude
 end
 
-local TweenConn, TweenInstance, TweenGhost, IsTweening = nil, nil, nil, false
+-- ============================================================
+-- TWEEN MODULE (BAN MOI - anti-cheat movement)
+--
+-- Game da chan 2 kieu cu:
+--   1) ghost/proxy part + ghi root.CFrame moi Heartbeat
+--   2) snap root.CFrame truc tiep khi dist <= 200
+-- Ban nay tween THANG HumanoidRootPart bang TweenService, doi
+-- character stable truoc khi chay, va tu phat hien server keo nguoc
+-- (jump >= 45 studs) de tween lai.
+-- ============================================================
+-- SPEED phai khai bao TRUOC ham Tween ben duoi, vi Tween() doc bien nay.
+-- Neu de sau, `local` chua ton tai luc dinh nghia ham -> Lua bat vao global nil
+-- -> tween chay 300 thay vi 250.
+local SPEED = 250
+
+local TweenInstance = nil
+local TweenSerial = 0
+local TweenGoal = nil
+local TweenObject = nil
+
+local function getCFrame(v)
+    if not v then return nil end
+    if typeof(v) == "CFrame" then return v end
+    if typeof(v) == "Vector3" then return CFrame.new(v) end
+    if typeof(v) ~= "Instance" then return nil end
+    if v:IsA("BasePart") then return v.CFrame end
+    if v:IsA("Model") then
+        local ok, cf = pcall(function() return v:GetPivot() end)
+        if ok and cf then return cf end
+        local root = v.PrimaryPart or v:FindFirstChild("HumanoidRootPart")
+        if root then return root.CFrame end
+    end
+    if v:IsA("CFrameValue") then return v.Value end
+    if v:IsA("Vector3Value") then return CFrame.new(v.Value) end
+    return nil
+end
+
+local function CancelTween()
+    TweenSerial += 1
+    TweenGoal = nil
+    TweenObject = nil
+    if TweenInstance then
+        pcall(function() TweenInstance:Cancel() end)
+        TweenInstance = nil
+    end
+end
+
+local function MovementLocked(char)
+    if not char then return true end
+    if char:FindFirstChild("AntiMover") then return true end
+    local ok, tagged = pcall(function()
+        return CollectionService:HasTag(char, "Teleporting")
+    end)
+    if ok and tagged then return true end
+    return false
+end
 
 -- Không quét GetDescendants mỗi frame nữa.
 -- Với nhiều client, Stepped + GetDescendants gây CPU thừa rất lớn.
@@ -1261,160 +1317,230 @@ task.spawn(function()
     end
 end)
 
-local function StopTween()
-    if TweenInstance then pcall(function() TweenInstance:Cancel() end) TweenInstance = nil end
-    if TweenConn then TweenConn:Disconnect() TweenConn = nil end
-    if TweenGhost then pcall(function() TweenGhost:Destroy() end) TweenGhost = nil end
-    IsTweening = false
+local function WaitMovementStable(serial, targetObject, timeout)
+    local deadline = tick() + (timeout or 2.5)
+    local lastPos = targetObject and targetObject.Position
+    local stableFor = 0
+    while serial == TweenSerial and targetObject and targetObject.Parent and tick() < deadline do
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChild("Humanoid")
+        if not hum or hum.Health <= 0 then
+            return false
+        end
+        if MovementLocked(char) then
+            stableFor = 0
+        else
+            local pos = targetObject.Position
+            if lastPos and (pos - lastPos).Magnitude <= 2 then
+                stableFor += 0.05
+                if stableFor >= 0.2 then
+                    return true
+                end
+            else
+                stableFor = 0
+            end
+            lastPos = pos
+        end
+        task.wait(0.05)
+    end
+    return serial == TweenSerial and targetObject and targetObject.Parent
+        and not MovementLocked(LocalPlayer.Character)
 end
 
-function TweenTo(Position)
-    RefreshCharacter()
+local function PlayTween(serial, targetObject, targetCFrame, speed)
+    if serial ~= TweenSerial or not targetObject or not targetObject.Parent then
+        return false
+    end
+    local distance = (targetObject.Position - targetCFrame.Position).Magnitude
+    if distance <= 2 then
+        TweenInstance = nil
+        return true
+    end
+    local duration = math.max(distance / speed, 0.05)
+    local tw = TweenService:Create(
+        targetObject,
+        TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+        {CFrame = targetCFrame}
+    )
+    TweenInstance = tw
+    tw:Play()
+    return true
+end
 
-    if not Character or not Character:FindFirstChild("Humanoid")
-        or Character.Humanoid.Health <= 0 or not HumanoidRootPart then
-        StopTween()
+local function Tween(targetCFrame, targetObject)
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChild("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if targetCFrame == false then
+        CancelTween()
         return
     end
+    if not hum or hum.Health <= 0 or not root then
+        CancelTween()
+        return
+    end
+    targetCFrame = getCFrame(targetCFrame)
+    if not targetCFrame then
+        return
+    end
+    targetObject = targetObject or root
+    if not targetObject or not targetObject.Parent then
+        return
+    end
+    if targetObject == root then
+        hum.Sit = false
+    end
+    local sameGoal = TweenGoal
+        and TweenObject == targetObject
+        and (TweenGoal.Position - targetCFrame.Position).Magnitude <= 3
+    if sameGoal and TweenInstance and TweenInstance.PlaybackState == Enum.PlaybackState.Playing then
+        return
+    end
+    CancelTween()
+    local serial = TweenSerial
+    TweenGoal = targetCFrame
+    TweenObject = targetObject
+    local speed = tonumber(getgenv().tweenspeed) or tonumber(SPEED) or 300
+    task.spawn(function()
+        if not WaitMovementStable(serial, targetObject, 3) then
+            return
+        end
+        if serial ~= TweenSerial then
+            return
+        end
+        PlayTween(serial, targetObject, targetCFrame, speed)
+        local lastPos = targetObject.Position
+        local correctionStart = nil
+        while serial == TweenSerial and targetObject.Parent do
+            task.wait(0.05)
+            char = LocalPlayer.Character
+            hum = char and char:FindFirstChild("Humanoid")
+            if not hum or hum.Health <= 0 then
+                CancelTween()
+                return
+            end
+            if MovementLocked(char) then
+                if TweenInstance then
+                    pcall(function() TweenInstance:Cancel() end)
+                    TweenInstance = nil
+                end
+                if not WaitMovementStable(serial, targetObject, 4) then
+                    return
+                end
+                if serial == TweenSerial
+                    and (targetObject.Position - targetCFrame.Position).Magnitude > 2 then
+                    PlayTween(serial, targetObject, targetCFrame, speed)
+                end
+                lastPos = targetObject.Position
+            else
+                local pos = targetObject.Position
+                local jump = (pos - lastPos).Magnitude
+                -- Nhay >= 45 studs trong 1 tick = server keo nguoc, khong phai tween.
+                if jump >= 45 then
+                    correctionStart = correctionStart or tick()
+                    if TweenInstance then
+                        pcall(function() TweenInstance:Cancel() end)
+                        TweenInstance = nil
+                    end
+                elseif correctionStart and tick() - correctionStart >= 0.15 then
+                    correctionStart = nil
+                    if WaitMovementStable(serial, targetObject, 2) and serial == TweenSerial then
+                        PlayTween(serial, targetObject, targetCFrame, speed)
+                    end
+                end
+                lastPos = pos
+            end
+            if (targetObject.Position - targetCFrame.Position).Magnitude <= 3 then
+                if TweenInstance then
+                    pcall(function() TweenInstance:Cancel() end)
+                end
+                TweenInstance = nil
+                return
+            end
+            if TweenInstance
+                and TweenInstance.PlaybackState ~= Enum.PlaybackState.Playing
+                and not MovementLocked(char) then
+                PlayTween(serial, targetObject, targetCFrame, speed)
+            end
+        end
+    end)
+end
+
+local function IsTweening()
+    return TweenInstance ~= nil and TweenInstance.PlaybackState == Enum.PlaybackState.Playing
+end
+
+-- Dich ma luong hold cua Mirage dang giu (xem MIRAGE MOVEMENT ben duoi).
+-- Khai bao o day de TweenTo() xoa duoc no: neu khong, di chuyen cua Race
+-- se bi luong hold keo nguoc ve Mirage moi 0.3s.
+local MirageHoldTarget = nil
+
+-- TweenTo() giu nguyen chu ky cu (DoRaceV4Progress dang goi):
+--   TweenTo(false) -> cancel
+--   Position dang {x,y,z} -> ConvertTo
+--   clamp Y >= 5 nhu ban cu
+-- Khac ban cu: KHONG con snap root.CFrame khi dist <= 200, vi snap chinh la
+-- cai game dang chan. Main loop goi lai moi 3s nen van hoi tu ve dich.
+function TweenTo(Position)
+    MirageHoldTarget = nil
 
     if Position == false then
-        StopTween()
+        CancelTween()
         return
     end
     if not Position then return end
 
     Position = typeof(Position) ~= "CFrame" and ConvertTo(CFrame, Position) or Position
     if typeof(Position) == "CFrame" then
-        local p = Position.p
+        local p = Position.Position
         Position = CFrame.new(p.X, math.max(p.Y, 5), p.Z)
     end
 
-    local root = HumanoidRootPart
-    local dist = (Position.Position - root.Position).Magnitude
-
-    if dist <= 200 then
-        StopTween()
-        pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-        end)
-        root.CFrame = Position
-        return
-    end
-
-    if IsTweening then return end
-    IsTweening = true
-
-    local ghost = Instance.new("Part")
-    ghost.Name = "TweenGhost"
-    ghost.Transparency = 1
-    ghost.Anchored = true
-    ghost.CanCollide = false
-    ghost.Size = Vector3.new(4, 4, 4)
-    ghost.CFrame = root.CFrame
-    ghost.Parent = workspace
-    TweenGhost = ghost
-
-    TweenInstance = TweenService:Create(
-        ghost,
-        TweenInfo.new(dist / 330, Enum.EasingStyle.Linear),
-        { CFrame = Position }
-    )
-
-    TweenConn = RunService.Heartbeat:Connect(function()
-        if root and root.Parent and ghost and ghost.Parent then
-            pcall(function()
-                root.AssemblyLinearVelocity = Vector3.zero
-                root.AssemblyAngularVelocity = Vector3.zero
-                root.CFrame = ghost.CFrame
-            end)
-        end
-    end)
-
-    TweenInstance.Completed:Connect(function()
-        StopTween()
-    end)
-
-    TweenInstance:Play()
+    Tween(Position)
 end
 
 
 -- ============================================================
--- MIRAGE MOVEMENT CONTROLLER V5.1
+-- MIRAGE MOVEMENT (V5.4) - dung Tween() moi
 --
--- Dedicated movement for long-distance Mirage travel.
--- Không dùng TweenTo() cũ vì TweenTo cũ:
---   - kết thúc tween -> StopTween() -> ngừng giữ vị trí ngay
---   - dist <= 200 -> CFrame thẳng
--- Hai điểm này có thể gây rubber-band / giật ngược về vị trí server cũ.
+-- Controller proxy + Heartbeat cu da bo: ghi root.CFrame moi frame
+-- la dung cai game dang chan, va no se danh nhau voi TweenService
+-- cua Tween() moi (ca hai cung ghi root.CFrame).
 --
--- Cách này theo controller Katakuri:
---   proxy tween -> Heartbeat kéo HRP theo proxy
---   khi tới đích -> chuyển HOLD, tiếp tục giữ vị trí
---   không có khoảng trống "tween xong rồi thả HRP".
+-- Tween() moi da tu lo phan chong keo nguoc:
+--   - doi character stable truoc khi chay
+--   - phat hien nhay >= 45 studs -> cancel, cho stable, tween lai
+-- Nen o day chi con lop mong goi Tween(), giu nguyen ten ham cu
+-- de cac cho goi khong phai sua.
 -- ============================================================
-local MIRAGE_TWEEN_SPEED = 250
+local MIRAGE_TWEEN_SPEED = SPEED
 local MIRAGE_SNAP_DISTANCE = 6
 
-local MirageMovement = {
-    Proxy = nil,
-    Tween = nil,
-    Mode = "IDLE", -- IDLE | MOVE | HOLD
-    Target = nil,
-    LastRetargetAt = 0,
-}
-
-local function EnsureMirageProxy()
-    if MirageMovement.Proxy and MirageMovement.Proxy.Parent then
-        return MirageMovement.Proxy
-    end
-
-    local proxy = Instance.new("Part")
-    proxy.Name = "PullLeverMirageProxy"
-    proxy.Anchored = true
-    proxy.CanCollide = false
-    proxy.CanTouch = false
-    proxy.CanQuery = false
-    proxy.Transparency = 1
-    proxy.Size = Vector3.new(2, 2, 2)
-    proxy.Parent = workspace
-
-    MirageMovement.Proxy = proxy
-    return proxy
-end
-
-local function CancelMirageTweenOnly()
-    if MirageMovement.Tween then
-        pcall(function()
-            MirageMovement.Tween:Cancel()
-        end)
-        MirageMovement.Tween = nil
-    end
-end
+-- Giu ten MirageMovement.cancel() vi 3 cho trong main loop dang goi.
+-- (MirageHoldTarget khai bao o tren, ngay truoc TweenTo.)
+local MirageMovement = {}
 
 function MirageMovement.cancel()
-    MirageMovement.Mode = "IDLE"
-    MirageMovement.Target = nil
-    CancelMirageTweenOnly()
-
-    if MirageMovement.Proxy then
-        pcall(function()
-            MirageMovement.Proxy:Destroy()
-        end)
-        MirageMovement.Proxy = nil
-    end
+    MirageHoldTarget = nil
+    CancelTween()
 end
 
-function MirageMovement.holdAt(targetCFrame)
-    if typeof(targetCFrame) ~= "CFrame" then
-        return false
+-- Ban cu HOLD bang cach ghi root.CFrame moi Heartbeat. Bo cach do (bi chan),
+-- thay bang: cu 0.3s kiem tra troi khoi dich thi Tween() lai.
+-- Can thiet vi target Mirage cao +300 studs, khong giu thi roi xuong va
+-- check CaculateDistance(top) < 20 trong DoMirageBlueGear se khong bao gio dung.
+task.spawn(function()
+    while task.wait(0.3) do
+        local target = MirageHoldTarget
+        if target then
+            local root = HumanoidRootPart
+            if root and root.Parent
+                and (root.Position - target.Position).Magnitude > MIRAGE_SNAP_DISTANCE then
+                pcall(Tween, target)
+            end
+        end
     end
-
-    CancelMirageTweenOnly()
-    MirageMovement.Mode = "HOLD"
-    MirageMovement.Target = targetCFrame
-    return true
-end
+end)
 
 function MirageMovement.moveTo(targetCFrame)
     RefreshCharacter()
@@ -1432,128 +1558,22 @@ function MirageMovement.moveTo(targetCFrame)
         return false
     end
 
-    hum.Sit = false
+    MirageHoldTarget = targetCFrame
 
-    local dist =
-        (root.Position - targetCFrame.Position).Magnitude
-
-    -- Chỉ snap/hold khi thực sự đã rất gần.
-    -- Không CFrame thẳng 200 studs như TweenTo cũ.
+    -- Da o dich: khong tween nua, va KHONG snap CFrame (snap la cai bi chan).
+    local dist = (root.Position - targetCFrame.Position).Magnitude
     if dist <= MIRAGE_SNAP_DISTANCE then
-        MirageMovement.holdAt(targetCFrame)
         return true
     end
 
-    local now = os.clock()
-
-    -- Main loop có thể gọi lại cùng target nhiều lần.
-    -- Không restart tween liên tục.
-    if MirageMovement.Mode == "MOVE"
-        and MirageMovement.Target
-    then
-        local targetDelta =
-            (MirageMovement.Target.Position - targetCFrame.Position).Magnitude
-
-        if targetDelta < 10 then
-            return false
-        end
-    end
-
-    local proxy = EnsureMirageProxy()
-
-    CancelMirageTweenOnly()
-
-    proxy.CFrame = root.CFrame
-    MirageMovement.Target = targetCFrame
-    MirageMovement.Mode = "MOVE"
-    MirageMovement.LastRetargetAt = now
-
-    local travel =
-        math.max(dist / MIRAGE_TWEEN_SPEED, 0.05)
-
-    local tween =
-        TweenService:Create(
-            proxy,
-            TweenInfo.new(
-                travel,
-                Enum.EasingStyle.Linear
-            ),
-            {
-                CFrame = targetCFrame
-            }
-        )
-
-    MirageMovement.Tween = tween
-
-    tween.Completed:Connect(function(playbackState)
-        -- Callback của tween cũ không được đè tween mới.
-        if MirageMovement.Tween ~= tween then
-            return
-        end
-
-        MirageMovement.Tween = nil
-
-        if playbackState == Enum.PlaybackState.Completed
-            and MirageMovement.Target
-        then
-            -- QUAN TRỌNG:
-            -- không IDLE / không StopTween tại đây.
-            -- HOLD liên tục để tránh server rubber-band về điểm xuất phát.
-            MirageMovement.Mode = "HOLD"
-        end
-    end)
-
-    tween:Play()
+    -- Tween() tu bo qua neu goal cu van dang chay (sameGoal check),
+    -- nen goi lai moi tick trong main loop la an toan.
+    Tween(targetCFrame)
     return false
 end
 
-RunService.Heartbeat:Connect(function()
-    if MirageMovement.Mode == "IDLE" then
-        return
-    end
-
-    RefreshCharacter()
-
-    local root = HumanoidRootPart
-    local hum = Humanoid
-
-    if not root
-        or not root.Parent
-        or not hum
-        or hum.Health <= 0
-    then
-        MirageMovement.cancel()
-        return
-    end
-
-    local target
-
-    if MirageMovement.Mode == "MOVE" then
-        local proxy = MirageMovement.Proxy
-
-        if not proxy or not proxy.Parent then
-            MirageMovement.cancel()
-            return
-        end
-
-        target = proxy.CFrame
-
-    elseif MirageMovement.Mode == "HOLD" then
-        target = MirageMovement.Target
-    end
-
-    if typeof(target) ~= "CFrame" then
-        MirageMovement.cancel()
-        return
-    end
-
-    pcall(function()
-        hum.Sit = false
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        root.CFrame = target
-    end)
-end)
+-- Heartbeat ghi root.CFrame moi frame da bo (xem comment o tren):
+-- no vua bi game chan, vua danh nhau voi TweenService trong Tween().
 
 local function TweenToMirage(targetCFrame)
     return MirageMovement.moveTo(targetCFrame)
