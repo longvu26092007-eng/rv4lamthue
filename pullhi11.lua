@@ -1267,6 +1267,85 @@ local TweenObject = nil
 -- nen dam nhau lien tuc: tween bi huy roi tao lai mai, nhan vat khong bay duoc.
 local TweenActive = false
 
+-- ============================================================
+-- CHONG GIAT (hoc tu BF49 Smooth Tween v5)
+--
+-- Nguyen nhan giat: ban cu chi ghi root.CFrame, con velocity = 0.
+-- Server thay nhan vat doi cho ma khong co van toc -> ket luan teleport
+-- -> keo nguoc ve vi tri no tinh -> giat.
+--
+-- Cach chua: dong thoi bao velocity dung bang huong bay * speed, qua
+-- BodyVelocity + AssemblyLinearVelocity. Luc do server thay mot vat the
+-- dang bay hop le nen khong keo nua. Day la ly do BF49 chay duoc 300-350
+-- studs/s trong khi ban khong velocity phai ha xuong 220 van giat.
+-- ============================================================
+local TweenStabilizer = nil
+local TweenAutoRotate = nil
+local TweenStartPos = nil
+local TweenStartAt = 0
+local TweenDir = Vector3.zero
+local TweenSpan = 0
+local TweenLastReplay = 0
+
+local function SetRootVelocity(root, v)
+    if not root or not root.Parent then return end
+    pcall(function()
+        root.AssemblyLinearVelocity = v
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+    -- Property cu, executor/engine doi ban co the khong co -> pcall rieng.
+    pcall(function()
+        root.Velocity = v
+        root.RotVelocity = Vector3.zero
+    end)
+end
+
+local function AttachStabilizer(root, velocity)
+    if not root or not root.Parent then return end
+
+    if TweenStabilizer and TweenStabilizer.Parent then
+        TweenStabilizer.Velocity = velocity
+        return
+    end
+
+    local old = root:FindFirstChild("PullTweenStabilizer")
+    if old then old:Destroy() end
+
+    local bv = Instance.new("BodyVelocity")
+    bv.Name = "PullTweenStabilizer"
+    bv.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    bv.P = 1000000
+    bv.Velocity = velocity
+    bv.Parent = root
+    TweenStabilizer = bv
+end
+
+local function DetachStabilizer()
+    if TweenStabilizer then
+        pcall(function() TweenStabilizer:Destroy() end)
+        TweenStabilizer = nil
+    end
+end
+
+-- AutoRotate bat thi Humanoid tu quay nhan vat, danh nhau voi CFrame cua tween.
+local function LockAutoRotate(hum)
+    if not hum or not hum.Parent then return end
+    if TweenAutoRotate == nil then
+        TweenAutoRotate = hum.AutoRotate
+    end
+    pcall(function() hum.AutoRotate = false end)
+end
+
+local function RestoreAutoRotate()
+    if TweenAutoRotate == nil then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChild("Humanoid")
+    if hum and hum.Parent then
+        pcall(function() hum.AutoRotate = TweenAutoRotate end)
+    end
+    TweenAutoRotate = nil
+end
+
 local function getCFrame(v)
     if not v then return nil end
     if typeof(v) == "CFrame" then return v end
@@ -1289,10 +1368,20 @@ local function CancelTween()
     TweenGoal = nil
     TweenObject = nil
     TweenActive = false
+    TweenStartPos = nil
     if TweenInstance then
         pcall(function() TweenInstance:Cancel() end)
         TweenInstance = nil
     end
+    -- Phai go stabilizer, khong thi BodyVelocity con velocity cu se bay nhan vat
+    -- di mai sau khi tween da dung.
+    DetachStabilizer()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if root then
+        SetRootVelocity(root, Vector3.zero)
+    end
+    RestoreAutoRotate()
 end
 
 local function MovementLocked(char)
@@ -1367,12 +1456,28 @@ local function PlayTween(serial, targetObject, targetCFrame, speed)
     if serial ~= TweenSerial or not targetObject or not targetObject.Parent then
         return false
     end
-    local distance = (targetObject.Position - targetCFrame.Position).Magnitude
+    local startPos = targetObject.Position
+    local distance = (startPos - targetCFrame.Position).Magnitude
     if distance <= 2 then
         TweenInstance = nil
         return true
     end
     local duration = math.max(distance / speed, 0.05)
+
+    -- TweenService noi suy Linear nen huong bay khong doi suot ca duong ->
+    -- tinh velocity 1 lan la du, khong can cap nhat moi frame nhu BF49
+    -- (BF49 phai lam vi no tween 1 part proxy roi copy sang root).
+    local dir = (targetCFrame.Position - startPos).Unit
+    TweenStartPos = startPos
+    TweenStartAt = tick()
+    TweenDir = dir
+    TweenSpan = distance
+    TweenLastReplay = tick()
+
+    -- Ke cau chuyen vat ly cho server TRUOC khi tween chay.
+    AttachStabilizer(targetObject, dir * speed)
+    SetRootVelocity(targetObject, dir * speed)
+
     local tw = TweenService:Create(
         targetObject,
         TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
@@ -1399,6 +1504,11 @@ local function TweenWatch(serial, targetObject, targetCFrame, speed)
         return
     end
 
+    do
+        local hum = char and char:FindFirstChild("Humanoid")
+        LockAutoRotate(hum)
+    end
+
     PlayTween(serial, targetObject, targetCFrame, speed)
 
     -- Vong nay CHI giam sat, KHONG cancel giua duong.
@@ -1414,6 +1524,7 @@ local function TweenWatch(serial, targetObject, targetCFrame, speed)
             CancelTween()
             return
         end
+        hum.Sit = false
 
         -- Den dich.
         if (targetObject.Position - targetCFrame.Position).Magnitude <= 3 then
@@ -1421,15 +1532,29 @@ local function TweenWatch(serial, targetObject, targetCFrame, speed)
                 pcall(function() TweenInstance:Cancel() end)
             end
             TweenInstance = nil
+            DetachStabilizer()
+            SetRootVelocity(targetObject, Vector3.zero)
+            RestoreAutoRotate()
             return
         end
 
-        -- Tween chet giua duong (het duration ma chua toi, hoac vua bi lock roi
-        -- nha ra) -> phat lai NGAY tu vi tri hien tai, khong cho stable.
-        if not MovementLocked(char)
-            and (not TweenInstance
-                or TweenInstance.PlaybackState ~= Enum.PlaybackState.Playing) then
-            PlayTween(serial, targetObject, targetCFrame, speed)
+        if not MovementLocked(char) then
+            if not TweenInstance
+                or TweenInstance.PlaybackState ~= Enum.PlaybackState.Playing then
+                -- Tween chet giua duong -> phat lai ngay tu vi tri hien tai.
+                PlayTween(serial, targetObject, targetCFrame, speed)
+            elseif TweenStartPos then
+                -- So voi vi tri LE RA phai o (tinh tu thoi gian da chay), KHONG
+                -- so voi mau vi tri tick truoc. Nen hitch bao lau cung khong gay
+                -- bao dong gia -- khac han nguong cung 45 studs cua Tween.txt.
+                local travelled = math.min((tick() - TweenStartAt) * speed, TweenSpan)
+                local expected = TweenStartPos + TweenDir * travelled
+                if (targetObject.Position - expected).Magnitude > 28
+                    and tick() - TweenLastReplay >= 0.4 then
+                    -- Server keo nguoc that -> ngam lai tu cho bi keo ve, bay tiep.
+                    PlayTween(serial, targetObject, targetCFrame, speed)
+                end
+            end
         end
     end
 end
@@ -1469,6 +1594,15 @@ local function Tween(targetCFrame, targetObject)
     TweenGoal = targetCFrame
     TweenObject = targetObject
     local speed = tonumber(getgenv().tweenspeed) or tonumber(SPEED) or 300
+    -- Nap truoc dia hinh quanh dich. Bay xa (Mirage +300, temple 28613/14896)
+    -- ma vung dich chua stream thi toi noi part chua ton tai -> roi/ket.
+    pcall(function()
+        task.spawn(function()
+            pcall(function()
+                LocalPlayer:RequestStreamAroundAsync(targetCFrame.Position, 5)
+            end)
+        end)
+    end)
     TweenActive = true
     task.spawn(function()
         TweenWatch(serial, targetObject, targetCFrame, speed)
