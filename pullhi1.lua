@@ -1251,12 +1251,21 @@ end
 -- SPEED phai khai bao TRUOC ham Tween ben duoi, vi Tween() doc bien nay.
 -- Neu de sau, `local` chua ton tai luc dinh nghia ham -> Lua bat vao global nil
 -- -> tween chay 300 thay vi 250.
-local SPEED = 250
+-- 250 -> 220: o 250 dang bay bi giat lai (server rubber-band vi client di truoc
+-- xa qua). Ha speed = client bot vuot truoc server = bot bi keo nguoc.
+local SPEED = 220
 
 local TweenInstance = nil
 local TweenSerial = 0
 local TweenGoal = nil
 local TweenObject = nil
+-- TweenActive = "dang co watcher song cho goal nay".
+-- Can rieng bien nay chu khong dua vao TweenInstance: tu luc Tween() spawn watcher
+-- den luc watcher goi PlayTween co mot khoang TweenInstance = nil. Ai goi Tween()
+-- trung goal trong khoang do se tuong chua co gi chay -> CancelTween() -> bump
+-- serial -> giet watcher vua spawn. Hold thread 0.3s + main loop 1s dung chung goal
+-- nen dam nhau lien tuc: tween bi huy roi tao lai mai, nhan vat khong bay duoc.
+local TweenActive = false
 
 local function getCFrame(v)
     if not v then return nil end
@@ -1279,6 +1288,7 @@ local function CancelTween()
     TweenSerial += 1
     TweenGoal = nil
     TweenObject = nil
+    TweenActive = false
     if TweenInstance then
         pcall(function() TweenInstance:Cancel() end)
         TweenInstance = nil
@@ -1373,6 +1383,57 @@ local function PlayTween(serial, targetObject, targetCFrame, speed)
     return true
 end
 
+-- Watcher tach ra thanh ham rieng de Tween() ha duoc co TweenActive khi no ket thuc.
+local function TweenWatch(serial, targetObject, targetCFrame, speed)
+    local char = LocalPlayer.Character
+
+    -- DI THANG: khong cho stable truoc khi chay (cai do lam tre 2-3s moi luot).
+    -- Chi cho khi dang bi lock cung (AntiMover / tag Teleporting), vi luc do
+    -- ghi CFrame se danh nhau voi teleport cua game.
+    if MovementLocked(char) then
+        if not WaitMovementStable(serial, targetObject, 1) then
+            return
+        end
+    end
+    if serial ~= TweenSerial then
+        return
+    end
+
+    PlayTween(serial, targetObject, targetCFrame, speed)
+
+    -- Vong nay CHI giam sat, KHONG cancel giua duong.
+    -- Ban Tween.txt cancel khi thay nhay >= 45 studs/tick, nhung 1 tick that co the
+    -- hitch len 0.15-0.2s -> speed*dt cham nguong -> tuong la server keo nguoc ->
+    -- cancel -> roi tu do -> tween lai: dung cai "bay 1 ti roi rot".
+    while serial == TweenSerial and targetObject.Parent do
+        task.wait(0.1)
+
+        char = LocalPlayer.Character
+        local hum = char and char:FindFirstChild("Humanoid")
+        if not hum or hum.Health <= 0 then
+            CancelTween()
+            return
+        end
+
+        -- Den dich.
+        if (targetObject.Position - targetCFrame.Position).Magnitude <= 3 then
+            if TweenInstance then
+                pcall(function() TweenInstance:Cancel() end)
+            end
+            TweenInstance = nil
+            return
+        end
+
+        -- Tween chet giua duong (het duration ma chua toi, hoac vua bi lock roi
+        -- nha ra) -> phat lai NGAY tu vi tri hien tai, khong cho stable.
+        if not MovementLocked(char)
+            and (not TweenInstance
+                or TweenInstance.PlaybackState ~= Enum.PlaybackState.Playing) then
+            PlayTween(serial, targetObject, targetCFrame, speed)
+        end
+    end
+end
+
 local function Tween(targetCFrame, targetObject)
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChild("Humanoid")
@@ -1399,7 +1460,8 @@ local function Tween(targetCFrame, targetObject)
     local sameGoal = TweenGoal
         and TweenObject == targetObject
         and (TweenGoal.Position - targetCFrame.Position).Magnitude <= 3
-    if sameGoal and TweenInstance and TweenInstance.PlaybackState == Enum.PlaybackState.Playing then
+    -- Dung TweenActive chu khong dung TweenInstance: xem comment o khai bao bien.
+    if sameGoal and TweenActive then
         return
     end
     CancelTween()
@@ -1407,53 +1469,13 @@ local function Tween(targetCFrame, targetObject)
     TweenGoal = targetCFrame
     TweenObject = targetObject
     local speed = tonumber(getgenv().tweenspeed) or tonumber(SPEED) or 300
+    TweenActive = true
     task.spawn(function()
-        -- DI THANG: khong cho stable truoc khi chay (cai do lam tre 2-3s moi luot).
-        -- Chi cho khi dang bi lock cung (AntiMover / tag Teleporting), vi luc do
-        -- ghi CFrame se danh nhau voi teleport cua game.
-        if MovementLocked(char) then
-            if not WaitMovementStable(serial, targetObject, 1) then
-                return
-            end
-        end
-        if serial ~= TweenSerial then
-            return
-        end
-
-        PlayTween(serial, targetObject, targetCFrame, speed)
-
-        -- Vong nay CHI giam sat, KHONG cancel giua duong nua.
-        -- Ban truoc cancel khi thay nhay >= 45 studs/tick, nhung 1 tick that co the
-        -- hitch len 0.2s -> 250*0.2 = 50 studs -> tuong la server keo nguoc ->
-        -- cancel -> roi tu do -> tween lai: dung cai "bay 1 ti roi rot" ban gap.
-        -- Server co keo nguoc that thi TweenService van ghi tiep theo duong noi suy
-        -- nen no tu keo lai, khong can can thiep.
-        while serial == TweenSerial and targetObject.Parent do
-            task.wait(0.1)
-
-            char = LocalPlayer.Character
-            hum = char and char:FindFirstChild("Humanoid")
-            if not hum or hum.Health <= 0 then
-                CancelTween()
-                return
-            end
-
-            -- Den dich.
-            if (targetObject.Position - targetCFrame.Position).Magnitude <= 3 then
-                if TweenInstance then
-                    pcall(function() TweenInstance:Cancel() end)
-                end
-                TweenInstance = nil
-                return
-            end
-
-            -- Tween chet giua duong (het duration ma chua toi, hoac vua bi lock roi
-            -- nha ra) -> phat lai NGAY tu vi tri hien tai, khong cho stable.
-            if not MovementLocked(char)
-                and (not TweenInstance
-                    or TweenInstance.PlaybackState ~= Enum.PlaybackState.Playing) then
-                PlayTween(serial, targetObject, targetCFrame, speed)
-            end
+        TweenWatch(serial, targetObject, targetCFrame, speed)
+        -- Watcher ket thuc (den dich / chet / bi thay the). Chi ha co khi minh van
+        -- la tween moi nhat, khong dap co cua tween moi hon vua spawn.
+        if serial == TweenSerial then
+            TweenActive = false
         end
     end)
 end
