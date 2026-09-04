@@ -1327,6 +1327,12 @@ local function WaitMovementStable(serial, targetObject, timeout)
         if not hum or hum.Health <= 0 then
             return false
         end
+        -- Tween bi cancel giua khong trung = nhan vat roi tu do. Roi thi moi tick
+        -- di ~10 studs, khong bao gio thoa "<= 2 studs" -> cho het timeout va roi
+        -- suot ca 2-4s. Triet velocity de dung han roi stable ngay.
+        pcall(function()
+            targetObject.AssemblyLinearVelocity = Vector3.zero
+        end)
         if MovementLocked(char) then
             stableFor = 0
         else
@@ -1402,54 +1408,37 @@ local function Tween(targetCFrame, targetObject)
     TweenObject = targetObject
     local speed = tonumber(getgenv().tweenspeed) or tonumber(SPEED) or 300
     task.spawn(function()
-        if not WaitMovementStable(serial, targetObject, 3) then
-            return
+        -- DI THANG: khong cho stable truoc khi chay (cai do lam tre 2-3s moi luot).
+        -- Chi cho khi dang bi lock cung (AntiMover / tag Teleporting), vi luc do
+        -- ghi CFrame se danh nhau voi teleport cua game.
+        if MovementLocked(char) then
+            if not WaitMovementStable(serial, targetObject, 1) then
+                return
+            end
         end
         if serial ~= TweenSerial then
             return
         end
+
         PlayTween(serial, targetObject, targetCFrame, speed)
-        local lastPos = targetObject.Position
-        local correctionStart = nil
+
+        -- Vong nay CHI giam sat, KHONG cancel giua duong nua.
+        -- Ban truoc cancel khi thay nhay >= 45 studs/tick, nhung 1 tick that co the
+        -- hitch len 0.2s -> 250*0.2 = 50 studs -> tuong la server keo nguoc ->
+        -- cancel -> roi tu do -> tween lai: dung cai "bay 1 ti roi rot" ban gap.
+        -- Server co keo nguoc that thi TweenService van ghi tiep theo duong noi suy
+        -- nen no tu keo lai, khong can can thiep.
         while serial == TweenSerial and targetObject.Parent do
-            task.wait(0.05)
+            task.wait(0.1)
+
             char = LocalPlayer.Character
             hum = char and char:FindFirstChild("Humanoid")
             if not hum or hum.Health <= 0 then
                 CancelTween()
                 return
             end
-            if MovementLocked(char) then
-                if TweenInstance then
-                    pcall(function() TweenInstance:Cancel() end)
-                    TweenInstance = nil
-                end
-                if not WaitMovementStable(serial, targetObject, 4) then
-                    return
-                end
-                if serial == TweenSerial
-                    and (targetObject.Position - targetCFrame.Position).Magnitude > 2 then
-                    PlayTween(serial, targetObject, targetCFrame, speed)
-                end
-                lastPos = targetObject.Position
-            else
-                local pos = targetObject.Position
-                local jump = (pos - lastPos).Magnitude
-                -- Nhay >= 45 studs trong 1 tick = server keo nguoc, khong phai tween.
-                if jump >= 45 then
-                    correctionStart = correctionStart or tick()
-                    if TweenInstance then
-                        pcall(function() TweenInstance:Cancel() end)
-                        TweenInstance = nil
-                    end
-                elseif correctionStart and tick() - correctionStart >= 0.15 then
-                    correctionStart = nil
-                    if WaitMovementStable(serial, targetObject, 2) and serial == TweenSerial then
-                        PlayTween(serial, targetObject, targetCFrame, speed)
-                    end
-                end
-                lastPos = pos
-            end
+
+            -- Den dich.
             if (targetObject.Position - targetCFrame.Position).Magnitude <= 3 then
                 if TweenInstance then
                     pcall(function() TweenInstance:Cancel() end)
@@ -1457,9 +1446,12 @@ local function Tween(targetCFrame, targetObject)
                 TweenInstance = nil
                 return
             end
-            if TweenInstance
-                and TweenInstance.PlaybackState ~= Enum.PlaybackState.Playing
-                and not MovementLocked(char) then
+
+            -- Tween chet giua duong (het duration ma chua toi, hoac vua bi lock roi
+            -- nha ra) -> phat lai NGAY tu vi tri hien tai, khong cho stable.
+            if not MovementLocked(char)
+                and (not TweenInstance
+                    or TweenInstance.PlaybackState ~= Enum.PlaybackState.Playing) then
                 PlayTween(serial, targetObject, targetCFrame, speed)
             end
         end
@@ -1664,15 +1656,46 @@ local function IsRaceV4ProgressReady()
     return ok and v == 4
 end
 
+-- Cho tween den dich thuc su.
+-- Ban tween cu snap root.CFrame khi dist <= 200 -> goi TweenTo() xong la coi nhu
+-- da den, ban remote ngay dong sau van dung vi tri. Ban moi bo snap (snap la cai
+-- game chan) nen tween can thoi gian that -> phai cho, khong thi Check/TeleportBack
+-- ban ra luc con dang bay giua duong.
+-- Co timeout: khong den duoc thi van chay tiep nhu ban cu, khong treo main loop.
+local function WaitArrive(target, timeout, tolerance)
+    timeout = timeout or 15
+    tolerance = tolerance or 25
+
+    local deadline = os.clock() + timeout
+    while os.clock() < deadline do
+        if CaculateDistance(target) <= tolerance then
+            return true
+        end
+        task.wait(0.15)
+    end
+
+    return false
+end
+
 local function DoRaceV4Progress()
     SetStatus("Temple: dang chay RaceV4Progress")
-    TweenTo(CFrame.new(3032, 2280, -7325))
-    if CaculateDistance(CFrame.new(3032, 2280, -7325)) < 30 then
+
+    local gate = CFrame.new(3032, 2280, -7325)
+    TweenTo(gate)
+    WaitArrive(gate, 20, 25)
+
+    if CaculateDistance(gate) < 30 then
         pcall(function() CommF_:InvokeServer("RaceV4Progress", "Begin") end)
         pcall(function() CommF_:InvokeServer("RaceV4Progress", "Check") end)
         pcall(function() CommF_:InvokeServer("RaceV4Progress", "Teleport") end)
         task.wait(2)
-        TweenTo(CFrame.new(28613, 14896, 106))
+
+        -- Server vua teleport vao temple. Diem nay o trong temple nen thuong gan,
+        -- ban cu snap tuc thi; ban moi phai cho tween xong roi moi TeleportBack.
+        local inside = CFrame.new(28613, 14896, 106)
+        TweenTo(inside)
+        WaitArrive(inside, 15, 25)
+
         pcall(function() CommF_:InvokeServer("RaceV4Progress", "Check") end)
         pcall(function() CommF_:InvokeServer("RaceV4Progress", "TeleportBack") end)
         task.wait(3)
