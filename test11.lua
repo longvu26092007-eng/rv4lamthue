@@ -1,5 +1,5 @@
 --[[
-    TEMPLE OF TIME - 2 METHOD TEST
+    TEMPLE OF TIME - 3 METHOD TEST
     ==========================================
     Button 1: KAITUN V4
       -> CommF_:InvokeServer("requestEntrance", Vector3.new(28310.0234, 14895.1123, 109.456741))
@@ -81,6 +81,30 @@ local KAITUN_TEMPLE_ENTRY =
         28310.0234,
         14895.1123,
         109.456741
+    )
+
+
+-- Banana Hub "Temple of Time" direct requestEntrance target.
+local BANANA_TEMPLE_ENTRY =
+    Vector3.new(
+        28286.35546875,
+        14895.3017578125,
+        102.62469482421875
+    )
+
+-- Banana Auto Race V4 / Pull Lever NPC flow.
+local BANANA_V4_NPC_POS =
+    Vector3.new(
+        2959.87231,
+        2282.42139,
+        -7216.23193
+    )
+
+local BANANA_V4_TEMPLE_POS =
+    Vector3.new(
+        28286.35546875,
+        14896.5078125,
+        102.62469482421875
     )
 
 local BANANA_DOOR_CFRAME = {
@@ -235,8 +259,8 @@ ScreenGui.Parent = guiParent
 
 local Frame = Instance.new("Frame")
 Frame.Name = "Main"
-Frame.Size = UDim2.fromOffset(360, 225)
-Frame.Position = UDim2.new(0.5, -180, 0.5, -112)
+Frame.Size = UDim2.fromOffset(540, 250)
+Frame.Position = UDim2.new(0.5, -270, 0.5, -125)
 Frame.BackgroundColor3 = Color3.fromRGB(20, 23, 31)
 Frame.BorderSizePixel = 0
 Frame.Parent = ScreenGui
@@ -258,7 +282,7 @@ Title.Font = Enum.Font.GothamBold
 Title.TextSize = 17
 Title.TextColor3 = Color3.fromRGB(255, 255, 255)
 Title.TextXAlignment = Enum.TextXAlignment.Left
-Title.Text = "TEMPLE OF TIME - REQUEST TEST"
+Title.Text = "TEMPLE OF TIME - KV4 vs BANANA"
 Title.Parent = Frame
 
 local Status = Instance.new("TextLabel")
@@ -281,8 +305,8 @@ StatusCorner.Parent = Status
 
 local function makeButton(text, x)
     local b = Instance.new("TextButton")
-    b.Size = UDim2.fromOffset(155, 54)
-    b.Position = UDim2.fromOffset(x, 139)
+    b.Size = UDim2.fromOffset(158, 58)
+    b.Position = UDim2.fromOffset(x, 154)
     b.BackgroundColor3 = Color3.fromRGB(42, 48, 65)
     b.BorderSizePixel = 0
     b.Font = Enum.Font.GothamBold
@@ -306,10 +330,16 @@ local KaitunButton =
         14
     )
 
-local BananaButton =
+local BananaDirectButton =
     makeButton(
-        "BANANA HUB\nTeleport Trial Door",
+        "BANANA\nTemple requestEntrance",
         191
+    )
+
+local BananaV4Button =
+    makeButton(
+        "BANANA V4\nNPC / RaceV4Progress",
+        368
     )
 
 local function setStatus(text)
@@ -393,6 +423,62 @@ local function requestKaitun()
         )
 
         kaitunBusy = false
+    end)
+end
+
+-- ============================================================
+-- BANANA HUB DIRECT TEMPLE METHOD
+-- Exact Banana "Temple of Time" button:
+-- CommF_:InvokeServer("requestEntrance", BANANA_TEMPLE_ENTRY)
+-- ============================================================
+local bananaDirectBusy = false
+
+local function requestBananaDirect()
+    if bananaDirectBusy then
+        setStatus("BANANA DIRECT: request already running.")
+        return
+    end
+
+    bananaDirectBusy = true
+
+    task.spawn(function()
+        local _, _, root = waitForCharacter(10)
+        if not root then
+            setStatus("BANANA DIRECT: Character/HRP not ready.")
+            bananaDirectBusy = false
+            return
+        end
+
+        local before = distanceTo(BANANA_TEMPLE_ENTRY)
+
+        setStatus(
+            "BANANA DIRECT\n"
+            .. "before=" .. string.format("%.1f", before)
+            .. "\nrequestEntrance -> 28286..."
+        )
+
+        local t0 = os.clock()
+        local ok, result = pcall(function()
+            return CommF_:InvokeServer(
+                "requestEntrance",
+                BANANA_TEMPLE_ENTRY
+            )
+        end)
+        local elapsed = os.clock() - t0
+
+        task.wait(0.75)
+
+        local after = distanceTo(BANANA_TEMPLE_ENTRY)
+
+        setStatus(
+            "BANANA DIRECT\n"
+            .. "ok=" .. tostring(ok)
+            .. " result=" .. tostring(result)
+            .. "\ntime=" .. string.format("%.2fs", elapsed)
+            .. " | after=" .. string.format("%.1f", after)
+        )
+
+        bananaDirectBusy = false
     end)
 end
 
@@ -547,123 +633,203 @@ local function bananaTp(target)
         duration
 end
 
-local function requestBanana()
-    if bananaBusy then
-        setStatus(
-            "Banana movement is already running."
+local bananaV4Busy = false
+
+local function getRaceV4Progress()
+    local ok, value = pcall(function()
+        return CommF_:InvokeServer(
+            "RaceV4Progress",
+            "Check"
         )
+    end)
+
+    if not ok then
+        return nil, value
+    end
+
+    return value, nil
+end
+
+local function bananaRaceV4Progress()
+    if bananaV4Busy then
+        setStatus("BANANA V4: flow already running.")
         return
     end
 
-    bananaBusy = true
+    bananaV4Busy = true
 
     task.spawn(function()
-        local race =
-            getRace()
-
-        if not race then
-            setStatus(
-                "BANANA: Data.Race not ready."
-            )
-            bananaBusy = false
+        local _, _, root = waitForCharacter(10)
+        if not root then
+            setStatus("BANANA V4: Character/HRP not ready.")
+            bananaV4Busy = false
             return
         end
 
-        local target =
-            BANANA_DOOR_CFRAME[race]
+        local state, checkErr = getRaceV4Progress()
 
-        if not target then
+        if state == nil then
             setStatus(
-                "BANANA: unsupported race = "
-                .. tostring(race)
+                "BANANA V4: Check error = "
+                .. tostring(checkErr)
             )
-            bananaBusy = false
-            return
-        end
-
-        local before =
-            distanceTo(target)
-
-        local ok, duration =
-            bananaTp(target)
-
-        if not ok then
-            setStatus(
-                "BANANA: "
-                .. tostring(duration)
-            )
-            bananaBusy = false
+            bananaV4Busy = false
             return
         end
 
         setStatus(
-            "BANANA "
-            .. tostring(race)
-            .. "\n"
-            .. "before="
-            .. string.format("%.1f", before)
-            .. " speed="
-            .. tostring(BANANA_TWEEN_SPEED)
-            .. "\n"
-            .. "ETA="
-            .. string.format("%.1fs", duration)
+            "BANANA V4\nRaceV4Progress Check = "
+            .. tostring(state)
         )
 
-        local deadline =
-            os.clock()
-            + math.min(
-                duration + 8,
-                180
-            )
-
-        local arrived = false
-
-        while os.clock() < deadline do
-            local d =
-                distanceTo(target)
-
-            if d <= 20 then
-                arrived = true
-                break
-            end
-
-            if bananaTween
-                and bananaTween.PlaybackState
-                    ~= Enum.PlaybackState.Playing
-            then
-                break
-            end
-
-            task.wait(0.1)
-        end
-
-        shouldTween = false
-
-        if bananaTween then
-            pcall(function()
-                bananaTween:Cancel()
-                bananaTween:Destroy()
+        -- State 1: exact Banana Pull Lever logic -> Check + Begin.
+        if state == 1 then
+            local okCheck, retCheck = pcall(function()
+                return CommF_:InvokeServer(
+                    "RaceV4Progress",
+                    "Check"
+                )
             end)
-            bananaTween = nil
+
+            local okBegin, retBegin = pcall(function()
+                return CommF_:InvokeServer(
+                    "RaceV4Progress",
+                    "Begin"
+                )
+            end)
+
+            task.wait(0.5)
+
+            local after = select(1, getRaceV4Progress())
+
+            setStatus(
+                "BANANA V4 [state 1]\n"
+                .. "Check=" .. tostring(okCheck)
+                .. "/" .. tostring(retCheck)
+                .. " Begin=" .. tostring(okBegin)
+                .. "/" .. tostring(retBegin)
+                .. "\nafter Check=" .. tostring(after)
+                .. " -> BAM LAI NUT V4"
+            )
+
+        -- State 2: exact Banana NPC point + RaceV4Progress Teleport.
+        elseif state == 2 then
+            pcall(function()
+                CommF_:InvokeServer(
+                    "RaceV4Progress",
+                    "Check"
+                )
+            end)
+
+            local deadline = os.clock() + 30
+            local attempt = 0
+            local entered = false
+
+            while os.clock() < deadline do
+                local char, hum, liveRoot = waitForCharacter(1)
+
+                if not (char and hum and liveRoot and hum.Health > 0) then
+                    break
+                end
+
+                local templeDist =
+                    (liveRoot.Position - BANANA_V4_TEMPLE_POS).Magnitude
+
+                if templeDist <= 15 then
+                    entered = true
+                    break
+                end
+
+                attempt += 1
+
+                -- Exact position used by Banana Pull Lever source.
+                liveRoot.CFrame = CFrame.new(BANANA_V4_NPC_POS)
+
+                local okTp, retTp = pcall(function()
+                    return CommF_:InvokeServer(
+                        "RaceV4Progress",
+                        "Teleport"
+                    )
+                end)
+
+                task.wait(0.15)
+
+                local _, _, rootAfter = waitForCharacter(1)
+                local afterDist =
+                    rootAfter
+                    and (rootAfter.Position - BANANA_V4_TEMPLE_POS).Magnitude
+                    or math.huge
+
+                setStatus(
+                    "BANANA V4 [state 2]\n"
+                    .. "NPC -> Teleport attempt=" .. tostring(attempt)
+                    .. " ok=" .. tostring(okTp)
+                    .. " ret=" .. tostring(retTp)
+                    .. "\nTempleDist=" .. string.format("%.1f", afterDist)
+                )
+
+                if afterDist <= 15 then
+                    entered = true
+                    break
+                end
+            end
+
+            local _, _, finalRoot = waitForCharacter(1)
+            local finalDist =
+                finalRoot
+                and (finalRoot.Position - BANANA_V4_TEMPLE_POS).Magnitude
+                or math.huge
+
+            setStatus(
+                "BANANA V4 [state 2]\n"
+                .. (entered and "SUCCESS -> TEMPLE" or "TIMEOUT / NO TELEPORT")
+                .. "\nattempts=" .. tostring(attempt)
+                .. " | dist=" .. string.format("%.1f", finalDist)
+            )
+
+        -- State 3: exact Banana flow -> Check, wait 1s, Continue.
+        elseif state == 3 then
+            local okCheck, retCheck = pcall(function()
+                return CommF_:InvokeServer(
+                    "RaceV4Progress",
+                    "Check"
+                )
+            end)
+
+            task.wait(1)
+
+            local okContinue, retContinue = pcall(function()
+                return CommF_:InvokeServer(
+                    "RaceV4Progress",
+                    "Continue"
+                )
+            end)
+
+            task.wait(0.5)
+            local after = select(1, getRaceV4Progress())
+
+            setStatus(
+                "BANANA V4 [state 3]\n"
+                .. "Check=" .. tostring(okCheck)
+                .. "/" .. tostring(retCheck)
+                .. " Continue=" .. tostring(okContinue)
+                .. "/" .. tostring(retContinue)
+                .. "\nafter Check=" .. tostring(after)
+            )
+
+        elseif state == 4 then
+            setStatus(
+                "BANANA V4 [state 4]\n"
+                .. "RaceV4Progress READY / COMPLETE."
+            )
+        else
+            setStatus(
+                "BANANA V4\nUnknown Check state = "
+                .. tostring(state)
+            )
         end
 
-        local after =
-            distanceTo(target)
-
-        setStatus(
-            "BANANA "
-            .. tostring(race)
-            .. "\n"
-            .. (
-                arrived
-                and "ARRIVED"
-                or "STOPPED"
-            )
-            .. " | after="
-            .. string.format("%.1f", after)
-        )
-
-        bananaBusy = false
+        bananaV4Busy = false
     end)
 end
 
@@ -671,8 +837,12 @@ KaitunButton.MouseButton1Click:Connect(
     requestKaitun
 )
 
-BananaButton.MouseButton1Click:Connect(
-    requestBanana
+BananaDirectButton.MouseButton1Click:Connect(
+    requestBananaDirect
+)
+
+BananaV4Button.MouseButton1Click:Connect(
+    bananaRaceV4Progress
 )
 
 -- Initial diagnostic.
