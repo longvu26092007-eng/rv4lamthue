@@ -17,6 +17,7 @@ end
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local CoreGui = game:GetService("CoreGui")
+local UserInputService = game:GetService("UserInputService")
 
 local LP = Players.LocalPlayer
 local Remotes = RS:WaitForChild("Remotes", 20)
@@ -293,11 +294,125 @@ frame.Size = UDim2.fromOffset(480, 240)
 frame.Position = UDim2.new(0.5, -240, 0.5, -120)
 frame.BackgroundColor3 = Color3.fromRGB(20,23,31)
 frame.BorderSizePixel = 0
+frame.Active = true
+frame.ClipsDescendants = false
 frame.Parent = gui
 
 local corner = Instance.new("UICorner")
 corner.CornerRadius = UDim.new(0,10)
 corner.Parent = frame
+
+-- ============================================================
+-- WINDOW DRAG + RESIZE
+-- ============================================================
+local MIN_W, MIN_H = 360, 210
+local MAX_W, MAX_H = 900, 650
+
+local dragging = false
+local resizing = false
+local dragStart
+local startPos
+local resizeStart
+local startSize
+
+local function clampWindowToScreen()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+
+    local vp = cam.ViewportSize
+    local absPos = frame.AbsolutePosition
+    local absSize = frame.AbsoluteSize
+
+    local x = math.clamp(absPos.X, 0, math.max(0, vp.X - absSize.X))
+    local y = math.clamp(absPos.Y, 0, math.max(0, vp.Y - absSize.Y))
+
+    frame.Position = UDim2.fromOffset(x, y)
+end
+
+local resizeHandle = Instance.new("TextButton")
+resizeHandle.Name = "ResizeHandle"
+resizeHandle.Size = UDim2.fromOffset(22, 22)
+resizeHandle.AnchorPoint = Vector2.new(1, 1)
+resizeHandle.Position = UDim2.new(1, -4, 1, -4)
+resizeHandle.BackgroundColor3 = Color3.fromRGB(65, 75, 100)
+resizeHandle.BorderSizePixel = 0
+resizeHandle.Text = "↘"
+resizeHandle.TextColor3 = Color3.fromRGB(235, 240, 255)
+resizeHandle.TextSize = 14
+resizeHandle.Font = Enum.Font.GothamBold
+resizeHandle.AutoButtonColor = true
+resizeHandle.ZIndex = 20
+resizeHandle.Parent = frame
+
+local resizeCorner = Instance.new("UICorner")
+resizeCorner.CornerRadius = UDim.new(0, 5)
+resizeCorner.Parent = resizeHandle
+
+local function beginDrag(input)
+    dragging = true
+    dragStart = input.Position
+    startPos = frame.Position
+end
+
+local function beginResize(input)
+    resizing = true
+    resizeStart = input.Position
+    startSize = frame.AbsoluteSize
+end
+
+resizeHandle.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
+        beginResize(input)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging
+        and (
+            input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch
+        )
+    then
+        local delta = input.Position - dragStart
+
+        frame.Position = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+
+    elseif resizing
+        and (
+            input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch
+        )
+    then
+        local delta = input.Position - resizeStart
+        local newW = math.clamp(startSize.X + delta.X, MIN_W, MAX_W)
+        local newH = math.clamp(startSize.Y + delta.Y, MIN_H, MAX_H)
+
+        frame.Size = UDim2.fromOffset(newW, newH)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
+        if dragging then
+            dragging = false
+            clampWindowToScreen()
+        end
+
+        if resizing then
+            resizing = false
+            clampWindowToScreen()
+        end
+    end
+end)
 
 local title = Instance.new("TextLabel")
 title.BackgroundTransparency = 1
@@ -307,12 +422,21 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 16
 title.TextColor3 = Color3.new(1,1,1)
 title.TextXAlignment = Enum.TextXAlignment.Left
-title.Text = "TEMPLE NPC CLICK DEBUG"
+title.Text = "TEMPLE NPC CLICK DEBUG  |  kéo tiêu đề để di chuyển"
+title.Active = true
 title.Parent = frame
+
+title.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+    then
+        beginDrag(input)
+    end
+end)
 
 Status = Instance.new("TextLabel")
 Status.Position = UDim2.fromOffset(12,44)
-Status.Size = UDim2.new(1,-24,0,104)
+Status.Size = UDim2.new(1,-24,1,-132)
 Status.BackgroundColor3 = Color3.fromRGB(13,16,23)
 Status.BorderSizePixel = 0
 Status.Font = Enum.Font.Code
@@ -321,13 +445,14 @@ Status.TextWrapped = true
 Status.TextXAlignment = Enum.TextXAlignment.Left
 Status.TextYAlignment = Enum.TextYAlignment.Top
 Status.TextColor3 = Color3.fromRGB(220,225,235)
-Status.Text = "Loading trace..."
+Status.Text = "Loading trace...\nKéo tiêu đề để di chuyển | kéo ↘ để thu/phóng"
 Status.Parent = frame
 
 local function button(text, x, w)
     local b = Instance.new("TextButton")
     b.Size = UDim2.fromOffset(w,52)
-    b.Position = UDim2.fromOffset(x,168)
+    b.AnchorPoint = Vector2.new(0, 1)
+    b.Position = UDim2.new(0, x, 1, -18)
     b.BackgroundColor3 = Color3.fromRGB(42,48,65)
     b.BorderSizePixel = 0
     b.Font = Enum.Font.GothamBold
@@ -345,6 +470,26 @@ end
 local goNpc = button("GO TO NPC\n(no remote)", 12, 145)
 local inspectNpc = button("SHOW NEAREST NPC", 167, 145)
 local clearLog = button("CLEAR LOG", 322, 145)
+
+
+local function relayoutButtons()
+    local totalW = frame.AbsoluteSize.X
+    local gap = 10
+    local margin = 12
+    local usable = math.max(300, totalW - margin * 2 - gap * 2)
+    local w = math.floor(usable / 3)
+
+    goNpc.Size = UDim2.fromOffset(w, 52)
+    inspectNpc.Size = UDim2.fromOffset(w, 52)
+    clearLog.Size = UDim2.fromOffset(w, 52)
+
+    goNpc.Position = UDim2.new(0, margin, 1, -18)
+    inspectNpc.Position = UDim2.new(0, margin + w + gap, 1, -18)
+    clearLog.Position = UDim2.new(0, margin + (w + gap) * 2, 1, -18)
+end
+
+frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(relayoutButtons)
+task.defer(relayoutButtons)
 
 goNpc.MouseButton1Click:Connect(function()
     installTrace()
